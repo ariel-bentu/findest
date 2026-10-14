@@ -1,0 +1,72 @@
+# Findest configuration.
+# Changes are picked up automatically when this file is saved.
+
+[general]
+# Folder shown when Findest starts. "~" is your home folder.
+start_path = "~"
+show_hidden = false
+folders_first = true
+# name | size | modified | kind
+sort_by = "name"
+sort_ascending = true
+# Ask before moving items to the Trash.
+confirm_trash = false
+# How many recently opened files to remember.
+max_recents = 50
+
+[appearance]
+# dark | light | system
+theme = "system"
+font_size = 13.0
+row_height = 26.0
+# Leave empty for the system font.
+font_family = ""
+# Override any theme color with a hex value, e.g. accent = "#ff8800".
+# Keys: background, sidebar, surface, border, text, text_muted, accent,
+#       selection, selection_text, hover, danger
+[appearance.colors]
+
+# Sidebar favorites, in order. Add or remove them from the app too
+# (right-click a folder > "Add to Favorites").
+[[favorites]]
+path = "~"
+
+[[favorites]]
+path = "~/Desktop"
+
+[[favorites]]
+path = "~/Documents"
+
+[[favorites]]
+path = "~/Downloads"
+
+[[favorites]]
+path = "/Applications"
+
+# "Open with" targets. Placeholders in `command`:
+#   {path} - the selected item (or the current folder if nothing is selected)
+#   {dir}  - the folder containing the selected item (or the item itself if it's a folder)
+# `for` limits where an opener shows up: "any", "files" or "folders".
+[[openers]]
+name = "VS Code"
+command = ["open", "-a", "Visual Studio Code", "{path}"]
+for = "any"
+
+[[openers]]
+name = "Terminal"
+command = ["open", "-a", "Terminal", "{dir}"]
+for = "any"
+
+[[openers]]
+name = "Preview"
+command = ["open", "-a", "Preview", "{path}"]
+for = "files"
+
+# Keyboard shortcuts, merged over the built-in defaults. Set a shortcut to
+# "none" to disable it. Openers are bound with "open_with:<name>".
+# Built-in defaults include: cmd-e = open_with:VS Code,
+# cmd-alt-t = open_with:Terminal, enter = rename, cmd-o = open.
+[keybindings]
+# "enter" = "open"
+# "f2" = "rename"
+# "cmd-p" = "open_with:Preview"

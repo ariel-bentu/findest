@@ -1,0 +1,202 @@
+//! Every user-facing operation is a [`Command`], addressable by a string name
+//! so keybindings, menus and context menus can all be driven from config.
+
+use std::str::FromStr;
+
+use gpui::{Action, KeyBinding, KeyBindingContextPredicate};
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+/// The single gpui action that carries a command name. Keybindings from
+/// the config file are bound to `Run { command }`.
+#[derive(Clone, PartialEq, Debug, Deserialize, JsonSchema, Action)]
+#[action(namespace = findest)]
+pub struct Run {
+    pub command: String,
+}
+
+impl Run {
+    pub fn new(command: impl Into<String>) -> Self {
+        Self { command: command.into() }
+    }
+}
+
+gpui::actions!(findest, [Quit]);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Command {
+    SelectPrev,
+    SelectNext,
+    ExtendPrev,
+    ExtendNext,
+    SelectFirst,
+    SelectLast,
+    SelectAll,
+    ClearSelection,
+    Open,
+    Rename,
+    GoUp,
+    GoBack,
+    GoForward,
+    GoHome,
+    GoToFolder,
+    NewFolder,
+    NewFile,
+    Duplicate,
+    /// Move to Trash, asking first only if `confirm_trash` is set.
+    Trash,
+    /// Move to Trash, always asking first.
+    TrashConfirm,
+    /// Move to Trash without asking.
+    TrashNow,
+    DeletePermanently,
+    Copy,
+    Paste,
+    MoveHere,
+    CopyPath,
+    ToggleHidden,
+    Refresh,
+    AddFavorite,
+    ShowRecents,
+    RevealInFinder,
+    OpenConfig,
+    OpenWith(String),
+}
+
+impl FromStr for Command {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        use Command::*;
+        if let Some(name) = s.strip_prefix("open_with:") {
+            return Ok(OpenWith(name.to_string()));
+        }
+        Ok(match s {
+            "select_prev" => SelectPrev,
+            "select_next" => SelectNext,
+            "extend_prev" => ExtendPrev,
+            "extend_next" => ExtendNext,
+            "select_first" => SelectFirst,
+            "select_last" => SelectLast,
+            "select_all" => SelectAll,
+            "clear_selection" => ClearSelection,
+            "open" => Open,
+            "rename" => Rename,
+            "go_up" => GoUp,
+            "go_back" => GoBack,
+            "go_forward" => GoForward,
+            "go_home" => GoHome,
+            "go_to_folder" => GoToFolder,
+            "new_folder" => NewFolder,
+            "new_file" => NewFile,
+            "duplicate" => Duplicate,
+            "trash" => Trash,
+            "trash_confirm" => TrashConfirm,
+            "trash_now" => TrashNow,
+            "delete_permanently" => DeletePermanently,
+            "copy" => Copy,
+            "paste" => Paste,
+            "move_here" => MoveHere,
+            "copy_path" => CopyPath,
+            "toggle_hidden" => ToggleHidden,
+            "refresh" => Refresh,
+            "add_favorite" => AddFavorite,
+            "show_recents" => ShowRecents,
+            "reveal_in_finder" => RevealInFinder,
+            "open_config" => OpenConfig,
+            other => return Err(format!("unknown command \"{other}\"")),
+        })
+    }
+}
+
+pub const BROWSER_CONTEXT: &str = "Browser";
+
+/// Builds gpui keybindings from the merged config map. Invalid entries are
+/// skipped and described in the returned error list.
+pub fn keybindings(map: &std::collections::BTreeMap<String, String>) -> (Vec<KeyBinding>, Vec<String>) {
+    let mut bindings = Vec::new();
+    let mut errors = Vec::new();
+    let context = KeyBindingContextPredicate::parse(BROWSER_CONTEXT).ok().map(std::rc::Rc::new);
+    for (keys, command) in map {
+        if let Err(e) = command.parse::<Command>() {
+            errors.push(format!("keybinding \"{keys}\": {e}"));
+            continue;
+        }
+        match KeyBinding::load(
+            keys,
+            Box::new(Run::new(command.clone())),
+            context.clone(),
+            false,
+            None,
+            &gpui::DummyKeyboardMapper,
+        ) {
+            Ok(binding) => bindings.push(binding),
+            Err(e) => errors.push(format!("keybinding \"{keys}\": {e}")),
+        }
+    }
+    (bindings, errors)
+}
+
+/// The first key bound to `command`, formatted for display in menus (e.g. "⌘⇧N").
+pub fn shortcut_label(map: &std::collections::BTreeMap<String, String>, command: &str) -> Option<String> {
+    let keys = map.iter().filter(|(_, c)| *c == command).map(|(k, _)| k).min_by_key(|k| k.len())?;
+    let mut out = String::new();
+    let parts: Vec<&str> = keys.split('-').collect();
+    let (mods, key) = match parts.split_last() {
+        // "cmd--" style bindings for the minus key end with an empty part.
+        Some((&"", rest)) => (&rest[..rest.len().saturating_sub(1)], "-"),
+        Some((last, rest)) => (rest, *last),
+        None => return None,
+    };
+    for m in ["ctrl", "alt", "shift", "cmd"] {
+        if mods.contains(&m) {
+            out.push_str(match m {
+                "ctrl" => "⌃",
+                "alt" => "⌥",
+                "shift" => "⇧",
+                _ => "⌘",
+            });
+        }
+    }
+    out.push_str(&match key {
+        "backspace" => "⌫".to_string(),
+        "enter" => "↩".to_string(),
+        "up" => "↑".to_string(),
+        "down" => "↓".to_string(),
+        "left" => "←".to_string(),
+        "right" => "→".to_string(),
+        "escape" => "⎋".to_string(),
+        "space" => "Space".to_string(),
+        k => k.to_uppercase(),
+    });
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn all_default_keybindings_are_valid() {
+        let map = findest_core::config::Config::default().keybindings();
+        let (bindings, errors) = keybindings(&map);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(bindings.len(), map.len());
+    }
+
+    #[test]
+    fn reports_bad_bindings() {
+        let map = BTreeMap::from([("cmd-x".to_string(), "explode".to_string())]);
+        let (_, errors) = keybindings(&map);
+        assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn labels() {
+        let map = findest_core::config::Config::default().keybindings();
+        assert_eq!(shortcut_label(&map, "new_folder").unwrap(), "⇧⌘N");
+        assert_eq!(shortcut_label(&map, "trash").unwrap(), "⌘⌫");
+        assert_eq!(shortcut_label(&map, "open").unwrap(), "⌘O");
+    }
+}
