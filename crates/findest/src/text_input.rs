@@ -17,7 +17,7 @@ actions!(
     [
         Backspace, Delete, Left, Right, WordLeft, WordRight, SelectLeft, SelectRight, SelectAll,
         Home, End, SelectHome, SelectEnd, Paste, Cut, Copy, Confirm, Cancel, DeleteToStart,
-        DeleteWordLeft,
+        DeleteWordLeft, MoveUp, MoveDown,
     ]
 );
 
@@ -42,8 +42,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("end", End, c),
         KeyBinding::new("cmd-left", Home, c),
         KeyBinding::new("cmd-right", End, c),
-        KeyBinding::new("up", Home, c),
-        KeyBinding::new("down", End, c),
+        KeyBinding::new("up", MoveUp, c),
+        KeyBinding::new("down", MoveDown, c),
         KeyBinding::new("shift-home", SelectHome, c),
         KeyBinding::new("shift-end", SelectEnd, c),
         KeyBinding::new("cmd-backspace", DeleteToStart, c),
@@ -56,6 +56,9 @@ pub fn bind_keys(cx: &mut App) {
 pub enum TextInputEvent {
     Confirm,
     Cancel,
+    /// ↑/↓ when `emit_vertical` is set (e.g. to move into a result list).
+    Up,
+    Down,
 }
 
 pub struct TextInput {
@@ -71,6 +74,8 @@ pub struct TextInput {
     pub cursor_color: Hsla,
     pub selection_color: Hsla,
     pub placeholder_color: Hsla,
+    /// Report ↑/↓ as events instead of moving to the start/end of the text.
+    pub emit_vertical: bool,
 }
 
 impl EventEmitter<TextInputEvent> for TextInput {}
@@ -90,6 +95,7 @@ impl TextInput {
             cursor_color: gpui::blue(),
             selection_color: gpui::rgba(0x3311ff30).into(),
             placeholder_color: gpui::hsla(0., 0., 0.5, 0.6),
+            emit_vertical: false,
         }
     }
 
@@ -190,6 +196,14 @@ impl TextInput {
             self.select_to(self.previous_word(self.cursor_offset()), cx)
         }
         self.replace_text_in_range(None, "", window, cx)
+    }
+
+    fn move_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
+        if self.emit_vertical { cx.emit(TextInputEvent::Up) } else { self.move_to(0, cx) }
+    }
+
+    fn move_down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<Self>) {
+        if self.emit_vertical { cx.emit(TextInputEvent::Down) } else { self.move_to(self.content.len(), cx) }
     }
 
     fn confirm(&mut self, _: &Confirm, _: &mut Window, cx: &mut Context<Self>) {
@@ -641,6 +655,8 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::move_up))
+            .on_action(cx.listener(Self::move_down))
             .on_action(cx.listener(Self::cancel))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))

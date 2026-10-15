@@ -66,6 +66,18 @@ name = "Preview"
 command = ["open", "-a", "Preview", "{path}"]
 for = "files"
 
+# Search (⌘F). Findest keeps an index of file names for instant results.
+[search]
+# Folders searched by "Everywhere". Cloud drives are listed explicitly because
+# ~/Library is excluded below.
+roots = ["~", "/Applications", "~/Library/Mobile Documents/com~apple~CloudDocs", "~/Library/CloudStorage"]
+# Paths to skip, or "**/name" to skip a folder name anywhere.
+exclude = ["~/Library", "~/.Trash", "**/node_modules", "**/.git"]
+# Results shown at most (the count still includes every match).
+max_results = 10000
+# content: skips files larger than this many megabytes.
+content_max_mb = 20
+
 # Keyboard shortcuts, merged over the built-in defaults. Set a shortcut to
 # "none" to disable it. Openers are bound with "open_with:<name>".
 # Built-in defaults include: cmd-e = open_with:VS Code,

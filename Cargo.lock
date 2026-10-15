@@ -1716,7 +1716,11 @@ name = "findest-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "dirs 6.0.0",
+ "memchr",
+ "rayon",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

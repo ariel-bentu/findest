@@ -45,6 +45,7 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str)] = &[
     ("cmd-alt-v", "move_here"),
     ("cmd-alt-c", "copy_path"),
     ("cmd-shift-.", "toggle_hidden"),
+    ("cmd-f", "find"),
     ("cmd-i", "toggle_info"),
     ("cmd-r", "refresh"),
     ("ctrl-cmd-t", "add_favorite"),
@@ -64,6 +65,7 @@ pub struct Config {
     pub appearance: Appearance,
     pub favorites: Vec<Favorite>,
     pub openers: Vec<Opener>,
+    pub search: SearchConfig,
     /// User overrides only; see [`Config::keybindings`] for the merged map.
     #[serde(rename = "keybindings")]
     pub keybinding_overrides: BTreeMap<String, String>,
@@ -87,7 +89,39 @@ impl Default for Config {
                 opener("Preview", "Preview", "{path}", OpenerTarget::Files),
             ],
             keybinding_overrides: BTreeMap::new(),
+            search: SearchConfig::default(),
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchConfig {
+    /// Folders to index for search ("Everywhere").
+    pub roots: Vec<String>,
+    /// Paths to skip, or "**/name" to skip a folder name anywhere.
+    pub exclude: Vec<String>,
+    /// Results shown at most (the count still includes all matches).
+    pub max_results: usize,
+    /// `content:` skips files larger than this many megabytes.
+    pub content_max_mb: u64,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect();
+        Self {
+            roots: s(&["~", "/Applications", "~/Library/Mobile Documents/com~apple~CloudDocs", "~/Library/CloudStorage"]),
+            exclude: s(&["~/Library", "~/.Trash", "**/node_modules", "**/.git"]),
+            max_results: 10_000,
+            content_max_mb: 20,
+        }
+    }
+}
+
+impl SearchConfig {
+    pub fn root_paths(&self) -> Vec<std::path::PathBuf> {
+        self.roots.iter().map(|r| expand_tilde(r)).collect()
     }
 }
 

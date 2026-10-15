@@ -1,9 +1,11 @@
 mod browser;
+mod browser_search;
 mod command;
 mod icons;
 mod install;
 mod native_drag;
 mod render;
+mod search_service;
 mod system;
 mod text_input;
 mod theme;
@@ -90,6 +92,8 @@ fn menus() -> Vec<Menu> {
                 item("Recents", "show_recents"),
                 item("Home", "go_home"),
                 item("Go to Folder…", "go_to_folder"),
+                MenuItem::separator(),
+                item("Find…", "find"),
             ],
         },
     ]
@@ -165,6 +169,7 @@ fn main() {
         bind_global_keys(cx);
         text_input::bind_keys(cx);
         cx.set_menus(menus());
+        search_service::init(cx);
 
         for init in initial_windows(start) {
             open_browser_window(init, cx);

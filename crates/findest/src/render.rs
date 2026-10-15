@@ -34,6 +34,9 @@ impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.load_sidebar_icons(cx);
         self.sync_info(cx);
+        if std::mem::take(&mut self.refocus_list) {
+            window.focus(&self.focus);
+        }
         if std::mem::take(&mut self.pending_rename) {
             self.start_rename(window, cx);
         }
@@ -67,6 +70,7 @@ impl Render for Browser {
                     .h_full()
                     .child(self.render_toolbar(cx))
                     .children(self.render_go_to_folder(cx))
+                    .children(self.render_search_bar(cx))
                     .child(
                         div()
                             .flex()
@@ -140,9 +144,105 @@ impl Browser {
             .child(self.toolbar_button("up", "chevron.up", "↑", self.current_dir().is_some_and(|d| d.parent().is_some()), "go_up", cx))
             .child(crumbs)
             .when(self.loading, |d| d.child(div().text_color(theme.text_muted).child("Loading…")))
+            .child(self.render_search_field(cx))
             .child(self.toolbar_text_button("goto", "Go to…", "go_to_folder", cx))
             .child(self.toolbar_text_button("hidden", hidden_label, "toggle_hidden", cx))
             .child(self.info_toggle_button(cx))
+    }
+
+    /// The toolbar search box: a button until opened (⌘F), then a text field.
+    fn render_search_field(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = &self.theme;
+        let icon = self.icons.peek(&self.symbol_key_colored("magnifyingglass", theme.text_muted));
+        div()
+            .id("search-field")
+            .w(px(240.))
+            .flex_none()
+            .h(px(28.))
+            .px_2()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .rounded_lg()
+            .bg(theme.background)
+            .border_1()
+            .border_color(if self.search.is_some() { theme.accent } else { theme.border })
+            .cursor_text()
+            // Once open, clicks go to the text field itself (cursor placement).
+            .when(self.search.is_none(), |d| {
+                d.on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_search(window, cx);
+                }))
+            })
+            .child(match icon {
+                Some(image) => img(image).size(px(13.)).object_fit(ObjectFit::Contain).into_any_element(),
+                None => div().text_color(theme.text_muted).child("⌕").into_any_element(),
+            })
+            .child(match &self.search {
+                Some(search) => div().flex_1().min_w_0().child(search.input.clone()).into_any_element(),
+                None => div().flex_1().text_color(theme.text_muted).child("Search  ⌘F").into_any_element(),
+            })
+    }
+
+    /// Scope buttons, result count / progress, and index status (while searching).
+    fn render_search_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let search = self.search.as_ref()?;
+        let theme = &self.theme;
+        let scope_button = |id: &'static str, label: String, active: bool, everywhere: bool| {
+            div()
+                .id(id)
+                .px_2()
+                .py(px(2.))
+                .rounded_md()
+                .whitespace_nowrap()
+                .cursor_pointer()
+                .when(active, |d| d.bg(theme.accent).text_color(theme.selection_text))
+                .when(!active, |d| d.text_color(theme.text_muted).hover(|s| s.bg(theme.hover)))
+                .on_click(cx.listener(move |this, _, _, cx| this.set_search_scope(everywhere, cx)))
+                .child(label)
+        };
+        let (summary, is_error) = self.search_summary().unwrap_or_default();
+        let index_status = cx.try_global::<crate::search_service::IndexService>().map(crate::search_service::status_text);
+        Some(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_1()
+                .bg(theme.surface)
+                .border_b_1()
+                .border_color(theme.border)
+                .text_size(px(theme.font_size - 1.))
+                .child(div().text_color(theme.text_muted).child("Search:"))
+                .when(self.current_dir().is_some(), |d| {
+                    d.child(scope_button("scope-here", format!("“{}”", self.scope_label()), !search.everywhere, false))
+                })
+                .child(scope_button("scope-all", "Everywhere".into(), search.everywhere, true))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(if is_error { theme.danger } else { theme.text_muted })
+                        .child(summary),
+                )
+                .children(index_status.map(|status| {
+                    div()
+                        .id("index-status")
+                        .flex_none()
+                        .whitespace_nowrap()
+                        .text_color(theme.text_muted)
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(theme.text))
+                        .tooltip(tooltip("Rebuild the search index"))
+                        .on_click(cx.listener(|this, _, window, cx| this.run(crate::command::Command::RebuildIndex, window, cx)))
+                        .child(status)
+                })),
+        )
     }
 
     /// Opens/closes the info panel; highlighted while it's open.
@@ -319,7 +419,7 @@ impl Browser {
             self.request_icon(key, cx);
         }
         let (enabled, disabled) = (self.theme.text, self.theme.text_muted);
-        for name in ["chevron.left", "chevron.right", "chevron.up", "sidebar.right", "xmark"] {
+        for name in ["chevron.left", "chevron.right", "chevron.up", "sidebar.right", "xmark", "magnifyingglass"] {
             for color in [enabled, disabled] {
                 let key = self.symbol_key_colored(name, color);
                 self.request_icon(key, cx);
@@ -436,8 +536,13 @@ impl Browser {
 
     fn render_file_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = &self.theme;
-        let recents = self.location == Location::Recents;
-        let empty_message = if self.loading || self.load_error.is_some() {
+        let searching = self.search_active(cx);
+        // Recents and search results show a "Where" column and aren't sortable.
+        let recents = self.location == Location::Recents || searching;
+        let search_idle = self.search.as_ref().is_some_and(|s| !s.running && s.error.is_none() && s.note.is_none());
+        let empty_message = if searching {
+            (self.entries.is_empty() && search_idle).then_some("No results.")
+        } else if self.loading || self.load_error.is_some() {
             None
         } else if self.entries.is_empty() {
             Some(if recents { "Files you open from Findest show up here." } else { "This folder is empty." })
@@ -608,7 +713,7 @@ impl Browser {
         let entry = &self.entries[ix];
         let selected = self.selected.contains(&entry.path);
         let renaming = self.renaming().filter(|(p, _)| *p == entry.path).map(|(_, input)| input.clone());
-        let recents = self.location == Location::Recents;
+        let recents = self.location == Location::Recents || self.search_active(cx);
         let (fg, muted) = if selected { (theme.selection_text, theme.selection_text.opacity(0.8)) } else { (theme.text, theme.text_muted) };
         let dim = entry.is_hidden && !selected;
 

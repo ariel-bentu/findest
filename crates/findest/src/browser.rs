@@ -150,6 +150,10 @@ pub struct Browser {
     /// `(available, total)` bytes on the current folder's volume.
     pub(crate) volume: Option<(u64, u64)>,
     pub(crate) info: Option<InfoState>,
+    pub(crate) search: Option<crate::browser_search::SearchUi>,
+    pub(crate) index_generation: u64,
+    /// Set when focus should return to the file list on the next frame.
+    pub(crate) refocus_list: bool,
     volume_task: Option<Task<()>>,
     /// Folders expanded in place. Kept across navigation, like Finder.
     pub(crate) expanded: HashSet<PathBuf>,
@@ -239,6 +243,7 @@ impl Browser {
         browsers.retain(|b| b.upgrade().is_some());
         browsers.push(me);
         let mut subscriptions = subscriptions;
+        subscriptions.push(cx.observe_global::<crate::search_service::IndexService>(|this, cx| this.on_index_updated(cx)));
         subscriptions.push(cx.on_release(|_, cx| {
             // Closing one of several windows drops it from the saved session.
             // Closing the last one (or quitting) keeps what was saved.
@@ -268,6 +273,9 @@ impl Browser {
             expandable: Vec::new(),
             volume: None,
             info: None,
+            search: None,
+            index_generation: 0,
+            refocus_list: false,
             volume_task: None,
             expanded: init.expanded.into_iter().collect(),
             loading: false,
@@ -338,6 +346,10 @@ impl Browser {
         // The panel toggle is a view choice remembered per session; a config
         // reload shouldn't flip it.
         config.general.info_panel = self.config.general.info_panel;
+        if config.search != self.config.search {
+            gpui::BorrowAppContext::update_global::<crate::search_service::IndexService, _>(cx, |s, _| s.config = config.search.clone());
+            crate::search_service::rebuild_now(cx);
+        }
         let listing_changed = config.general != self.config.general;
         self.theme = theme;
         self.keymap = keymap;
@@ -386,6 +398,10 @@ impl Browser {
     // ---- Navigation & loading ----------------------------------------
 
     pub fn navigate(&mut self, location: Location, push_history: bool, cx: &mut Context<Self>) {
+        // Going somewhere ends a search (e.g. opening a folder from the results).
+        if self.search.take().is_some() {
+            self.refocus_list = true;
+        }
         if push_history && location != self.location {
             self.back.push(self.location.clone());
             self.forward.clear();
@@ -433,6 +449,10 @@ impl Browser {
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
+        // While searching, refresh the results instead of the folder listing.
+        if self.search_active(cx) {
+            return self.run_search(cx);
+        }
         let location = self.location.clone();
         let show_hidden = self.config.general.show_hidden;
         let order = self.config.general.sort_order();
@@ -624,9 +644,9 @@ impl Browser {
     }
 
     /// Handles printable keys not claimed by a keybinding: jump-to-name.
-    pub fn on_key_down(&mut self, event: &gpui::KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    pub fn on_key_down(&mut self, event: &gpui::KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let m = event.keystroke.modifiers;
-        if self.edit.is_some() || m.platform || m.control || m.alt || m.function {
+        if self.edit.is_some() || self.search_focused(window, cx) || m.platform || m.control || m.alt || m.function {
             return;
         }
         if let Some(ch) = event.keystroke.key_char.as_deref()
@@ -681,7 +701,18 @@ impl Browser {
                 self.selected = self.entries.iter().map(|e| e.path.clone()).collect();
                 cx.notify();
             }
-            ClearSelection => self.clear_selection(cx),
+            ClearSelection => {
+                if self.selected.is_empty() && self.search.is_some() {
+                    self.close_search(window, cx);
+                } else {
+                    self.clear_selection(cx);
+                }
+            }
+            Find => self.open_search(window, cx),
+            RebuildIndex => {
+                crate::search_service::rebuild_now(cx);
+                self.set_info("Rebuilding the search index…", cx);
+            }
             Expand => self.expand_selection(cx),
             Collapse => self.collapse_selection(cx),
             Open => self.open_selection(cx),
@@ -1093,6 +1124,7 @@ impl Browser {
             cx.subscribe_in(&input, window, |this, _, event, window, cx| match event {
                 TextInputEvent::Confirm => this.commit_edit(window, cx),
                 TextInputEvent::Cancel => this.cancel_edit(window, cx),
+                TextInputEvent::Up | TextInputEvent::Down => {}
             }),
             cx.on_blur(&input.focus_handle(cx), window, |this, window, cx| {
                 // Clicking away commits a rename, but abandons go-to-folder.

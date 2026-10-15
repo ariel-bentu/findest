@@ -12,6 +12,10 @@ toml.workspace = true
 toml_edit.workspace = true
 dirs.workspace = true
 trash.workspace = true
+rayon.workspace = true
+regex.workspace = true
+memchr.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

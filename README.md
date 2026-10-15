@@ -63,6 +63,28 @@ Changes apply as soon as you save the file. Open it with **⌘,**.
 
 Typing letters jumps to the first matching name.
 
+## Search (⌘F)
+
+Findest keeps an in-memory index of file names, a design inspired by FSearch and Everything: flat name-sorted arrays searched on all cores. It indexes about 1.2M files in ~7 s, and most queries finish in a few milliseconds. The index is saved to disk, so search works right away at launch, and it's refreshed when files change. You choose what's indexed in `[search]` in the config.
+
+| Query | Matches |
+|---|---|
+| `report` | name contains "report" (a capital letter makes it case-sensitive) |
+| `*.pdf`, `img_??.jpg` | wildcards |
+| `"two words"` | literal text |
+| `a b`, `a \| b`, `!a` or `-a`, `( )` | AND, OR, NOT, grouping |
+| `ext:jpg;png` | extension |
+| `size:>10mb`, `size:1k..5mb`, `size:empty` | size |
+| `dm:today`, `dm:week`, `dm:2024-05`, `dm:>2024-05-01` | date modified |
+| `file:`, `folder:` | only files / folders |
+| `path:src`, `src/main` | full path |
+| `regex:^\d{4}-` | regular expression |
+| `case:`, `nocase:` | force case sensitivity |
+| `content:"TODO"` | text inside files (pair it with other terms to stay fast) |
+| `hidden:` | include hidden files |
+
+Search **This folder** or **Everywhere**. Press ↓ or Enter to move to the results and Esc to close search. Run `cargo run --release -p findest-core --example search_bench` to benchmark indexing and search on your machine.
+
 ## Mouse
 
 - **▾** next to back/forward: recently visited folders.

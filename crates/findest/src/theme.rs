@@ -127,8 +127,7 @@ mod tests {
 
     #[test]
     fn overrides_and_errors() {
-        let mut appearance = Appearance::default();
-        appearance.theme = ThemeMode::Light;
+        let mut appearance = Appearance { theme: ThemeMode::Light, ..Default::default() };
         appearance.colors.insert("accent".into(), "#ff8800".into());
         appearance.colors.insert("nope".into(), "#000".into());
         let (theme, errors) = Theme::resolve(&appearance, WindowAppearance::Dark);

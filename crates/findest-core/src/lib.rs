@@ -9,4 +9,5 @@ pub mod locations;
 pub mod ops;
 pub mod paths;
 pub mod recents;
+pub mod search;
 pub mod session;

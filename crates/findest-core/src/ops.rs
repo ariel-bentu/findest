@@ -242,16 +242,16 @@ mod tests {
         let f = src.join("f.txt");
         fs::write(&f, "1").unwrap();
 
-        copy_into(&[f.clone()], &dst).unwrap();
-        let again = copy_into(&[f.clone()], &dst).unwrap();
+        copy_into(std::slice::from_ref(&f), &dst).unwrap();
+        let again = copy_into(std::slice::from_ref(&f), &dst).unwrap();
         assert_eq!(again[0].file_name().unwrap(), "f copy.txt");
 
-        assert!(move_into(&[f.clone()], &dst).is_err(), "must not overwrite");
-        assert!(copy_into(&[src.clone()], &src).is_err(), "no copying into itself");
+        assert!(move_into(std::slice::from_ref(&f), &dst).is_err(), "must not overwrite");
+        assert!(copy_into(std::slice::from_ref(&src), &src).is_err(), "no copying into itself");
 
         let g = src.join("g.txt");
         fs::write(&g, "2").unwrap();
-        let moved = move_into(&[g.clone()], &dst).unwrap();
+        let moved = move_into(std::slice::from_ref(&g), &dst).unwrap();
         assert!(!g.exists() && moved[0].exists());
     }
 
@@ -270,7 +270,7 @@ mod tests {
         let d = tmp.path().join("d");
         fs::create_dir_all(d.join("e")).unwrap();
         fs::write(d.join("e/f"), "").unwrap();
-        delete_permanently(&[d.clone()]).unwrap();
+        delete_permanently(std::slice::from_ref(&d)).unwrap();
         assert!(!d.exists());
     }
 }
