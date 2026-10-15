@@ -8,13 +8,15 @@ use chrono::{DateTime, Local};
 use findest_core::listing::{Entry, SortKey, format_size};
 use findest_core::locations;
 use findest_core::paths::contract_tilde;
+use findest_core::config::ViewMode;
 use gpui::{
-    AnyElement, Context, ExternalPaths, FontWeight, Hsla, Image, MouseButton, MouseDownEvent,
-    ObjectFit, Pixels, Point, SharedString, Window, anchored, deferred, div, img, prelude::*, px, uniform_list,
+    AnyElement, Bounds, Context, DispatchPhase, ExternalPaths, FontWeight, Hsla, Image, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Point, SharedString, Window, anchored, canvas, deferred, div, img,
+    prelude::*, px, uniform_list,
 };
 
 use crate::browser::{
-    Browser, EditKind, GoToTarget, Location, MenuAction, MenuEntry, count_label, go_to_target,
+    Browser, EditKind, GoToTarget, Location, MAX_TILE, MIN_TILE, MenuAction, MenuEntry, count_label, go_to_target,
 };
 use crate::command::BROWSER_CONTEXT;
 
@@ -39,6 +41,14 @@ impl Render for Browser {
         }
         if std::mem::take(&mut self.pending_name_new) {
             self.start_name_new(window, cx);
+        }
+        if self.view == ViewMode::Tiles {
+            // The list's width is what the sidebar and info panel leave (both fixed).
+            let mut width = window.viewport_size().width - px(SIDEBAR_WIDTH + 1. + 8.);
+            if self.config.general.info_panel {
+                width -= px(INFO_PANEL_WIDTH + 1.);
+            }
+            self.tile_columns = ((width / px(self.tile_cell_width())).floor() as usize).max(1);
         }
         let title = format!("Findest — {}", self.location_label());
         if title != self.last_title {
@@ -80,7 +90,7 @@ impl Render for Browser {
                             .child(self.render_file_list(cx))
                             .children(self.render_info_panel(cx)),
                     )
-                    .child(self.render_status_bar()),
+                    .child(self.render_status_bar(cx)),
             )
             .children(self.render_menu(cx))
             .children(self.render_syntax_help(cx));
@@ -149,6 +159,8 @@ impl Browser {
             .child(self.syntax_help_button(cx))
             .child(self.toolbar_text_button("goto", "Go to…", "go_to_folder", cx))
             .child(self.toolbar_text_button("hidden", hidden_label, "toggle_hidden", cx))
+            .child(self.view_button(ViewMode::List, cx))
+            .child(self.view_button(ViewMode::Tiles, cx))
             .child(self.folder_menu_button(cx))
             .child(self.info_toggle_button(cx))
     }
@@ -353,6 +365,19 @@ impl Browser {
             )
     }
 
+    /// List / tiles switch; the current view is highlighted.
+    fn view_button(&self, view: ViewMode, cx: &mut Context<Self>) -> impl IntoElement {
+        let (id, symbol, fallback, hint) = match view {
+            ViewMode::List => ("view-list", "list.bullet.indent", "☰", "View as list (⌘1)"),
+            ViewMode::Tiles => ("view-tiles", "square.grid.2x2", "▦", "View as tiles (⌘2)"),
+        };
+        self.symbol_button(id, symbol, fallback, true)
+            .w(px(30.))
+            .when(self.view == view, |d| d.bg(self.theme.hover))
+            .tooltip(tooltip(hint))
+            .on_click(cx.listener(move |this, _, _, cx| this.set_view(view, cx)))
+    }
+
     /// Opens/closes the info panel; highlighted while it's open.
     fn info_toggle_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let open = self.config.general.info_panel;
@@ -527,7 +552,18 @@ impl Browser {
             self.request_icon(key, cx);
         }
         let (enabled, disabled) = (self.theme.text, self.theme.text_muted);
-        for name in ["chevron.left", "chevron.right", "chevron.up", "sidebar.right", "xmark", "magnifyingglass", "questionmark.circle"] {
+        for name in [
+            "chevron.left",
+            "chevron.right",
+            "chevron.up",
+            "sidebar.right",
+            "xmark",
+            "magnifyingglass",
+            "questionmark.circle",
+            "ellipsis.circle",
+            "list.bullet.indent",
+            "square.grid.2x2",
+        ] {
             for color in [enabled, disabled] {
                 let key = self.symbol_key_colored(name, color);
                 self.request_icon(key, cx);
@@ -665,7 +701,7 @@ impl Browser {
             .flex_1()
             .min_w_0()
             .h_full()
-            .child(self.render_header(recents, cx))
+            .children((self.view == ViewMode::List).then(|| self.render_header(recents, cx)))
             .child(
                 div()
                     .id("list-area")
@@ -694,8 +730,8 @@ impl Browser {
                             window.focus(&this.focus);
                         }),
                     )
-                    .child(
-                        uniform_list(
+                    .child(match self.view {
+                        ViewMode::List => uniform_list(
                             "entries",
                             self.entries.len(),
                             cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
@@ -709,8 +745,10 @@ impl Browser {
                         )
                         .track_scroll(self.scroll.clone())
                         .size_full()
-                        .px_1(),
-                    )
+                        .px_1()
+                        .into_any_element(),
+                        ViewMode::Tiles => self.render_tiles(cx).into_any_element(),
+                    })
                     .when_some(empty_message, |d, msg| {
                         d.child(
                             div()
@@ -816,6 +854,155 @@ impl Browser {
             })
     }
 
+    fn tile_cell_width(&self) -> f32 {
+        (self.tile_size + 28.).max(84.)
+    }
+
+    /// Tile rows: the picture plus up to two lines of name.
+    fn render_tiles(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let columns = self.tile_columns.max(1);
+        let line = (self.theme.font_size - 1.) * 1.3;
+        let row_height = self.tile_size + 8. + 2. * line + 18.;
+        uniform_list(
+            "tiles",
+            self.entries.len().div_ceil(columns),
+            cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                range
+                    .map(|row| {
+                        let start = row * columns;
+                        let end = (start + columns).min(this.entries.len());
+                        let tiles: Vec<AnyElement> = (start..end)
+                            .map(|ix| {
+                                let image = this.tile_image(ix, cx);
+                                this.render_tile(ix, image, line, cx)
+                            })
+                            .collect();
+                        div().w_full().h(px(row_height)).flex().flex_row().children(tiles).into_any_element()
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        )
+        .track_scroll(self.scroll.clone())
+        .size_full()
+        .px_1()
+        .pt_1()
+    }
+
+    fn render_tile(&self, ix: usize, image: Option<Arc<Image>>, line: f32, cx: &mut Context<Self>) -> AnyElement {
+        let theme = &self.theme;
+        let entry = &self.entries[ix];
+        let selected = self.selected.contains(&entry.path);
+        let renaming = self.renaming().filter(|(p, _)| *p == entry.path).map(|(_, input)| input.clone());
+        let width = self.tile_cell_width() - 8.;
+        let size = self.tile_size;
+
+        let picture = div()
+            .p(px(4.))
+            .rounded_lg()
+            .when(selected, |d| d.bg(theme.selection.opacity(0.3)))
+            .when(!selected, |d| d.group_hover("tile", |s| s.bg(theme.hover)))
+            .child(div().size(px(size)).flex().items_center().justify_center().child(match image {
+                Some(image) => img(image).size_full().object_fit(ObjectFit::Contain).into_any_element(),
+                None => div().text_size(px(size * 0.5)).child(icon_for(entry)).into_any_element(),
+            }));
+        let label = match renaming {
+            Some(input) => div()
+                .w(px(width))
+                .px_1()
+                .rounded_sm()
+                .bg(theme.background)
+                .text_color(theme.text)
+                .border_1()
+                .border_color(theme.accent)
+                .child(input)
+                .into_any_element(),
+            None => div()
+                .max_w(px(width))
+                .max_h(px(2. * line))
+                .overflow_hidden()
+                .px_1()
+                .rounded_md()
+                .text_center()
+                .line_height(px(line))
+                .when(selected, |d| d.bg(theme.selection).text_color(theme.selection_text))
+                .child(entry.display_name().to_string())
+                .into_any_element(),
+        };
+        div()
+            .id(ix)
+            .group("tile")
+            .w(px(self.tile_cell_width()))
+            .h_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .items_center()
+            .pt(px(6.))
+            .gap_1()
+            .text_size(px(theme.font_size - 1.))
+            .when(entry.is_hidden && !selected, |d| d.opacity(0.6))
+            .when(entry.is_dir, |d| self.drop_target(d, entry.path.clone(), cx))
+            .map(|d| self.item_mouse_handlers(d, ix, cx))
+            .child(picture)
+            .child(label)
+            .into_any_element()
+    }
+
+    /// Click, drag, and context-menu handling shared by list rows and tiles.
+    fn item_mouse_handlers(&self, el: gpui::Stateful<gpui::Div>, ix: usize, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        el.on_mouse_up(
+            MouseButton::Left,
+            cx.listener(move |this, event: &gpui::MouseUpEvent, _, cx| {
+                // A plain click on one item of a multi-selection (that didn't
+                // turn into a drag) narrows the selection to it, like Finder.
+                let m = event.modifiers;
+                if this.drag_origin.take().is_some() && !m.platform && !m.shift && this.selected.len() > 1 {
+                    this.select_only(ix, cx);
+                }
+            }),
+        )
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                this.menu = None;
+                let path = this.entries.get(ix).map(|e| e.path.clone());
+                if this.renaming().is_some_and(|(p, _)| Some(p) == path.as_deref()) {
+                    return; // Let the text field handle the click.
+                }
+                this.commit_edit(window, cx);
+                window.focus(&this.focus);
+                let m = event.modifiers;
+                if m.platform {
+                    this.toggle_selected(ix, cx);
+                } else if m.shift {
+                    this.select_range_to(ix, cx);
+                } else if event.click_count >= 2 {
+                    this.open_entry(ix, cx);
+                } else if !path.as_ref().is_some_and(|p| this.selected.contains(p)) {
+                    this.select_only(ix, cx);
+                }
+                // Pressing on a selected item may become a drag of the whole selection.
+                if path.as_ref().is_some_and(|p| this.selected.contains(p)) && event.click_count < 2 {
+                    this.drag_origin = Some(event.position);
+                }
+            }),
+        )
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                this.commit_edit(window, cx);
+                window.focus(&this.focus);
+                let path = this.entries.get(ix).map(|e| e.path.clone());
+                if path.is_some_and(|p| !this.selected.contains(&p)) {
+                    this.select_only(ix, cx);
+                }
+                this.open_list_menu(event.position, true, cx);
+            }),
+        )
+    }
+
     fn render_row(&self, ix: usize, icon: Option<Arc<Image>>, cx: &mut Context<Self>) -> AnyElement {
         let theme = &self.theme;
         let entry = &self.entries[ix];
@@ -869,57 +1056,7 @@ impl Browser {
             .when(selected, |d| d.bg(theme.selection))
             .when(!selected, |d| d.hover(|s| s.bg(theme.hover)))
             .when(entry.is_dir, |d| self.drop_target(d, entry.path.clone(), cx))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(move |this, event: &gpui::MouseUpEvent, _, cx| {
-                    // A plain click on one item of a multi-selection (that didn't
-                    // turn into a drag) narrows the selection to it, like Finder.
-                    let m = event.modifiers;
-                    if this.drag_origin.take().is_some() && !m.platform && !m.shift && this.selected.len() > 1 {
-                        this.select_only(ix, cx);
-                    }
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
-                    this.menu = None;
-                    let path = this.entries.get(ix).map(|e| e.path.clone());
-                    if this.renaming().is_some_and(|(p, _)| Some(p) == path.as_deref()) {
-                        return; // Let the text field handle the click.
-                    }
-                    this.commit_edit(window, cx);
-                    window.focus(&this.focus);
-                    let m = event.modifiers;
-                    if m.platform {
-                        this.toggle_selected(ix, cx);
-                    } else if m.shift {
-                        this.select_range_to(ix, cx);
-                    } else if event.click_count >= 2 {
-                        this.open_entry(ix, cx);
-                    } else if !path.as_ref().is_some_and(|p| this.selected.contains(p)) {
-                        this.select_only(ix, cx);
-                    }
-                    // Pressing on a selected item may become a drag of the whole selection.
-                    if path.as_ref().is_some_and(|p| this.selected.contains(p)) && event.click_count < 2 {
-                        this.drag_origin = Some(event.position);
-                    }
-                }),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
-                    this.commit_edit(window, cx);
-                    window.focus(&this.focus);
-                    let path = this.entries.get(ix).map(|e| e.path.clone());
-                    if path.is_some_and(|p| !this.selected.contains(&p)) {
-                        this.select_only(ix, cx);
-                    }
-                    this.open_list_menu(event.position, true, cx);
-                }),
-            )
+            .map(|d| self.item_mouse_handlers(d, ix, cx))
             .child(self.render_disclosure(ix, cx))
             .child(
                 div().w(px(22.)).flex_none().flex().items_center().child(match icon {
@@ -1173,7 +1310,7 @@ impl Browser {
             })
     }
 
-    fn render_status_bar(&self) -> impl IntoElement {
+    fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = &self.theme;
         let mut summary = count_label(self.entries.len());
         if !self.selected.is_empty() {
@@ -1205,6 +1342,82 @@ impl Browser {
             .child(div().flex_none().whitespace_nowrap().child(summary))
             .child(div().flex_1().min_w_0().flex().justify_end().text_color(color).truncate().child(message))
             .children(capacity.map(|c| div().flex_none().whitespace_nowrap().child(c)))
+            .when(self.view == ViewMode::Tiles, |d| d.child(self.render_tile_slider(cx)))
+    }
+
+    /// Tile size slider. Dragging is tracked window-wide so it keeps working
+    /// when the pointer leaves the track.
+    fn render_tile_slider(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        const WIDTH: f32 = 110.;
+        const KNOB: f32 = 12.;
+        fn size_at(bounds: Bounds<Pixels>, x: Pixels) -> f32 {
+            let t = (x - bounds.left() - px(KNOB / 2.)) / (bounds.size.width - px(KNOB));
+            MIN_TILE + t.clamp(0., 1.) * (MAX_TILE - MIN_TILE)
+        }
+        let theme = &self.theme;
+        let t = (self.tile_size - MIN_TILE) / (MAX_TILE - MIN_TILE);
+        let this = cx.entity().downgrade();
+        div()
+            .id("tile-size")
+            .flex_none()
+            .w(px(WIDTH))
+            .h(px(16.))
+            .relative()
+            .cursor_pointer()
+            .tooltip(tooltip("Tile size (⌘= / ⌘-)"))
+            .child(div().absolute().left(px(KNOB / 2.)).right(px(KNOB / 2.)).top(px(6.5)).h(px(3.)).rounded_full().bg(theme.border))
+            .child(
+                div()
+                    .absolute()
+                    .top(px(2.))
+                    .left(px(t * (WIDTH - KNOB)))
+                    .size(px(KNOB))
+                    .rounded_full()
+                    .bg(theme.background)
+                    .border_1()
+                    .border_color(theme.text_muted),
+            )
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, (), window, _| {
+                        let down = this.clone();
+                        window.on_mouse_event(move |e: &MouseDownEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Bubble && e.button == MouseButton::Left && bounds.contains(&e.position) {
+                                down.update(cx, |b, cx| {
+                                    b.tile_slider_drag = true;
+                                    b.set_tile_size(size_at(bounds, e.position.x), cx);
+                                })
+                                .ok();
+                            }
+                        });
+                        let moved = this.clone();
+                        window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Bubble && e.pressed_button == Some(MouseButton::Left) {
+                                moved
+                                    .update(cx, |b, cx| {
+                                        if b.tile_slider_drag {
+                                            b.set_tile_size(size_at(bounds, e.position.x), cx);
+                                        }
+                                    })
+                                    .ok();
+                            }
+                        });
+                        window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Bubble {
+                                this.update(cx, |b, cx| {
+                                    if std::mem::take(&mut b.tile_slider_drag) {
+                                        b.tile_size_committed(cx);
+                                    }
+                                })
+                                .ok();
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
     }
 
     fn render_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {

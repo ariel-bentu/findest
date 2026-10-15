@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::config::ViewMode;
+
 /// One browser window's state.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -15,6 +17,9 @@ pub struct WindowSession {
     pub recents: bool,
     /// Folders expanded in place (tree view).
     pub expanded: Vec<PathBuf>,
+    /// List or tiles; `None` defers to the config.
+    pub view: Option<ViewMode>,
+    pub tile_size: Option<f32>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -54,6 +59,7 @@ impl Session {
                 folder: session.folder.take(),
                 recents: session.recents,
                 expanded: std::mem::take(&mut session.expanded),
+                ..Default::default()
             });
         }
         for window in &mut session.windows {
@@ -83,9 +89,9 @@ mod tests {
         let here = tmp.path().to_path_buf();
         let session = Session::new(
             vec![
-                WindowSession { folder: Some(here.clone()), recents: false, expanded: vec![here.clone(), here.join("gone")] },
-                WindowSession { folder: Some(here.join("gone")), recents: false, expanded: vec![] },
-                WindowSession { folder: None, recents: true, expanded: vec![] },
+                WindowSession { folder: Some(here.clone()), recents: false, expanded: vec![here.clone(), here.join("gone")], ..Default::default() },
+                WindowSession { folder: Some(here.join("gone")), recents: false, expanded: vec![], ..Default::default() },
+                WindowSession { folder: None, recents: true, expanded: vec![], ..Default::default() },
             ],
             Some(false),
         );

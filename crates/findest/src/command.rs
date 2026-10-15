@@ -61,6 +61,11 @@ pub enum Command {
     CopyPath,
     ToggleHidden,
     ToggleInfo,
+    ViewList,
+    ViewTiles,
+    /// Bigger / smaller tiles (tiles view).
+    ZoomIn,
+    ZoomOut,
     Find,
     RebuildIndex,
     Refresh,
@@ -113,6 +118,10 @@ impl FromStr for Command {
             "copy_path" => CopyPath,
             "toggle_hidden" => ToggleHidden,
             "toggle_info" => ToggleInfo,
+            "view_list" => ViewList,
+            "view_tiles" => ViewTiles,
+            "zoom_in" => ZoomIn,
+            "zoom_out" => ZoomOut,
             "find" => Find,
             "rebuild_index" => RebuildIndex,
             "refresh" => Refresh,
@@ -216,5 +225,6 @@ mod tests {
         assert_eq!(shortcut_label(&map, "new_folder").unwrap(), "⇧⌘N");
         assert_eq!(shortcut_label(&map, "trash").unwrap(), "⌘⌫");
         assert_eq!(shortcut_label(&map, "open").unwrap(), "⌘O");
+        assert_eq!(shortcut_label(&map, "zoom_out").unwrap(), "⌘-");
     }
 }

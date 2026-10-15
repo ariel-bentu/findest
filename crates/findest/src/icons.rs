@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use findest_core::listing::Entry;
 use gpui::{Image, ImageFormat};
@@ -19,6 +20,8 @@ use objc2_uniform_type_identifiers::{UTType, UTTypeData, UTTypeFolder};
 /// Rendered icon edge in pixels: sharp on Retina both in rows (~18pt) and
 /// in the info panel (64pt).
 const ICON_PIXELS: f64 = 128.0;
+/// Edge for [`IconKey::Large`]: big tiles (up to 256pt).
+const LARGE_ICON_PIXELS: f64 = 512.0;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum IconKey {
@@ -30,6 +33,11 @@ pub enum IconKey {
     File,
     /// An SF Symbol (as in Finder's sidebar) tinted with an sRGB `0xRRGGBB` color.
     Symbol { name: &'static str, rgb: u32 },
+    /// Another icon rendered at a higher resolution, for big tiles.
+    Large(Box<IconKey>),
+    /// An image file's own contents, longer side at most `pixels`. `modified`
+    /// is part of the key so an edited image gets a fresh thumbnail.
+    Thumbnail { path: PathBuf, modified: Option<SystemTime>, pixels: u32 },
 }
 
 impl IconKey {
@@ -54,8 +62,15 @@ impl IconKey {
 
     /// Renders the icon as PNG bytes. Safe to call from a background thread.
     fn load(&self) -> Option<Vec<u8>> {
-        if let IconKey::Symbol { name, rgb } = self {
-            return render_symbol(name, *rgb);
+        self.load_at(ICON_PIXELS)
+    }
+
+    fn load_at(&self, pixels: f64) -> Option<Vec<u8>> {
+        match self {
+            IconKey::Symbol { name, rgb } => return render_symbol(name, *rgb),
+            IconKey::Large(inner) => return inner.load_at(LARGE_ICON_PIXELS),
+            IconKey::Thumbnail { path, pixels, .. } => return crate::system::image_preview_png(path, *pixels as f64),
+            _ => {}
         }
         autoreleasepool(|_| {
             let workspace = NSWorkspace::sharedWorkspace();
@@ -70,9 +85,9 @@ impl IconKey {
                 // SAFETY: immutable framework constants.
                 IconKey::Folder => workspace.iconForContentType(unsafe { UTTypeFolder }),
                 IconKey::File => workspace.iconForContentType(unsafe { UTTypeData }),
-                IconKey::Symbol { .. } => unreachable!("handled above"),
+                IconKey::Symbol { .. } | IconKey::Large(_) | IconKey::Thumbnail { .. } => unreachable!("handled above"),
             };
-            let size = NSSize::new(ICON_PIXELS, ICON_PIXELS);
+            let size = NSSize::new(pixels, pixels);
             image.setSize(size);
             let mut rect = NSRect::new(NSPoint::new(0.0, 0.0), size);
             // SAFETY: `rect` is a valid pointer for the duration of the call.
@@ -137,7 +152,15 @@ impl IconCache {
 
     /// Per-path icons can change (e.g. an app was updated); drop them on refresh.
     pub fn clear_paths(&mut self) {
-        self.icons.retain(|key, _| !matches!(key, IconKey::Path(_)));
+        self.icons.retain(|key, _| {
+            let key = if let IconKey::Large(inner) = key { inner } else { key };
+            !matches!(key, IconKey::Path(_) | IconKey::Thumbnail { .. })
+        });
+    }
+
+    /// Thumbnails are per folder; drop them when leaving it to bound memory.
+    pub fn clear_thumbnails(&mut self) {
+        self.icons.retain(|key, _| !matches!(key, IconKey::Thumbnail { .. }));
     }
 }
 
@@ -167,6 +190,12 @@ mod tests {
             IconKey::Extension("no-such-ext-xyz".into()),
             IconKey::Path("/System/Applications/Calculator.app".into()),
             IconKey::Symbol { name: "arrow.down.circle", rgb: 0x0a64ff },
+            IconKey::Large(Box::new(IconKey::Folder)),
+            IconKey::Thumbnail {
+                path: Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/AppIcon.png"),
+                modified: None,
+                pixels: 256,
+            },
         ];
         let handle = std::thread::spawn(move || keys.iter().map(|k| load_icon(k).map(|b| is_png(&b))).collect::<Vec<_>>());
         assert!(handle.join().unwrap().iter().all(|r| *r == Some(true)));

@@ -47,6 +47,10 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str)] = &[
     ("cmd-shift-.", "toggle_hidden"),
     ("cmd-f", "find"),
     ("cmd-i", "toggle_info"),
+    ("cmd-1", "view_list"),
+    ("cmd-2", "view_tiles"),
+    ("cmd-=", "zoom_in"),
+    ("cmd--", "zoom_out"),
     ("cmd-r", "refresh"),
     ("ctrl-cmd-t", "add_favorite"),
     ("cmd-shift-r", "show_recents"),
@@ -133,6 +137,10 @@ pub struct General {
     pub restore_session: bool,
     /// Show the info panel (details of the selection) on the right.
     pub info_panel: bool,
+    /// How new windows show a folder: a list (tree) or tiles.
+    pub view: ViewMode,
+    /// Tile edge in points (tiles view).
+    pub tile_size: f32,
     pub show_hidden: bool,
     pub folders_first: bool,
     pub sort_by: SortKey,
@@ -147,6 +155,8 @@ impl Default for General {
             start_path: "~".into(),
             restore_session: true,
             info_panel: true,
+            view: ViewMode::List,
+            tile_size: 96.0,
             show_hidden: false,
             folders_first: true,
             sort_by: SortKey::Name,
@@ -161,6 +171,16 @@ impl General {
     pub fn sort_order(&self) -> SortOrder {
         SortOrder { key: self.sort_by, ascending: self.sort_ascending, folders_first: self.folders_first }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewMode {
+    /// Rows with columns; folders expand in place.
+    #[default]
+    List,
+    /// Icons and image thumbnails in a grid.
+    Tiles,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

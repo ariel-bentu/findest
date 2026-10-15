@@ -77,6 +77,11 @@ fn menus() -> Vec<Menu> {
         Menu {
             name: "View".into(),
             items: vec![
+                item("as List", "view_list"),
+                item("as Tiles", "view_tiles"),
+                item("Bigger Tiles", "zoom_in"),
+                item("Smaller Tiles", "zoom_out"),
+                MenuItem::separator(),
                 item("Show/Hide Info Panel", "toggle_info"),
                 item("Show/Hide Hidden Files", "toggle_hidden"),
                 item("Refresh", "refresh"),
@@ -136,7 +141,14 @@ fn initial_windows(start: Option<PathBuf>) -> Vec<BrowserInit> {
         session
             .windows
             .into_iter()
-            .map(|w| BrowserInit { start: w.folder, recents: w.recents, expanded: w.expanded, info_panel: session.info_panel })
+            .map(|w| BrowserInit {
+                start: w.folder,
+                recents: w.recents,
+                expanded: w.expanded,
+                info_panel: session.info_panel,
+                view: w.view,
+                tile_size: w.tile_size,
+            })
             .collect()
     } else {
         Vec::new()

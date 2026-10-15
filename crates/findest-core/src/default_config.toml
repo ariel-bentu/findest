@@ -8,6 +8,10 @@ start_path = "~"
 restore_session = true
 # Show the info panel (details of the selection) on the right. Toggle with ⌘I.
 info_panel = true
+# "list" (tree) or "tiles" for new windows; switch with ⌘1 / ⌘2.
+view = "list"
+# Tile size in points (32-256); change with ⌘= / ⌘- or the status bar slider.
+tile_size = 96
 show_hidden = false
 folders_first = true
 # name | size | modified | kind

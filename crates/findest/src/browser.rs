@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use findest_core::config::{Config, Favorite};
+use findest_core::config::{Config, Favorite, ViewMode};
 use findest_core::listing::{self, Entry};
 use findest_core::locations::{self, Place};
 use findest_core::paths::{contract_tilde, display_name, home_dir};
@@ -32,7 +32,16 @@ pub struct BrowserInit {
     pub recents: bool,
     pub expanded: Vec<PathBuf>,
     pub info_panel: Option<bool>,
+    pub view: Option<ViewMode>,
+    pub tile_size: Option<f32>,
 }
+
+/// Tile size range (points), and the step for ⌘= / ⌘-.
+pub const MIN_TILE: f32 = 32.0;
+pub const MAX_TILE: f32 = 256.0;
+const TILE_ZOOM: f32 = 1.25;
+/// Images up to this size get a thumbnail tile.
+const MAX_THUMBNAIL_BYTES: u64 = 64 * 1024 * 1024;
 
 impl BrowserInit {
     pub fn at(start: Option<PathBuf>) -> Self {
@@ -162,6 +171,12 @@ pub struct Browser {
     volume_task: Option<Task<()>>,
     /// Folders expanded in place. Kept across navigation, like Finder.
     pub(crate) expanded: HashSet<PathBuf>,
+    pub(crate) view: ViewMode,
+    pub(crate) tile_size: f32,
+    /// Tiles per row, as last laid out; arrow keys move by this much vertically.
+    pub(crate) tile_columns: usize,
+    /// The tile size slider is being dragged.
+    pub(crate) tile_slider_drag: bool,
     pub(crate) loading: bool,
     pub(crate) load_error: Option<LoadError>,
     /// A pending press on back/forward: a quick click navigates, a long press opens history.
@@ -241,6 +256,8 @@ impl Browser {
 
         let restore_recents = init.recents;
         let restore_info_panel = init.info_panel;
+        let view = init.view.unwrap_or(config.general.view);
+        let tile_size = init.tile_size.unwrap_or(config.general.tile_size).clamp(MIN_TILE, MAX_TILE);
         let start = init.start.unwrap_or_else(|| config.start_path());
 
         let me = cx.weak_entity();
@@ -284,6 +301,10 @@ impl Browser {
             syntax_help: None,
             volume_task: None,
             expanded: init.expanded.into_iter().collect(),
+            view,
+            tile_size,
+            tile_columns: 1,
+            tile_slider_drag: false,
             loading: false,
             load_error: None,
             nav_press: None,
@@ -425,6 +446,7 @@ impl Browser {
         self.menu = None;
         self.entries.clear();
         self.depths.clear();
+        self.icons.clear_thumbnails();
         self.scroll.scroll_to_item(0, ScrollStrategy::Top);
         self.update_watches();
         self.save_session(cx);
@@ -451,6 +473,8 @@ impl Browser {
             folder: self.current_dir(),
             recents: self.location == Location::Recents,
             expanded: self.expanded.iter().cloned().collect(),
+            view: Some(self.view),
+            tile_size: Some(self.tile_size),
         }
     }
 
@@ -463,7 +487,8 @@ impl Browser {
         let show_hidden = self.config.general.show_hidden;
         let order = self.config.general.sort_order();
         let recents: Vec<PathBuf> = self.recents.items.clone();
-        let expanded = self.expanded.clone();
+        // Tiles show the folder's own items only; expansions are kept for the list.
+        let expanded = if self.view == ViewMode::Tiles { HashSet::new() } else { self.expanded.clone() };
         self.loading = true;
         let listing = cx.background_executor().spawn(async move {
             match &location {
@@ -562,9 +587,14 @@ impl Browser {
 
     fn set_cursor(&mut self, path: Option<PathBuf>) {
         if let Some(ix) = path.as_deref().and_then(|p| self.index_of(p)) {
-            self.scroll.scroll_to_item(ix, ScrollStrategy::Top);
+            self.scroll.scroll_to_item(self.list_row(ix), ScrollStrategy::Top);
         }
         self.cursor = path;
+    }
+
+    /// The `uniform_list` row showing entry `ix` (tiles pack several per row).
+    fn list_row(&self, ix: usize) -> usize {
+        if self.view == ViewMode::Tiles { ix / self.tile_columns.max(1) } else { ix }
     }
 
     pub fn select_only(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -697,11 +727,20 @@ impl Browser {
         if !matches!(command, SelectPrev | SelectNext | ExtendPrev | ExtendNext) {
             self.status = None;
         }
+        let tiles = self.view == ViewMode::Tiles;
+        // In tiles, ↑/↓ move a whole row and ←/→ one tile.
+        let row = if tiles { self.tile_columns.max(1) as isize } else { 1 };
         match command {
-            SelectPrev => self.move_cursor(-1, false, cx),
-            SelectNext => self.move_cursor(1, false, cx),
-            ExtendPrev => self.move_cursor(-1, true, cx),
-            ExtendNext => self.move_cursor(1, true, cx),
+            SelectPrev => self.move_cursor(-row, false, cx),
+            SelectNext => self.move_cursor(row, false, cx),
+            ExtendPrev => self.move_cursor(-row, true, cx),
+            ExtendNext => self.move_cursor(row, true, cx),
+            Expand if tiles => self.move_cursor(1, false, cx),
+            Collapse if tiles => self.move_cursor(-1, false, cx),
+            ViewList => self.set_view(ViewMode::List, cx),
+            ViewTiles => self.set_view(ViewMode::Tiles, cx),
+            ZoomIn => self.zoom_tiles(TILE_ZOOM, cx),
+            ZoomOut => self.zoom_tiles(1.0 / TILE_ZOOM, cx),
             SelectFirst => self.select_only(0, cx),
             SelectLast => self.select_only(self.entries.len().saturating_sub(1), cx),
             SelectAll => {
@@ -789,7 +828,13 @@ impl Browser {
                 self.set_info(format!("Copied {}", if paths.len() == 1 { "path".into() } else { format!("{} paths", paths.len()) }), cx);
             }
             NewWindow => {
-                let init = BrowserInit { start: self.current_dir(), info_panel: Some(self.config.general.info_panel), ..Default::default() };
+                let init = BrowserInit {
+                    start: self.current_dir(),
+                    info_panel: Some(self.config.general.info_panel),
+                    view: Some(self.view),
+                    tile_size: Some(self.tile_size),
+                    ..Default::default()
+                };
                 cx.defer(move |cx| {
                     crate::open_browser_window(init, cx);
                 });
@@ -1453,6 +1498,63 @@ impl Browser {
         }
         self.menu = Some(ContextMenu { position, entries });
         cx.notify();
+    }
+
+    pub fn set_view(&mut self, view: ViewMode, cx: &mut Context<Self>) {
+        if self.view == view {
+            return;
+        }
+        self.view = view;
+        // Keep the selection in view once the new layout arrives.
+        self.pending_select = Some(PendingSelect { paths: self.selection(), name_new: false });
+        self.save_session(cx);
+        self.reload(cx);
+    }
+
+    fn zoom_tiles(&mut self, factor: f32, cx: &mut Context<Self>) {
+        if self.view != ViewMode::Tiles {
+            return self.set_view(ViewMode::Tiles, cx);
+        }
+        self.set_tile_size(self.tile_size * factor, cx);
+        self.save_session(cx);
+    }
+
+    /// Resizes tiles (slider drags call this per move; the session is saved on release).
+    pub fn set_tile_size(&mut self, size: f32, cx: &mut Context<Self>) {
+        let size = size.clamp(MIN_TILE, MAX_TILE).round();
+        if size != self.tile_size {
+            self.tile_size = size;
+            if let Some(ix) = self.cursor_index() {
+                self.scroll.scroll_to_item(self.list_row(ix), ScrollStrategy::Center);
+            }
+            cx.notify();
+        }
+    }
+
+    pub fn tile_size_committed(&mut self, cx: &mut Context<Self>) {
+        self.save_session(cx);
+    }
+
+    /// The picture for tile `ix`: the image itself for image files (once its
+    /// thumbnail is ready), else its icon, sharper for big tiles.
+    pub fn tile_image(&mut self, ix: usize, cx: &mut Context<Self>) -> Option<std::sync::Arc<gpui::Image>> {
+        let entry = self.entries.get(ix)?;
+        let icon = IconKey::for_entry(entry, &self.home);
+        let icon = if self.tile_size > 64.0 { IconKey::Large(Box::new(icon)) } else { icon };
+        let thumbnail = !entry.is_dir && entry.size <= MAX_THUMBNAIL_BYTES && is_image_path(&entry.path);
+        let (path, modified) = (entry.path.clone(), entry.modified);
+        if thumbnail {
+            // Retina pixels, in a few buckets so resizing doesn't re-render every step.
+            const BUCKETS: [u32; 3] = [128, 256, 512];
+            let pixels = BUCKETS.into_iter().find(|&p| p as f32 >= self.tile_size * 2.0).unwrap_or(512);
+            let key = |pixels| IconKey::Thumbnail { path: path.clone(), modified, pixels };
+            // While resizing, show another size until this one is ready.
+            let fallback = BUCKETS.into_iter().rev().find_map(|p| self.icons.peek(&key(p)));
+            if let Some(thumbnail) = self.request_icon(key(pixels), cx).or(fallback) {
+                return Some(thumbnail);
+            }
+        }
+        self.request_icon(icon, cx)
     }
 
     /// The icon for row `ix`, kicking off a background load on first request.
