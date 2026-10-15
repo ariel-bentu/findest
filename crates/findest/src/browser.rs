@@ -58,6 +58,8 @@ pub enum Location {
 
 pub enum EditKind {
     Rename(PathBuf),
+    /// Naming a just-created item: Esc or an empty name removes it again.
+    NameNew(PathBuf),
     GoToFolder,
 }
 
@@ -127,10 +129,11 @@ pub struct LoadError {
 }
 
 
-/// What to select (and optionally start renaming) once the next listing arrives.
+/// What to select once the next listing arrives; `name_new` then starts
+/// naming it (a just-created item).
 struct PendingSelect {
     paths: Vec<PathBuf>,
-    rename: bool,
+    name_new: bool,
 }
 
 pub struct Browser {
@@ -168,8 +171,8 @@ pub struct Browser {
     pub(crate) drag_origin: Option<Point<Pixels>>,
     load_task: Option<Task<()>>,
     pending_select: Option<PendingSelect>,
-    /// Set when a just-created item should enter rename mode on the next frame.
-    pub(crate) pending_rename: bool,
+    /// Set when a just-created item should be named on the next frame.
+    pub(crate) pending_name_new: bool,
     pub(crate) selected: HashSet<PathBuf>,
     cursor: Option<PathBuf>,
     anchor: Option<PathBuf>,
@@ -288,7 +291,7 @@ impl Browser {
             drag_origin: None,
             load_task: None,
             pending_select: None,
-            pending_rename: false,
+            pending_name_new: false,
             selected: HashSet::new(),
             cursor: None,
             anchor: None,
@@ -418,7 +421,7 @@ impl Browser {
         self.selected.clear();
         self.cursor = None;
         self.anchor = None;
-        self.edit = None;
+        self.discard_edit(cx);
         self.menu = None;
         self.entries.clear();
         self.depths.clear();
@@ -517,8 +520,8 @@ impl Browser {
                 self.selected = found.iter().cloned().collect();
                 self.set_cursor(found.last().cloned());
                 self.anchor = found.first().cloned();
-                if pending.rename && found.len() == 1 {
-                    self.pending_rename = true;
+                if pending.name_new && found.len() == 1 {
+                    self.pending_name_new = true;
                 }
             }
         }
@@ -880,8 +883,8 @@ impl Browser {
         .detach();
     }
 
-    fn reload_and_select(&mut self, paths: Vec<PathBuf>, rename: bool, cx: &mut Context<Self>) {
-        self.pending_select = Some(PendingSelect { paths, rename });
+    fn reload_and_select(&mut self, paths: Vec<PathBuf>, name_new: bool, cx: &mut Context<Self>) {
+        self.pending_select = Some(PendingSelect { paths, name_new });
         self.reload(cx);
     }
 
@@ -948,7 +951,7 @@ impl Browser {
         let Some(dir) = self.current_dir() else { return };
         if let Some(parent) = dir.parent() {
             self.navigate(Location::Dir(parent.to_path_buf()), true, cx);
-            self.pending_select = Some(PendingSelect { paths: vec![dir], rename: false });
+            self.pending_select = Some(PendingSelect { paths: vec![dir], name_new: false });
         }
     }
 
@@ -957,7 +960,7 @@ impl Browser {
             self.navigate(Location::Dir(path), true, cx);
         } else if let Some(parent) = path.parent().filter(|_| path.exists()) {
             self.navigate(Location::Dir(parent.to_path_buf()), true, cx);
-            self.pending_select = Some(PendingSelect { paths: vec![path], rename: false });
+            self.pending_select = Some(PendingSelect { paths: vec![path], name_new: false });
         } else {
             self.set_error(format!("{} doesn't exist", contract_tilde(&path)), cx);
         }
@@ -1076,6 +1079,13 @@ impl Browser {
         self.start_edit(EditKind::Rename(entry.path.clone()), entry.name.clone(), 0..stem_len, "", window, cx);
     }
 
+    /// Names a just-created item, starting from an empty field.
+    pub fn start_name_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry) = self.single_selected_entry().cloned() else { return };
+        let placeholder = if entry.is_dir { "Folder name" } else { "File name" };
+        self.start_edit(EditKind::NameNew(entry.path), String::new(), 0..0, placeholder, window, cx);
+    }
+
     fn start_go_to_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // A path on the clipboard is probably where the user wants to go:
         // prefill it, selected, so Enter jumps there and typing replaces it.
@@ -1133,7 +1143,7 @@ impl Browser {
             cx.on_blur(&input.focus_handle(cx), window, |this, window, cx| {
                 // Clicking away commits a rename, but abandons go-to-folder.
                 match this.edit.as_ref().map(|e| &e.kind) {
-                    Some(EditKind::Rename(_)) => this.commit_edit(window, cx),
+                    Some(EditKind::Rename(_) | EditKind::NameNew(_)) => this.commit_edit(window, cx),
                     Some(EditKind::GoToFolder) => this.cancel_edit(window, cx),
                     None => {}
                 }
@@ -1156,7 +1166,8 @@ impl Browser {
         let text = edit.input.read(cx).text().to_string();
         window.focus(&self.focus);
         match edit.kind {
-            EditKind::Rename(path) => {
+            EditKind::NameNew(path) if text.trim().is_empty() => self.discard_new(path, cx),
+            EditKind::Rename(path) | EditKind::NameNew(path) => {
                 if text == display_name(&path) {
                     return cx.notify();
                 }
@@ -1182,15 +1193,29 @@ impl Browser {
     }
 
     pub fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.edit.take().is_some() {
+        if self.edit.is_some() {
+            self.discard_edit(cx);
             window.focus(&self.focus);
             cx.notify();
         }
     }
 
+    /// Drops any edit in progress, removing a just-created item that never got a name.
+    fn discard_edit(&mut self, cx: &mut Context<Self>) {
+        if let Some(Edit { kind: EditKind::NameNew(path), .. }) = self.edit.take() {
+            self.discard_new(path, cx);
+        }
+    }
+
+    fn discard_new(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let result = ops::discard_new(&path);
+        self.report(result, cx);
+        self.reload(cx);
+    }
+
     pub fn renaming(&self) -> Option<(&Path, &Entity<TextInput>)> {
         match &self.edit {
-            Some(Edit { kind: EditKind::Rename(path), input, .. }) => Some((path, input)),
+            Some(Edit { kind: EditKind::Rename(path) | EditKind::NameNew(path), input, .. }) => Some((path, input)),
             _ => None,
         }
     }
@@ -1655,7 +1680,7 @@ impl Browser {
         if let Some(cursor) = self.cursor.clone()
             && let Some(dir) = dirs.iter().find(|d| cursor.starts_with(d) && cursor != **d)
         {
-            self.pending_select = Some(PendingSelect { paths: vec![dir.clone()], rename: false });
+            self.pending_select = Some(PendingSelect { paths: vec![dir.clone()], name_new: false });
         }
         self.save_session(cx);
         self.reload(cx);

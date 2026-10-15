@@ -37,8 +37,8 @@ impl Render for Browser {
         if std::mem::take(&mut self.refocus_list) {
             window.focus(&self.focus);
         }
-        if std::mem::take(&mut self.pending_rename) {
-            self.start_rename(window, cx);
+        if std::mem::take(&mut self.pending_name_new) {
+            self.start_name_new(window, cx);
         }
         let title = format!("Findest — {}", self.location_label());
         if title != self.last_title {
@@ -149,6 +149,7 @@ impl Browser {
             .child(self.syntax_help_button(cx))
             .child(self.toolbar_text_button("goto", "Go to…", "go_to_folder", cx))
             .child(self.toolbar_text_button("hidden", hidden_label, "toggle_hidden", cx))
+            .child(self.folder_menu_button(cx))
             .child(self.info_toggle_button(cx))
     }
 
@@ -331,6 +332,25 @@ impl Browser {
                         .child(status)
                 })),
         )
+    }
+
+    /// "⋯": actions on the current folder (New Folder, Paste, …), the same
+    /// menu as right-clicking empty space in the list.
+    fn folder_menu_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        self.symbol_button("folder-menu", "ellipsis.circle", "⋯", true)
+            .tooltip(tooltip("Folder actions"))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.syntax_help = None;
+                    this.commit_edit(window, cx);
+                    this.clear_selection(cx);
+                    window.focus(&this.focus);
+                    let position = Point { x: event.position.x - px(14.), y: event.position.y + px(18.) };
+                    this.open_list_menu(position, false, cx);
+                }),
+            )
     }
 
     /// Opens/closes the info panel; highlighted while it's open.

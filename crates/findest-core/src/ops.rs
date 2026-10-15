@@ -49,6 +49,20 @@ pub fn create_file(dir: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Removes a just-created item whose naming was cancelled, but only while it
+/// is still an empty folder or an empty file.
+pub fn discard_new(path: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(path)?;
+    if meta.is_dir() {
+        fs::remove_dir(path)?;
+    } else if meta.is_file() && meta.len() == 0 {
+        fs::remove_file(path)?;
+    } else {
+        bail!("\"{}\" isn't empty any more", crate::paths::display_name(path));
+    }
+    Ok(())
+}
+
 pub fn validate_name(name: &str) -> Result<()> {
     if name.trim().is_empty() {
         bail!("Name can't be empty");
@@ -198,6 +212,14 @@ mod tests {
         let g = create_file(tmp.path()).unwrap();
         assert_eq!(f.file_name().unwrap(), "untitled.txt");
         assert_eq!(g.file_name().unwrap(), "untitled 2.txt");
+
+        discard_new(&a).unwrap();
+        discard_new(&f).unwrap();
+        assert!(!a.exists() && !f.exists());
+        fs::write(&g, "keep").unwrap();
+        fs::write(b.join("x"), "").unwrap();
+        assert!(discard_new(&g).is_err() && discard_new(&b).is_err());
+        assert!(g.exists() && b.exists());
     }
 
     #[test]
