@@ -10,19 +10,27 @@ crates/
   findest/        The GPUI app: window, sidebar, file list, menus, keybindings
 ```
 
-## Run
+## Install
 
 ```sh
-cargo run -p findest            # debug
-cargo run -p findest --release  # fast
+cargo install --path crates/findest
+findest            # installs/updates Findest.app, then opens it
+findest ~/code     # open a folder (like `code .`)
+```
+
+Run from a terminal, a release build of `findest` installs or updates `Findest.app`, in `/Applications`, or in `~/Applications` if `/Applications` isn't writable. It then hands off to the app. Findest needs to run as its own app: macOS gives privacy permissions (Full Disk Access, OneDrive and iCloud folders) to the app that launched it, so a binary run from a terminal gets the terminal's permissions. The bundle is signed with your "Apple Development" certificate if you have one, so permissions survive updates. To choose a different certificate, set `FINDEST_SIGN_IDENTITY`.
+
+Findest also appears in Finder's "Open With" menu for folders.
+
+## Develop
+
+```sh
+cargo run -p findest [-- <path>]   # debug builds always run in place
 cargo test --workspace
+./scripts/make_icon.sh             # regenerate assets/AppIcon.icns
 ```
 
-To install as a real app (recommended: it gets its own macOS privacy permissions, e.g. for OneDrive/iCloud folders):
-
-```sh
-./scripts/bundle.sh && cp -R target/release/Findest.app /Applications/
-```
+Set `FINDEST_NO_BUNDLE=1` to run a release build in place.
 
 GPUI is built with `runtime_shaders`, so you don't need Xcode's separately downloaded Metal toolchain. To precompile shaders instead, run `xcodebuild -downloadComponent MetalToolchain` and remove that feature.
 

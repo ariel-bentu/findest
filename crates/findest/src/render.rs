@@ -8,13 +8,15 @@ use std::time::SystemTime;
 use chrono::{DateTime, Local};
 use findest_core::listing::{Entry, SortKey, format_size};
 use findest_core::locations;
-use findest_core::paths::{contract_tilde, home_dir};
+use findest_core::paths::contract_tilde;
 use gpui::{
     AnyElement, Context, ExternalPaths, FontWeight, Hsla, Image, MouseButton, MouseDownEvent,
-    Pixels, Point, SharedString, Window, anchored, deferred, div, img, prelude::*, px, uniform_list,
+    ObjectFit, Pixels, Point, SharedString, Window, anchored, deferred, div, img, prelude::*, px, uniform_list,
 };
 
-use crate::browser::{Browser, DraggedFiles, EditKind, Location, MenuAction, MenuEntry, count_label};
+use crate::browser::{
+    Browser, DraggedFiles, EditKind, GoToTarget, Location, MenuAction, MenuEntry, count_label, go_to_target,
+};
 use crate::command::BROWSER_CONTEXT;
 
 const SIDEBAR_WIDTH: f32 = 200.0;
@@ -24,10 +26,11 @@ const COL_KIND: f32 = 130.0;
 
 impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.load_sidebar_icons(cx);
         if std::mem::take(&mut self.pending_rename) {
             self.start_rename(window, cx);
         }
-        let title = self.location_label();
+        let title = format!("Findest — {}", self.location_label());
         if title != self.last_title {
             window.set_window_title(&title);
             self.last_title = title;
@@ -47,7 +50,7 @@ impl Render for Browser {
             .text_color(theme.text)
             .text_size(px(theme.font_size))
             .child(self.render_toolbar(cx))
-            .children(self.render_go_to_folder())
+            .children(self.render_go_to_folder(cx))
             .child(
                 div()
                     .flex()
@@ -120,6 +123,7 @@ impl Browser {
             .child(self.toolbar_button("up", "↑", self.current_dir().is_some_and(|d| d.parent().is_some()), "go_up", cx))
             .child(crumbs)
             .when(self.loading, |d| d.child(div().text_color(theme.text_muted).child("Loading…")))
+            .child(self.toolbar_text_button("goto", "Go to…", "go_to_folder", cx))
             .child(self.toolbar_text_button("hidden", hidden_label, "toggle_hidden", cx))
     }
 
@@ -197,9 +201,15 @@ impl Browser {
             .child(label)
     }
 
-    fn render_go_to_folder(&self) -> Option<impl IntoElement> {
+    fn render_go_to_folder(&self, cx: &gpui::App) -> Option<impl IntoElement> {
         let edit = self.edit.as_ref().filter(|e| matches!(e.kind, EditKind::GoToFolder))?;
         let theme = &self.theme;
+        // Checked every frame while the bar is open: one stat() call, so typing gets live feedback.
+        let (hint, hint_color, border) = match go_to_target(edit.input.read(cx).text()) {
+            GoToTarget::Missing => ("⚠ This path doesn't exist", theme.danger, theme.danger),
+            GoToTarget::File => ("↩ shows the file in its folder · ⎋ cancel", theme.text_muted, theme.accent),
+            GoToTarget::Folder | GoToTarget::Empty => ("↩ go · ⎋ cancel", theme.text_muted, theme.accent),
+        };
         Some(
             div()
                 .flex()
@@ -211,19 +221,74 @@ impl Browser {
                 .bg(theme.surface)
                 .border_b_1()
                 .border_color(theme.border)
-                .child(div().text_color(theme.text_muted).whitespace_nowrap().child("Go to folder"))
+                .child(div().text_color(theme.text_muted).whitespace_nowrap().child("Go to"))
                 .child(
                     div()
                         .flex_1()
+                        .min_w_0()
                         .px_2()
                         .py(px(3.))
                         .rounded_md()
                         .bg(theme.background)
                         .border_1()
-                        .border_color(theme.accent)
+                        .border_color(border)
                         .child(edit.input.clone()),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(hint_color)
+                        .text_size(px(theme.font_size - 1.))
+                        .whitespace_nowrap()
+                        .child(hint),
                 ),
         )
+    }
+
+    /// Everything listed in the sidebar below Recents, grouped by section.
+    fn sidebar_places(&self) -> Vec<SidebarPlace> {
+        let mut places = Vec::new();
+        for (ix, fav) in self.config.favorites.iter().enumerate() {
+            let path = fav.resolved_path();
+            places.push(SidebarPlace {
+                section: "Favorites",
+                id: format!("fav-{ix}"),
+                symbol: place_symbol(&self.home, &path),
+                label: fav.label(),
+                path,
+                favorite: Some(ix),
+            });
+        }
+        for (ix, place) in self.cloud.iter().enumerate() {
+            let icloud = place.path == locations::icloud_drive(&self.home);
+            places.push(SidebarPlace {
+                section: "Cloud",
+                id: format!("cloud-{ix}"),
+                symbol: if icloud { "icloud" } else { "cloud" },
+                label: place.label.clone(),
+                path: place.path.clone(),
+                favorite: None,
+            });
+        }
+        let mut push_location = |id: String, symbol, label: String, path: PathBuf| {
+            places.push(SidebarPlace { section: "Locations", id, symbol, label, path, favorite: None });
+        };
+        push_location("loc-root".into(), "internaldrive", "Macintosh HD".into(), PathBuf::from("/"));
+        for (ix, v) in self.volumes.iter().enumerate() {
+            push_location(format!("loc-{ix}"), "externaldrive", v.label.clone(), v.path.clone());
+        }
+        push_location("loc-trash".into(), "trash", "Trash".into(), self.trash_dir());
+        places
+    }
+
+    /// Requests any sidebar symbols not yet rendered (call before `render_sidebar`).
+    pub(crate) fn load_sidebar_icons(&mut self, cx: &mut Context<Self>) {
+        let names: Vec<&'static str> =
+            ["clock"].into_iter().chain(self.sidebar_places().iter().map(|p| p.symbol)).collect();
+        for name in names {
+            let key = self.symbol_key(name);
+            self.request_icon(key, cx);
+        }
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -243,7 +308,7 @@ impl Browser {
 
         list = list.child(self.sidebar_item(
             "recents".into(),
-            "🕘",
+            "clock",
             "Recents".into(),
             self.location == Location::Recents,
             cx.listener(|this, _: &MouseDownEvent, _, cx| this.navigate(Location::Recents, true, cx)),
@@ -251,58 +316,23 @@ impl Browser {
             cx,
         ));
 
-        list = list.child(self.sidebar_header("Favorites"));
-        for (ix, fav) in self.config.favorites.iter().enumerate() {
-            let path = fav.resolved_path();
-            let icon = if path == home_dir() { "🏠" } else { "📁" };
-            list = list.child(self.sidebar_item(
-                format!("fav-{ix}").into(),
-                icon,
-                fav.label().into(),
-                self.location == Location::Dir(path.clone()),
-                cx.listener({
-                    let path = path.clone();
-                    move |this, _: &MouseDownEvent, _, cx| this.navigate_to_path(path.clone(), cx)
-                }),
-                Some((path, Some(ix))),
-                cx,
-            ));
-        }
-
-        if !self.cloud.is_empty() {
-            list = list.child(self.sidebar_header("Cloud"));
-            for (ix, place) in self.cloud.iter().enumerate() {
-                let path = place.path.clone();
-                list = list.child(self.sidebar_item(
-                    format!("cloud-{ix}").into(),
-                    "☁️",
-                    place.label.clone().into(),
-                    self.location == Location::Dir(path.clone()),
-                    cx.listener({
-                        let path = path.clone();
-                        move |this, _: &MouseDownEvent, _, cx| this.navigate_to_path(path.clone(), cx)
-                    }),
-                    Some((path, None)),
-                    cx,
-                ));
+        let mut section = "";
+        for place in self.sidebar_places() {
+            if place.section != section {
+                section = place.section;
+                list = list.child(self.sidebar_header(section));
             }
-        }
-
-        list = list.child(self.sidebar_header("Locations"));
-        let root = PathBuf::from("/");
-        let mut locations = vec![(root, "💻", "Macintosh HD".to_string())];
-        locations.extend(self.volumes.iter().map(|v| (v.path.clone(), "💽", v.label.clone())));
-        for (ix, (path, icon, label)) in locations.into_iter().enumerate() {
+            let path = place.path.clone();
             list = list.child(self.sidebar_item(
-                format!("loc-{ix}").into(),
-                icon,
-                label.into(),
+                place.id.into(),
+                place.symbol,
+                place.label.into(),
                 self.location == Location::Dir(path.clone()),
                 cx.listener({
                     let path = path.clone();
                     move |this, _: &MouseDownEvent, _, cx| this.navigate_to_path(path.clone(), cx)
                 }),
-                Some((path, None)),
+                Some((path, place.favorite)),
                 cx,
             ));
         }
@@ -324,7 +354,7 @@ impl Browser {
     fn sidebar_item(
         &self,
         id: SharedString,
-        icon: &'static str,
+        symbol: &'static str,
         label: SharedString,
         active: bool,
         on_click: impl Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
@@ -355,7 +385,14 @@ impl Browser {
                     }),
                 )
             })
-            .child(div().flex_none().child(icon))
+            .child(
+                div().w(px(18.)).h(px(16.)).flex_none().flex().items_center().justify_center().child(
+                    match self.icons.peek(&self.symbol_key(symbol)) {
+                        Some(image) => img(image).size_full().object_fit(ObjectFit::Contain).into_any_element(),
+                        None => div().text_color(theme.accent).child("•").into_any_element(),
+                    },
+                ),
+            )
             .child(div().flex_1().min_w_0().truncate().child(label))
     }
 
@@ -812,6 +849,36 @@ fn permission_hint() -> String {
              and grant it Full Disk Access.",
             launcher.unwrap_or_else(|_| "a terminal".into())
         ),
+    }
+}
+
+struct SidebarPlace {
+    section: &'static str,
+    id: String,
+    symbol: &'static str,
+    label: String,
+    path: PathBuf,
+    favorite: Option<usize>,
+}
+
+/// Finder-style SF Symbol for well-known folders.
+fn place_symbol(home: &std::path::Path, path: &std::path::Path) -> &'static str {
+    if path == home {
+        return "house";
+    }
+    if path == std::path::Path::new("/Applications") || path == home.join("Applications") {
+        return "square.grid.2x2";
+    }
+    match path.strip_prefix(home).ok().and_then(|p| p.to_str()) {
+        Some("Desktop") => "menubar.dock.rectangle",
+        Some("Documents") => "doc",
+        Some("Downloads") => "arrow.down.circle",
+        Some("Movies") => "film",
+        Some("Music") => "music.note",
+        Some("Pictures") => "photo",
+        Some("Public") => "person.2",
+        Some("Library") => "building.columns",
+        _ => "folder",
     }
 }
 

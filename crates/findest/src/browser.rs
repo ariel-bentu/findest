@@ -9,7 +9,7 @@ use anyhow::Result;
 use findest_core::config::{Config, Favorite};
 use findest_core::listing::{self, Entry};
 use findest_core::locations::{self, Place};
-use findest_core::paths::{contract_tilde, display_name, expand_tilde, home_dir};
+use findest_core::paths::{contract_tilde, display_name, home_dir};
 use findest_core::recents::Recents;
 use findest_core::{launch, ops};
 use futures::StreamExt;
@@ -135,7 +135,7 @@ impl Focusable for Browser {
 }
 
 impl Browser {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(start: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let config_path = Config::path();
         let (config, mut errors) = match Config::load_or_init(&config_path) {
             Ok(config) => (config, Vec::new()),
@@ -172,7 +172,7 @@ impl Browser {
             this.apply_config(this.config.clone(), window, cx);
         })];
 
-        let start = config.start_path();
+        let start = start.unwrap_or_else(|| config.start_path());
         let mut this = Self {
             focus: cx.focus_handle(),
             config,
@@ -209,8 +209,13 @@ impl Browser {
             _tasks: tasks,
             _subscriptions: subscriptions,
         };
-        let start = if start.is_dir() { start } else { home_dir() };
-        this.navigate(Location::Dir(start), false, cx);
+        if start.is_dir() {
+            this.navigate(Location::Dir(start), false, cx);
+        } else {
+            this.navigate(Location::Dir(home_dir()), false, cx);
+            // A file was passed in: show it in its folder.
+            this.navigate_to_path(start, cx);
+        }
         if !errors.is_empty() {
             this.set_error(format!("Config: {}", errors.join("; ")), cx);
         }
@@ -575,6 +580,7 @@ impl Browser {
             TrashConfirm => self.trash(true, window, cx),
             TrashNow => self.trash(false, window, cx),
             DeletePermanently => self.delete_permanently(window, cx),
+            EmptyTrash => self.empty_trash(window, cx),
             Copy => {
                 let paths = self.selection();
                 if paths.is_empty() {
@@ -788,6 +794,28 @@ impl Browser {
         });
     }
 
+    pub fn trash_dir(&self) -> PathBuf {
+        locations::trash(&self.home)
+    }
+
+    fn empty_trash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let items: Vec<PathBuf> = match std::fs::read_dir(self.trash_dir()) {
+            Ok(read) => read.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| !p.ends_with(".DS_Store")).collect(),
+            Err(e) => return self.set_error(format!("Can't read the Trash: {e} (Findest needs Full Disk Access)"), cx),
+        };
+        if items.is_empty() {
+            return self.set_info("The Trash is empty", cx);
+        }
+        let message = format!("Permanently erase {} in the Trash?", count_label(items.len()));
+        self.confirm_then(true, &message, Some("This can't be undone."), "Empty Trash", window, cx, move |this, cx| {
+            let n = items.len();
+            this.run_op(cx, move || ops::delete_permanently(&items), move |this, (), cx| {
+                this.set_info(format!("Erased {}", count_label(n)), cx);
+                this.reload(cx);
+            });
+        });
+    }
+
     fn delete_permanently(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let paths = self.selection();
         if paths.is_empty() {
@@ -865,6 +893,17 @@ impl Browser {
     }
 
     fn start_go_to_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A path on the clipboard is probably where the user wants to go:
+        // prefill it, selected, so Enter jumps there and typing replaces it.
+        let clipboard = cx.read_from_clipboard().and_then(|item| item.text()).filter(|t| t.trim().lines().count() == 1);
+        if let Some(text) = clipboard
+            && let Some(path) = findest_core::paths::parse_user_path(&text)
+            && path.exists()
+        {
+            let text = contract_tilde(&path);
+            let len = text.len();
+            return self.start_edit(EditKind::GoToFolder, text, 0..len, "Path, e.g. ~/Projects", window, cx);
+        }
         let text = match &self.location {
             Location::Dir(dir) => {
                 let mut s = contract_tilde(dir);
@@ -900,6 +939,8 @@ impl Browser {
             input
         });
         let subscriptions = vec![
+            // Re-render on every edit so the Go to bar's path check stays live.
+            cx.observe(&input, |_, _, cx| cx.notify()),
             cx.subscribe_in(&input, window, |this, _, event, window, cx| match event {
                 TextInputEvent::Confirm => this.commit_edit(window, cx),
                 TextInputEvent::Cancel => this.cancel_edit(window, cx),
@@ -919,6 +960,13 @@ impl Browser {
     }
 
     pub fn commit_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Enter on a path that doesn't exist keeps the Go to bar open; it's already
+        // showing the warning, so the user can fix the path.
+        if let Some(Edit { kind: EditKind::GoToFolder, input, .. }) = &self.edit
+            && go_to_target(input.read(cx).text()) == GoToTarget::Missing
+        {
+            return;
+        }
         let Some(edit) = self.edit.take() else { return };
         let text = edit.input.read(cx).text().to_string();
         window.focus(&self.focus);
@@ -940,9 +988,8 @@ impl Browser {
                 }
             }
             EditKind::GoToFolder => {
-                let text = text.trim();
-                if !text.is_empty() {
-                    self.navigate_to_path(expand_tilde(text), cx);
+                if let Some(path) = findest_core::paths::parse_user_path(&text) {
+                    self.navigate_to_path(path, cx);
                 }
             }
         }
@@ -1035,6 +1082,15 @@ impl Browser {
             let hidden = if self.config.general.show_hidden { "Hide Hidden Files" } else { "Show Hidden Files" };
             entries.push(self.item(hidden, ToggleHidden, "toggle_hidden"));
             entries.push(self.item("Refresh", Refresh, "refresh"));
+            if self.current_dir() == Some(self.trash_dir()) {
+                entries.push(MenuEntry::Separator);
+                entries.push(MenuEntry::Item {
+                    label: "Empty Trash…".into(),
+                    detail: command::shortcut_label(&self.keymap, "empty_trash"),
+                    action: MenuAction::Command(EmptyTrash),
+                    danger: true,
+                });
+            }
         }
         self.menu = Some(ContextMenu { position, entries });
         cx.notify();
@@ -1053,12 +1109,22 @@ impl Browser {
                 danger: false,
             })
             .collect();
+        let is_trash = path == self.trash_dir();
         entries.push(MenuEntry::Item {
             label: "Reveal in Finder".into(),
             detail: None,
             action: MenuAction::RevealPath(path),
             danger: false,
         });
+        if is_trash {
+            entries.push(MenuEntry::Separator);
+            entries.push(MenuEntry::Item {
+                label: "Empty Trash…".into(),
+                detail: None,
+                action: MenuAction::Command(Command::EmptyTrash),
+                danger: true,
+            });
+        }
         if let Some(ix) = favorite {
             entries.push(MenuEntry::Separator);
             entries.push(MenuEntry::Item {
@@ -1158,6 +1224,18 @@ impl Browser {
     /// The icon for row `ix`, kicking off a background load on first request.
     pub fn icon(&mut self, ix: usize, cx: &mut Context<Self>) -> Option<std::sync::Arc<gpui::Image>> {
         let key = IconKey::for_entry(self.entries.get(ix)?, &self.home);
+        self.request_icon(key, cx)
+    }
+
+    /// Sidebar symbols are tinted with the theme's accent color.
+    pub fn symbol_key(&self, name: &'static str) -> IconKey {
+        let c = gpui::Rgba::from(self.theme.accent);
+        let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+        IconKey::Symbol { name, rgb: byte(c.r) << 16 | byte(c.g) << 8 | byte(c.b) }
+    }
+
+    /// Returns a cached icon, starting a background load the first time.
+    pub fn request_icon(&mut self, key: IconKey, cx: &mut Context<Self>) -> Option<std::sync::Arc<gpui::Image>> {
         let (icon, needs_load) = self.icons.get(&key);
         if needs_load {
             let task = cx.background_executor().spawn({
@@ -1185,6 +1263,14 @@ impl Browser {
             paths.into_iter().filter(|p| *p != dest && p.parent() != Some(dest.as_path())).collect();
         if paths.is_empty() || !dest.is_dir() {
             return;
+        }
+        if dest == self.trash_dir() {
+            // Go through the system Trash so Finder's "Put Back" keeps working.
+            let n = paths.len();
+            return self.run_op(cx, move || ops::move_to_trash(&paths), move |this, (), cx| {
+                this.set_info(format!("Moved {} to the Trash", count_label(n)), cx);
+                this.reload(cx);
+            });
         }
         let copy = force_copy || !ops::same_volume(&paths[0], &dest);
         let n = paths.len();
@@ -1227,6 +1313,24 @@ fn apply_keybindings(keymap: &BTreeMap<String, String>, cx: &mut App) -> Vec<Str
 }
 
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum GoToTarget {
+    Empty,
+    Folder,
+    File,
+    Missing,
+}
+
+/// What the text in the Go to bar points at.
+pub fn go_to_target(text: &str) -> GoToTarget {
+    match findest_core::paths::parse_user_path(text) {
+        None => GoToTarget::Empty,
+        Some(path) if path.is_dir() => GoToTarget::Folder,
+        Some(path) if path.exists() => GoToTarget::File,
+        Some(_) => GoToTarget::Missing,
+    }
+}
+
 pub fn count_label(n: usize) -> String {
     if n == 1 { "1 item".into() } else { format!("{n} items") }
 }
@@ -1235,5 +1339,22 @@ fn describe(paths: &[PathBuf]) -> String {
     match paths {
         [one] => format!("\"{}\"", display_name(one)),
         _ => count_label(paths.len()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn go_to_targets() {
+        let tmp = std::env::temp_dir();
+        let file = tmp.join(format!("findest-goto-{}", std::process::id()));
+        std::fs::write(&file, "").unwrap();
+        assert_eq!(go_to_target(" "), GoToTarget::Empty);
+        assert_eq!(go_to_target(&format!("'{}'", tmp.display())), GoToTarget::Folder);
+        assert_eq!(go_to_target(&file.display().to_string()), GoToTarget::File);
+        assert_eq!(go_to_target("/definitely/not/here"), GoToTarget::Missing);
+        std::fs::remove_file(file).unwrap();
     }
 }

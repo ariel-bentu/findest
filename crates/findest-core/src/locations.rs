@@ -13,6 +13,11 @@ pub fn icloud_drive(home: &Path) -> PathBuf {
     home.join("Library/Mobile Documents/com~apple~CloudDocs")
 }
 
+/// The user's Trash. Listing it needs Full Disk Access.
+pub fn trash(home: &Path) -> PathBuf {
+    home.join(".Trash")
+}
+
 fn cloud_storage(home: &Path) -> PathBuf {
     home.join("Library/CloudStorage")
 }
@@ -79,9 +84,19 @@ pub fn cloud_root(home: &Path, path: &Path) -> Option<Place> {
     Some(Place { path: cloud_storage(home).join(first), label: cloud_label(first) })
 }
 
-/// Name to show for a folder: cloud roots get their friendly name.
+/// A named place that `path` lives in (Trash or a cloud drive): breadcrumbs
+/// start there instead of walking through hidden folders.
+fn special_root(home: &Path, path: &Path) -> Option<Place> {
+    let trash = trash(home);
+    if path.starts_with(&trash) {
+        return Some(Place { path: trash, label: "Trash".into() });
+    }
+    cloud_root(home, path)
+}
+
+/// Name to show for a folder: Trash and cloud roots get their friendly name.
 pub fn friendly_name(home: &Path, path: &Path) -> String {
-    match cloud_root(home, path) {
+    match special_root(home, path) {
         Some(root) if root.path == path => root.label,
         _ if path == Path::new("/") => "Macintosh HD".into(),
         _ => crate::paths::display_name(path),
@@ -91,7 +106,7 @@ pub fn friendly_name(home: &Path, path: &Path) -> String {
 /// Breadcrumb trail for `path`, root first. Inside a cloud drive the trail
 /// starts at the drive instead of walking through `~/Library/...`.
 pub fn breadcrumbs(home: &Path, path: &Path) -> Vec<Place> {
-    let stop = cloud_root(home, path).map(|r| r.path);
+    let stop = special_root(home, path).map(|r| r.path);
     let mut crumbs = Vec::new();
     for ancestor in path.ancestors() {
         crumbs.push(Place { path: ancestor.to_path_buf(), label: friendly_name(home, ancestor) });
@@ -130,6 +145,9 @@ mod tests {
         let od = home.join("Library/CloudStorage/OneDrive-Contoso/Shared");
         let labels: Vec<String> = breadcrumbs(home, &od).into_iter().map(|p| p.label).collect();
         assert_eq!(labels, vec!["OneDrive – Contoso", "Shared"]);
+
+        let trashed: Vec<String> = breadcrumbs(home, &trash(home).join("old")).into_iter().map(|p| p.label).collect();
+        assert_eq!(trashed, vec!["Trash", "old"]);
 
         let plain: Vec<String> = breadcrumbs(home, Path::new("/Users/me/code")).into_iter().map(|p| p.label).collect();
         assert_eq!(plain, vec!["Macintosh HD", "Users", "me", "code"]);

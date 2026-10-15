@@ -9,7 +9,10 @@ use findest_core::listing::Entry;
 use gpui::{Image, ImageFormat};
 use objc2::{AllocAnyThread, Message};
 use objc2::rc::autoreleasepool;
-use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSWorkspace};
+use objc2_app_kit::{
+    NSBitmapImageFileType, NSBitmapImageRep, NSColor, NSFontWeightMedium, NSImage, NSImageSymbolConfiguration,
+    NSWorkspace,
+};
 use objc2_foundation::{NSDictionary, NSPoint, NSRect, NSSize, NSString};
 use objc2_uniform_type_identifiers::{UTType, UTTypeData, UTTypeFolder};
 
@@ -24,6 +27,8 @@ pub enum IconKey {
     Extension(String),
     Folder,
     File,
+    /// An SF Symbol (as in Finder's sidebar) tinted with an sRGB `0xRRGGBB` color.
+    Symbol { name: &'static str, rgb: u32 },
 }
 
 impl IconKey {
@@ -48,6 +53,9 @@ impl IconKey {
 
     /// Renders the icon as PNG bytes. Safe to call from a background thread.
     fn load(&self) -> Option<Vec<u8>> {
+        if let IconKey::Symbol { name, rgb } = self {
+            return render_symbol(name, *rgb);
+        }
         autoreleasepool(|_| {
             let workspace = NSWorkspace::sharedWorkspace();
             let image = match self {
@@ -61,6 +69,7 @@ impl IconKey {
                 // SAFETY: immutable framework constants.
                 IconKey::Folder => workspace.iconForContentType(unsafe { UTTypeFolder }),
                 IconKey::File => workspace.iconForContentType(unsafe { UTTypeData }),
+                IconKey::Symbol { .. } => unreachable!("handled above"),
             };
             let size = NSSize::new(ICON_PIXELS, ICON_PIXELS);
             image.setSize(size);
@@ -73,6 +82,28 @@ impl IconKey {
             Some(png.to_vec())
         })
     }
+}
+
+/// Renders an SF Symbol at Retina resolution, keeping its aspect ratio.
+fn render_symbol(name: &str, rgb: u32) -> Option<Vec<u8>> {
+    autoreleasepool(|_| {
+        let c = |shift: u32| ((rgb >> shift) & 0xff) as f64 / 255.0;
+        let color = NSColor::colorWithSRGBRed_green_blue_alpha(c(16), c(8), c(0), 1.0);
+        // SAFETY: NSFontWeightMedium is an immutable framework constant.
+        let weight = unsafe { NSFontWeightMedium };
+        let config = NSImageSymbolConfiguration::configurationWithPointSize_weight(32.0, weight)
+            .configurationByApplyingConfiguration(&NSImageSymbolConfiguration::configurationWithHierarchicalColor(&color));
+        let image = NSImage::imageWithSystemSymbolName_accessibilityDescription(&NSString::from_str(name), None)?
+            .imageWithSymbolConfiguration(&config)?;
+        let size = image.size();
+        let mut rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(size.width * 2.0, size.height * 2.0));
+        // SAFETY: `rect` is a valid pointer for the duration of the call.
+        let cg_image = unsafe { image.CGImageForProposedRect_context_hints(&mut rect, None, None) }?;
+        let rep = NSBitmapImageRep::initWithCGImage(NSBitmapImageRep::alloc(), &cg_image);
+        // SAFETY: an empty properties dictionary is valid.
+        let png = unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new()) }?;
+        Some(png.to_vec())
+    })
 }
 
 /// Icon cache. `None` means "requested, not ready (or failed)".
@@ -91,6 +122,11 @@ impl IconCache {
                 (None, true)
             }
         }
+    }
+
+    /// The cached icon without requesting a load.
+    pub fn peek(&self, key: &IconKey) -> Option<Arc<Image>> {
+        self.icons.get(key).cloned().flatten()
     }
 
     pub fn insert(&mut self, key: IconKey, png: Option<Vec<u8>>) {
@@ -117,6 +153,11 @@ mod tests {
     }
 
     #[test]
+    fn unknown_symbol_is_none() {
+        assert!(load_icon(&IconKey::Symbol { name: "no.such.symbol.xyz", rgb: 0 }).is_none());
+    }
+
+    #[test]
     fn renders_icons_off_main_thread() {
         let keys = [
             IconKey::Folder,
@@ -124,6 +165,7 @@ mod tests {
             IconKey::Extension("pdf".into()),
             IconKey::Extension("no-such-ext-xyz".into()),
             IconKey::Path("/System/Applications/Calculator.app".into()),
+            IconKey::Symbol { name: "arrow.down.circle", rgb: 0x0a64ff },
         ];
         let handle = std::thread::spawn(move || keys.iter().map(|k| load_icon(k).map(|b| is_png(&b))).collect::<Vec<_>>());
         assert!(handle.join().unwrap().iter().all(|r| *r == Some(true)));

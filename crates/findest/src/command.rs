@@ -50,6 +50,7 @@ pub enum Command {
     /// Move to Trash without asking.
     TrashNow,
     DeletePermanently,
+    EmptyTrash,
     Copy,
     Paste,
     MoveHere,
@@ -93,6 +94,7 @@ impl FromStr for Command {
             "trash" => Trash,
             "trash_confirm" => TrashConfirm,
             "trash_now" => TrashNow,
+            "empty_trash" => EmptyTrash,
             "delete_permanently" => DeletePermanently,
             "copy" => Copy,
             "paste" => Paste,

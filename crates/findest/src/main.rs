@@ -1,11 +1,15 @@
 mod browser;
 mod command;
 mod icons;
+mod install;
 mod render;
 mod text_input;
 mod theme;
 mod watcher;
 
+use std::path::PathBuf;
+
+use futures::StreamExt;
 use gpui::{
     App, Application, Bounds, KeyBinding, Menu, MenuItem, SystemMenuType, TitlebarOptions,
     WindowBounds, WindowOptions, prelude::*, px, size,
@@ -47,6 +51,7 @@ fn menus() -> Vec<Menu> {
                 MenuItem::separator(),
                 item("Move to Trash", "trash"),
                 item("Delete Permanently…", "delete_permanently"),
+                item("Empty Trash…", "empty_trash"),
             ],
         },
         Menu {
@@ -80,7 +85,20 @@ fn menus() -> Vec<Menu> {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    if install::handoff_if_needed() {
+        return;
+    }
+    // `findest <path>` when running in place (debug builds / FINDEST_NO_BUNDLE).
+    let start = std::env::args_os().skip(1).map(PathBuf::from).find(|p| !p.to_string_lossy().starts_with('-'));
+    let start = start.and_then(|p| std::path::absolute(p).ok());
+
+    // Folders opened via `findest <path>`, Finder's "Open With" or dropping on the Dock icon.
+    let (url_tx, mut url_rx) = futures::channel::mpsc::unbounded::<Vec<String>>();
+    let app = Application::new();
+    app.on_open_urls(move |urls| {
+        let _ = url_tx.unbounded_send(urls);
+    });
+    app.run(move |cx: &mut App| {
         cx.on_action(|_: &Quit, cx| cx.quit());
         bind_global_keys(cx);
         text_input::bind_keys(cx);
@@ -95,7 +113,7 @@ fn main() {
                     window_min_size: Some(size(px(600.), px(360.))),
                     ..Default::default()
                 },
-                |window, cx| cx.new(|cx| Browser::new(window, cx)),
+                |window, cx| cx.new(|cx| Browser::new(start, window, cx)),
             )
             .expect("failed to open window");
         window
@@ -104,6 +122,20 @@ fn main() {
                 cx.activate(true);
             })
             .ok();
+        cx.spawn(async move |cx| {
+            while let Some(urls) = url_rx.next().await {
+                let Some(path) = urls.iter().rev().find_map(|u| findest_core::paths::path_from_file_url(u)) else {
+                    continue;
+                };
+                window
+                    .update(cx, |browser, window, cx| {
+                        browser.navigate_to_path(path, cx);
+                        window.activate_window();
+                    })
+                    .ok();
+            }
+        })
+        .detach();
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();
