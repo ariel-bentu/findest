@@ -101,6 +101,16 @@ impl Browser {
         cx.notify();
     }
 
+    /// Puts `query` in the search box (opening it if needed) and runs it.
+    pub fn use_example_query(&mut self, query: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.syntax_help = None;
+        self.open_search(window, cx);
+        if let Some(search) = &self.search {
+            let len = query.len();
+            search.input.update(cx, |input, cx| input.set_text(query.to_string(), len..len, cx));
+        }
+    }
+
     pub fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.search.take().is_some() {
             window.focus(&self.focus);
@@ -263,4 +273,38 @@ impl Browser {
 
 fn query_is_slow(search: &SearchUi) -> bool {
     search.has_content
+}
+
+/// Examples shown in the "?" popover: (query, what it finds). Grouped by blank entries.
+pub const SYNTAX_EXAMPLES: &[(&str, &str)] = &[
+    ("report", "name contains \"report\" (any capital makes it case-sensitive)"),
+    ("*.pdf", "wildcards: * any text, ? one character"),
+    ("\"q3 report\"", "exact text, spaces included"),
+    ("", ""),
+    ("invoice 2024", "both words (AND)"),
+    ("jpg | png", "either one (OR)"),
+    ("report !draft", "exclude a word (also -draft)"),
+    ("(jpg | png) vacation", "group with parentheses"),
+    ("", ""),
+    ("ext:jpg;png;heic", "by extension"),
+    ("size:>10mb", "larger than 10 MB (also <, >=, 1mb..5mb, empty)"),
+    ("dm:today", "modified today (yesterday, week, month, year)"),
+    ("dm:>2024-05-01", "modified after a date (2024, 2024-05, a..b)"),
+    ("file: size:>1gb", "only files (folder: for folders)"),
+    ("", ""),
+    ("path:projects", "match the full path (or any term with a /)"),
+    ("regex:^IMG_\\d{4}", "regular expression on the name"),
+    ("case:README", "force case-sensitive (nocase: for insensitive)"),
+    ("ext:md content:TODO", "text inside files (add filters to keep it fast)"),
+    ("hidden: .zshrc", "include hidden files"),
+];
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn syntax_examples_parse() {
+        for (query, _) in super::SYNTAX_EXAMPLES.iter().filter(|(q, _)| !q.is_empty()) {
+            findest_core::search::parse(query).unwrap_or_else(|e| panic!("{query}: {e}"));
+        }
+    }
 }

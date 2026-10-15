@@ -82,7 +82,8 @@ impl Render for Browser {
                     )
                     .child(self.render_status_bar()),
             )
-            .children(self.render_menu(cx));
+            .children(self.render_menu(cx))
+            .children(self.render_syntax_help(cx));
         if let Some(family) = &theme.font_family {
             root = root.font_family(SharedString::from(family.clone()));
         }
@@ -145,6 +146,7 @@ impl Browser {
             .child(crumbs)
             .when(self.loading, |d| d.child(div().text_color(theme.text_muted).child("Loading…")))
             .child(self.render_search_field(cx))
+            .child(self.syntax_help_button(cx))
             .child(self.toolbar_text_button("goto", "Go to…", "go_to_folder", cx))
             .child(self.toolbar_text_button("hidden", hidden_label, "toggle_hidden", cx))
             .child(self.info_toggle_button(cx))
@@ -184,6 +186,92 @@ impl Browser {
                 Some(search) => div().flex_1().min_w_0().child(search.input.clone()).into_any_element(),
                 None => div().flex_1().text_color(theme.text_muted).child("Search  ⌘F").into_any_element(),
             })
+    }
+
+    /// "?" next to the search box: opens the syntax popover.
+    fn syntax_help_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let open = self.syntax_help.is_some();
+        self.symbol_button("syntax-help", "questionmark.circle", "?", true)
+            .w(px(28.))
+            .when(open, |d| d.bg(self.theme.hover))
+            .tooltip(tooltip("Search syntax and examples"))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.menu = None;
+                    this.syntax_help = match this.syntax_help {
+                        Some(_) => None,
+                        None => Some(Point { x: event.position.x + px(14.), y: event.position.y + px(18.) }),
+                    };
+                    cx.notify();
+                }),
+            )
+    }
+
+    /// Popover listing query examples; clicking one runs it.
+    fn render_syntax_help(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let position = self.syntax_help?;
+        let theme = &self.theme;
+        let mut list = div()
+            .id("syntax-help")
+            .occlude()
+            .w(px(520.))
+            .p_2()
+            .rounded_lg()
+            .bg(theme.surface)
+            .border_1()
+            .border_color(theme.border)
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.syntax_help = None;
+                cx.notify();
+            }))
+            .child(div().px_2().pb_1().font_weight(FontWeight::SEMIBOLD).child("Search syntax"))
+            .child(
+                div()
+                    .px_2()
+                    .pb_2()
+                    .text_size(px(theme.font_size - 1.))
+                    .text_color(theme.text_muted)
+                    .child("Click an example to try it. Combine any of these freely."),
+            );
+        for (i, (query, meaning)) in crate::browser_search::SYNTAX_EXAMPLES.iter().enumerate() {
+            if query.is_empty() {
+                list = list.child(div().my_1().h(px(1.)).bg(theme.border));
+                continue;
+            }
+            list = list.child(
+                div()
+                    .id(("syntax-example", i))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .px_2()
+                    .py(px(3.))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(theme.hover))
+                    .on_click(cx.listener(move |this, _, window, cx| this.use_example_query(query, window, cx)))
+                    .child(
+                        div()
+                            .w(px(170.))
+                            .flex_none()
+                            .font_family("Menlo")
+                            .text_size(px(theme.font_size - 1.))
+                            .text_color(theme.accent)
+                            .child(*query),
+                    )
+                    .child(div().flex_1().min_w_0().text_size(px(theme.font_size - 1.)).text_color(theme.text_muted).child(*meaning)),
+            );
+        }
+        Some(
+            deferred(anchored().anchor(gpui::Corner::TopRight).position(position).snap_to_window_with_margin(px(8.)).child(list))
+                .with_priority(1),
+        )
     }
 
     /// Scope buttons, result count / progress, and index status (while searching).
@@ -419,7 +507,7 @@ impl Browser {
             self.request_icon(key, cx);
         }
         let (enabled, disabled) = (self.theme.text, self.theme.text_muted);
-        for name in ["chevron.left", "chevron.right", "chevron.up", "sidebar.right", "xmark", "magnifyingglass"] {
+        for name in ["chevron.left", "chevron.right", "chevron.up", "sidebar.right", "xmark", "magnifyingglass", "questionmark.circle"] {
             for color in [enabled, disabled] {
                 let key = self.symbol_key_colored(name, color);
                 self.request_icon(key, cx);

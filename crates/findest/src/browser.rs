@@ -154,6 +154,8 @@ pub struct Browser {
     pub(crate) index_generation: u64,
     /// Set when focus should return to the file list on the next frame.
     pub(crate) refocus_list: bool,
+    /// Where the search-syntax popover is shown, if open.
+    pub(crate) syntax_help: Option<Point<Pixels>>,
     volume_task: Option<Task<()>>,
     /// Folders expanded in place. Kept across navigation, like Finder.
     pub(crate) expanded: HashSet<PathBuf>,
@@ -276,6 +278,7 @@ impl Browser {
             search: None,
             index_generation: 0,
             refocus_list: false,
+            syntax_help: None,
             volume_task: None,
             expanded: init.expanded.into_iter().collect(),
             loading: false,
@@ -687,6 +690,7 @@ impl Browser {
     pub fn run(&mut self, command: Command, window: &mut Window, cx: &mut Context<Self>) {
         use Command::*;
         self.menu = None;
+        self.syntax_help = None;
         if !matches!(command, SelectPrev | SelectNext | ExtendPrev | ExtendNext) {
             self.status = None;
         }
