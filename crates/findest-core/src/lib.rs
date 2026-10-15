@@ -2,9 +2,11 @@
 //! configuration, recents and external launchers. No UI code lives here.
 
 pub mod config;
+pub mod info;
 pub mod launch;
 pub mod listing;
 pub mod locations;
 pub mod ops;
 pub mod paths;
 pub mod recents;
+pub mod session;

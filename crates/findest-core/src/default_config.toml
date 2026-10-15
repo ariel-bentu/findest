@@ -4,6 +4,10 @@
 [general]
 # Folder shown when Findest starts. "~" is your home folder.
 start_path = "~"
+# Reopen the folder and expanded subfolders from last time instead of start_path.
+restore_session = true
+# Show the info panel (details of the selection) on the right. Toggle with ⌘I.
+info_panel = true
 show_hidden = false
 folders_first = true
 # name | size | modified | kind

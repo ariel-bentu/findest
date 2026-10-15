@@ -11,6 +11,7 @@ use findest_core::listing::{self, Entry};
 use findest_core::locations::{self, Place};
 use findest_core::paths::{contract_tilde, display_name, home_dir};
 use findest_core::recents::Recents;
+use findest_core::session::Session;
 use findest_core::{launch, ops};
 use futures::StreamExt;
 use gpui::{
@@ -69,6 +70,26 @@ pub enum MenuAction {
     History { back: bool, steps: usize },
 }
 
+/// Details of the single selected item, shown in the info panel.
+pub struct InfoState {
+    pub path: PathBuf,
+    pub file: Option<findest_core::info::FileInfo>,
+    pub dimensions: Option<(u32, u32)>,
+    /// For folders: `(bytes, items)` once the background walk finishes.
+    pub folder_size: Option<(u64, u64)>,
+    pub computing: bool,
+    pub icon_key: Option<IconKey>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    _task: Option<Task<()>>,
+}
+
+impl Drop for InfoState {
+    fn drop(&mut self) {
+        // Stop a folder-size walk for an item that's no longer selected.
+        self.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Why the current folder couldn't be listed.
 pub struct LoadError {
     pub message: String,
@@ -98,10 +119,21 @@ pub struct Browser {
     back: Vec<Location>,
     forward: Vec<Location>,
     pub(crate) entries: Vec<Entry>,
+    /// Nesting level of each row in `entries` (tree view).
+    pub(crate) depths: Vec<usize>,
+    /// Whether each row is a folder with something inside (shows a disclosure triangle).
+    pub(crate) expandable: Vec<bool>,
+    /// `(available, total)` bytes on the current folder's volume.
+    pub(crate) volume: Option<(u64, u64)>,
+    pub(crate) info: Option<InfoState>,
+    volume_task: Option<Task<()>>,
+    /// Folders expanded in place. Kept across navigation, like Finder.
+    pub(crate) expanded: HashSet<PathBuf>,
     pub(crate) loading: bool,
     pub(crate) load_error: Option<LoadError>,
     /// A pending press on back/forward: a quick click navigates, a long press opens history.
     nav_press: Option<Task<()>>,
+    nav_long_pressed: bool,
     load_task: Option<Task<()>>,
     pending_select: Option<PendingSelect>,
     /// Set when a just-created item should enter rename mode on the next frame.
@@ -172,7 +204,11 @@ impl Browser {
             this.apply_config(this.config.clone(), window, cx);
         })];
 
-        let start = start.unwrap_or_else(|| config.start_path());
+        // An explicit path wins, then the last session, then the configured start folder.
+        let session = if config.general.restore_session { Session::load(&Session::path()) } else { Session::default() };
+        let restore_recents = start.is_none() && session.recents;
+        let restore_info_panel = session.info_panel;
+        let start = start.or(session.folder).unwrap_or_else(|| config.start_path());
         let mut this = Self {
             focus: cx.focus_handle(),
             config,
@@ -183,9 +219,16 @@ impl Browser {
             back: Vec::new(),
             forward: Vec::new(),
             entries: Vec::new(),
+            depths: Vec::new(),
+            expandable: Vec::new(),
+            volume: None,
+            info: None,
+            volume_task: None,
+            expanded: session.expanded.into_iter().collect(),
             loading: false,
             load_error: None,
             nav_press: None,
+            nav_long_pressed: false,
             load_task: None,
             pending_select: None,
             pending_rename: false,
@@ -209,7 +252,12 @@ impl Browser {
             _tasks: tasks,
             _subscriptions: subscriptions,
         };
-        if start.is_dir() {
+        if let Some(open) = restore_info_panel {
+            this.config.general.info_panel = open;
+        }
+        if restore_recents {
+            this.navigate(Location::Recents, false, cx);
+        } else if start.is_dir() {
             this.navigate(Location::Dir(start), false, cx);
         } else {
             this.navigate(Location::Dir(home_dir()), false, cx);
@@ -240,6 +288,10 @@ impl Browser {
         let (theme, mut errors) = Theme::resolve(&config.appearance, window.appearance());
         let keymap = config.keybindings();
         errors.extend(apply_keybindings(&keymap, cx));
+        let mut config = config;
+        // The panel toggle is a view choice remembered per session; a config
+        // reload shouldn't flip it.
+        config.general.info_panel = self.config.general.info_panel;
         let listing_changed = config.general != self.config.general;
         self.theme = theme;
         self.keymap = keymap;
@@ -263,7 +315,7 @@ impl Browser {
                 config_changed = true;
             }
             if let Location::Dir(dir) = &self.location
-                && (path == dir || path.parent() == Some(dir.as_path()))
+                && (path == dir || path.parent().is_some_and(|p| p == dir || self.expanded.contains(p)))
             {
                 refresh = true;
             }
@@ -304,12 +356,22 @@ impl Browser {
         self.edit = None;
         self.menu = None;
         self.entries.clear();
+        self.depths.clear();
         self.scroll.scroll_to_item(0, ScrollStrategy::Top);
-        let dir = self.current_dir();
-        if let Some(watcher) = &mut self.watcher {
-            watcher.watch_dir(dir.as_deref());
-        }
+        self.update_watches();
+        self.save_session(cx);
         self.reload(cx);
+    }
+
+    /// Persists the open folder and expansions for the next launch.
+    fn save_session(&self, cx: &mut Context<Self>) {
+        let session = Session {
+            folder: self.current_dir(),
+            recents: self.location == Location::Recents,
+            expanded: self.expanded.iter().cloned().collect(),
+            info_panel: Some(self.config.general.info_panel),
+        };
+        cx.background_executor().spawn(async move { session.save(&Session::path()) }).detach();
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
@@ -317,14 +379,16 @@ impl Browser {
         let show_hidden = self.config.general.show_hidden;
         let order = self.config.general.sort_order();
         let recents: Vec<PathBuf> = self.recents.items.clone();
+        let expanded = self.expanded.clone();
         self.loading = true;
         let listing = cx.background_executor().spawn(async move {
             match &location {
-                Location::Dir(dir) => listing::read_dir(dir, show_hidden).map(|mut entries| {
-                    listing::sort_entries(&mut entries, order);
-                    entries
-                }),
-                Location::Recents => Ok(recents.iter().filter_map(|p| Entry::from_path(p).ok()).collect()),
+                Location::Dir(dir) => listing::read_tree(dir, &expanded, show_hidden, order),
+                Location::Recents => Ok(recents
+                    .iter()
+                    .filter_map(|p| Entry::from_path(p).ok())
+                    .map(|entry| listing::TreeRow { entry, depth: 0, has_children: false })
+                    .collect()),
             }
         });
         // Replacing the task drops (cancels) any listing still in flight.
@@ -335,19 +399,32 @@ impl Browser {
         cx.notify();
     }
 
-    fn finish_load(&mut self, result: std::io::Result<Vec<Entry>>, cx: &mut Context<Self>) {
+    fn finish_load(&mut self, result: std::io::Result<Vec<listing::TreeRow>>, cx: &mut Context<Self>) {
         self.loading = false;
         self.load_error = None;
         match result {
-            Ok(entries) => self.entries = entries,
+            Ok(rows) => {
+                self.entries = Vec::with_capacity(rows.len());
+                self.depths = Vec::with_capacity(rows.len());
+                self.expandable = Vec::with_capacity(rows.len());
+                for row in rows {
+                    self.entries.push(row.entry);
+                    self.depths.push(row.depth);
+                    self.expandable.push(row.has_children);
+                }
+            }
             Err(e) => {
                 self.entries.clear();
+                self.depths.clear();
+                self.expandable.clear();
                 self.load_error = Some(LoadError {
                     not_permitted: matches!(e.raw_os_error(), Some(1 /* EPERM */ | 13 /* EACCES */)),
                     message: format!("Can't open {}: {e}", self.location_label()),
                 });
             }
         }
+        self.update_watches();
+        self.refresh_volume(cx);
         let present: HashSet<&PathBuf> = self.entries.iter().map(|e| &e.path).collect();
         self.selected.retain(|p| present.contains(p));
         if self.cursor.as_ref().is_some_and(|c| !present.contains(c)) {
@@ -547,6 +624,8 @@ impl Browser {
                 cx.notify();
             }
             ClearSelection => self.clear_selection(cx),
+            Expand => self.expand_selection(cx),
+            Collapse => self.collapse_selection(cx),
             Open => self.open_selection(cx),
             Rename => self.start_rename(window, cx),
             GoUp => self.go_up(cx),
@@ -612,6 +691,11 @@ impl Browser {
                 let text = paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n");
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                 self.set_info(format!("Copied {}", if paths.len() == 1 { "path".into() } else { format!("{} paths", paths.len()) }), cx);
+            }
+            ToggleInfo => {
+                self.config.general.info_panel = !self.config.general.info_panel;
+                self.save_session(cx);
+                cx.notify();
             }
             ToggleHidden => {
                 self.config.general.show_hidden = !self.config.general.show_hidden;
@@ -1153,25 +1237,29 @@ impl Browser {
         self.navigate(target, false, cx);
     }
 
-    /// Mouse down on back/forward: navigate on release, or open history after a long press.
+    /// Mouse down on back/forward starts the long-press timer. If it fires
+    /// before the click completes, the history menu opens and the click is ignored.
     pub fn press_nav(&mut self, back: bool, position: Point<Pixels>, cx: &mut Context<Self>) {
+        self.nav_long_pressed = false;
         self.nav_press = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_millis(400)).await;
+            cx.background_executor().timer(Duration::from_millis(450)).await;
             this.update(cx, |this, cx| {
-                if this.nav_press.take().is_some() {
-                    this.open_history_menu(back, position, cx);
-                }
+                this.nav_long_pressed = true;
+                this.open_history_menu(back, position, cx);
             })
             .ok();
         }));
     }
 
-    /// Mouse up on back/forward: a short press navigates.
-    pub fn release_nav(&mut self, back: bool, cx: &mut Context<Self>) {
-        if self.nav_press.take().is_some() {
-            self.status = None;
-            self.go_history(back, 1, cx);
+    /// A completed click on back/forward: navigate, unless it was a long press.
+    pub fn click_nav(&mut self, back: bool, cx: &mut Context<Self>) {
+        // Dropping the task cancels a pending long-press timer.
+        self.nav_press = None;
+        if std::mem::take(&mut self.nav_long_pressed) {
+            return;
         }
+        self.status = None;
+        self.go_history(back, 1, cx);
     }
 
     pub fn cancel_nav_press(&mut self) {
@@ -1229,9 +1317,15 @@ impl Browser {
 
     /// Sidebar symbols are tinted with the theme's accent color.
     pub fn symbol_key(&self, name: &'static str) -> IconKey {
-        let c = gpui::Rgba::from(self.theme.accent);
+        self.symbol_key_colored(name, self.theme.accent)
+    }
+
+    /// An SF Symbol tinted `color`, blended over the sidebar background when translucent.
+    pub fn symbol_key_colored(&self, name: &'static str, color: gpui::Hsla) -> IconKey {
+        let (c, bg) = (gpui::Rgba::from(color), gpui::Rgba::from(self.theme.sidebar));
+        let mix = |fg: f32, bg: f32| fg * c.a + bg * (1.0 - c.a);
         let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
-        IconKey::Symbol { name, rgb: byte(c.r) << 16 | byte(c.g) << 8 | byte(c.b) }
+        IconKey::Symbol { name, rgb: byte(mix(c.r, bg.r)) << 16 | byte(mix(c.g, bg.g)) << 8 | byte(mix(c.b, bg.b)) }
     }
 
     /// Returns a cached icon, starting a background load the first time.
@@ -1294,11 +1388,180 @@ impl Browser {
             general.sort_by = key;
             general.sort_ascending = key == listing::SortKey::Name || key == listing::SortKey::Kind;
         }
-        let order = general.sort_order();
         if self.location != Location::Recents {
-            listing::sort_entries(&mut self.entries, order);
+            // Re-list rather than sort in place: each tree level sorts separately.
+            self.reload(cx);
         }
         cx.notify();
+    }
+
+    // ---- Tree view ----------------------------------------------------
+
+    pub fn is_expandable(&self, ix: usize) -> bool {
+        self.expandable.get(ix).copied().unwrap_or(false)
+    }
+
+    /// Re-reads free space for the current folder's volume in the background.
+    fn refresh_volume(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = self.current_dir() else {
+            self.volume = None;
+            return;
+        };
+        let task = cx.background_executor().spawn(async move { crate::system::volume_capacity(&dir) });
+        self.volume_task = Some(cx.spawn(async move |this, cx| {
+            let volume = task.await;
+            this.update(cx, |this, cx| {
+                this.volume = volume;
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// The item the info panel describes: the single selection, or the current
+    /// folder when nothing is selected.
+    fn info_target(&self) -> Option<PathBuf> {
+        match self.selected.len() {
+            0 => self.current_dir(),
+            1 => self.selected.iter().next().cloned(),
+            _ => None,
+        }
+    }
+
+    /// Keeps `info` in step with the selection (called each frame; cheap when unchanged).
+    pub(crate) fn sync_info(&mut self, cx: &mut Context<Self>) {
+        if !self.config.general.info_panel {
+            self.info = None;
+            return;
+        }
+        let target = self.info_target();
+        if self.info.as_ref().map(|i| &i.path) == target.as_ref() {
+            return;
+        }
+        let Some(path) = target else {
+            self.info = None;
+            return;
+        };
+        let file = findest_core::info::file_info(&path).ok();
+        // Folders and bundles (apps) get their total size measured.
+        let is_dir = path.is_dir();
+        let is_image = !is_dir && is_image_path(&path);
+        let icon_key = Entry::from_path(&path).ok().map(|e| IconKey::for_entry(&e, &self.home));
+        if let Some(key) = icon_key.clone() {
+            self.request_icon(key, cx);
+        }
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = (is_dir || is_image).then(|| {
+            let (path, cancel) = (path.clone(), cancel.clone());
+            let work = cx.background_executor().spawn(async move {
+                if is_dir {
+                    (None, findest_core::info::dir_size(&path, &cancel))
+                } else {
+                    (crate::system::image_dimensions(&path), None)
+                }
+            });
+            cx.spawn(async move |this, cx| {
+                let (dimensions, folder_size) = work.await;
+                this.update(cx, |this, cx| {
+                    if let Some(info) = &mut this.info {
+                        info.dimensions = dimensions;
+                        info.folder_size = folder_size;
+                        info.computing = false;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+        });
+        self.info = Some(InfoState {
+            path,
+            file,
+            dimensions: None,
+            folder_size: None,
+            computing: task.is_some(),
+            icon_key,
+            cancel,
+            _task: task,
+        });
+    }
+
+    /// Total size of selected files (folders aren't measured).
+    pub fn selection_size(&self) -> u64 {
+        self.entries.iter().filter(|e| !e.is_dir && self.selected.contains(&e.path)).map(|e| e.size).sum()
+    }
+
+    pub fn depth(&self, ix: usize) -> usize {
+        self.depths.get(ix).copied().unwrap_or(0)
+    }
+
+    pub fn is_expanded(&self, path: &Path) -> bool {
+        self.expanded.contains(path)
+    }
+
+    /// Watches the current folder plus every visible expanded subfolder.
+    fn update_watches(&mut self) {
+        let Some(watcher) = &mut self.watcher else { return };
+        let mut dirs = HashSet::new();
+        if let Location::Dir(root) = &self.location {
+            dirs.insert(root.clone());
+            dirs.extend(self.entries.iter().filter(|e| e.is_dir && self.expanded.contains(&e.path)).map(|e| e.path.clone()));
+        }
+        watcher.watch_dirs(dirs);
+    }
+
+    pub fn toggle_expanded(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.expanded.contains(&path) {
+            self.collapse_dirs(vec![path], cx);
+        } else {
+            self.expanded.insert(path);
+            self.save_session(cx);
+            self.reload(cx);
+        }
+    }
+
+    fn collapse_dirs(&mut self, dirs: Vec<PathBuf>, cx: &mut Context<Self>) {
+        for dir in &dirs {
+            self.expanded.remove(dir);
+        }
+        // If the cursor was inside a collapsed folder, move it to that folder.
+        if let Some(cursor) = self.cursor.clone()
+            && let Some(dir) = dirs.iter().find(|d| cursor.starts_with(d) && cursor != **d)
+        {
+            self.pending_select = Some(PendingSelect { paths: vec![dir.clone()], rename: false });
+        }
+        self.save_session(cx);
+        self.reload(cx);
+    }
+
+    fn expand_selection(&mut self, cx: &mut Context<Self>) {
+        let dirs: Vec<PathBuf> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(ix, e)| self.is_expandable(*ix) && self.selected.contains(&e.path) && !self.expanded.contains(&e.path))
+            .map(|(_, e)| e.path.clone())
+            .collect();
+        if dirs.is_empty() {
+            return;
+        }
+        self.expanded.extend(dirs);
+        self.save_session(cx);
+        self.reload(cx);
+    }
+
+    /// ← collapses expanded selected folders; otherwise moves to the parent row.
+    fn collapse_selection(&mut self, cx: &mut Context<Self>) {
+        let dirs: Vec<PathBuf> =
+            self.selection().into_iter().filter(|p| self.expanded.contains(p)).collect();
+        if !dirs.is_empty() {
+            return self.collapse_dirs(dirs, cx);
+        }
+        if let Some(ix) = self.cursor_index()
+            && self.depth(ix) > 0
+            && let Some(parent_ix) = self.entries[ix].path.parent().and_then(|p| self.index_of(p))
+        {
+            self.select_only(parent_ix, cx);
+        }
     }
 }
 
@@ -1329,6 +1592,14 @@ pub fn go_to_target(text: &str) -> GoToTarget {
         Some(path) if path.exists() => GoToTarget::File,
         Some(_) => GoToTarget::Missing,
     }
+}
+
+pub fn is_image_path(path: &Path) -> bool {
+    const IMAGE_EXTENSIONS: &[&str] =
+        &["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "heic", "heif", "ico", "icns", "psd", "svg"];
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| IMAGE_EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(e)))
 }
 
 pub fn count_label(n: usize) -> String {

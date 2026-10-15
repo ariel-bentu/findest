@@ -22,6 +22,8 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str)] = &[
     ("end", "select_last"),
     ("cmd-a", "select_all"),
     ("escape", "clear_selection"),
+    ("right", "expand"),
+    ("left", "collapse"),
     ("cmd-down", "open"),
     ("cmd-o", "open"),
     ("enter", "rename"),
@@ -43,6 +45,7 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str)] = &[
     ("cmd-alt-v", "move_here"),
     ("cmd-alt-c", "copy_path"),
     ("cmd-shift-.", "toggle_hidden"),
+    ("cmd-i", "toggle_info"),
     ("cmd-r", "refresh"),
     ("ctrl-cmd-t", "add_favorite"),
     ("cmd-shift-r", "show_recents"),
@@ -90,6 +93,10 @@ impl Default for Config {
 #[serde(default)]
 pub struct General {
     pub start_path: String,
+    /// Reopen the folder (and expanded subfolders) from the last session.
+    pub restore_session: bool,
+    /// Show the info panel (details of the selection) on the right.
+    pub info_panel: bool,
     pub show_hidden: bool,
     pub folders_first: bool,
     pub sort_by: SortKey,
@@ -102,6 +109,8 @@ impl Default for General {
     fn default() -> Self {
         Self {
             start_path: "~".into(),
+            restore_session: true,
+            info_panel: true,
             show_hidden: false,
             folders_first: true,
             sort_by: SortKey::Name,

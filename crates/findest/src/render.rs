@@ -20,13 +20,21 @@ use crate::browser::{
 use crate::command::BROWSER_CONTEXT;
 
 const SIDEBAR_WIDTH: f32 = 200.0;
+const INFO_PANEL_WIDTH: f32 = 270.0;
+/// Images up to this size are previewed in the info panel.
+const MAX_PREVIEW_BYTES: u64 = 64 * 1024 * 1024;
+const TOP_BAR_HEIGHT: f32 = 44.0;
 const COL_MODIFIED: f32 = 170.0;
 const COL_SIZE: f32 = 90.0;
 const COL_KIND: f32 = 130.0;
+/// Width of the disclosure-triangle column, and the indent per tree level.
+const TREE_GUTTER: f32 = 14.0;
+const TREE_INDENT: f32 = 16.0;
 
 impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.load_sidebar_icons(cx);
+        self.sync_info(cx);
         if std::mem::take(&mut self.pending_rename) {
             self.start_rename(window, cx);
         }
@@ -45,22 +53,32 @@ impl Render for Browser {
             .on_key_down(cx.listener(Self::on_key_down))
             .size_full()
             .flex()
-            .flex_col()
+            .flex_row()
             .bg(theme.background)
             .text_color(theme.text)
             .text_size(px(theme.font_size))
-            .child(self.render_toolbar(cx))
-            .children(self.render_go_to_folder(cx))
+            // The sidebar runs full height; toolbar and status bar belong to the file pane.
+            .child(self.render_sidebar(cx))
             .child(
                 div()
                     .flex()
-                    .flex_row()
+                    .flex_col()
                     .flex_1()
-                    .min_h_0()
-                    .child(self.render_sidebar(cx))
-                    .child(self.render_file_list(cx)),
+                    .min_w_0()
+                    .h_full()
+                    .child(self.render_toolbar(cx))
+                    .children(self.render_go_to_folder(cx))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_1()
+                            .min_h_0()
+                            .child(self.render_file_list(cx))
+                            .children(self.render_info_panel(cx)),
+                    )
+                    .child(self.render_status_bar()),
             )
-            .child(self.render_status_bar())
             .children(self.render_menu(cx));
         if let Some(family) = &theme.font_family {
             root = root.font_family(SharedString::from(family.clone()));
@@ -113,46 +131,71 @@ impl Browser {
             .flex_row()
             .items_center()
             .gap_2()
-            .h(px(38.))
+            .h(px(TOP_BAR_HEIGHT))
             .px_2()
             .bg(theme.surface)
             .border_b_1()
             .border_color(theme.border)
             .child(self.nav_button(true, cx))
             .child(self.nav_button(false, cx))
-            .child(self.toolbar_button("up", "↑", self.current_dir().is_some_and(|d| d.parent().is_some()), "go_up", cx))
+            .child(self.toolbar_button("up", "chevron.up", "↑", self.current_dir().is_some_and(|d| d.parent().is_some()), "go_up", cx))
             .child(crumbs)
             .when(self.loading, |d| d.child(div().text_color(theme.text_muted).child("Loading…")))
             .child(self.toolbar_text_button("goto", "Go to…", "go_to_folder", cx))
             .child(self.toolbar_text_button("hidden", hidden_label, "toggle_hidden", cx))
+            .child(self.info_toggle_button(cx))
+    }
+
+    /// Opens/closes the info panel; highlighted while it's open.
+    fn info_toggle_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let open = self.config.general.info_panel;
+        self.symbol_button("info-toggle", "sidebar.right", "▥", true)
+            .when(open, |d| d.bg(self.theme.hover))
+            .tooltip(tooltip(if open { "Hide info panel (⌘I)" } else { "Show info panel (⌘I)" }))
+            .on_click(cx.listener(|this, _, window, cx| this.run(crate::command::Command::ToggleInfo, window, cx)))
+    }
+
+    /// Back/forward: click to navigate; long-press or right-click for history.
+    /// Large toolbar button showing an SF Symbol (text fallback until it loads).
+    fn symbol_button(&self, id: &'static str, symbol: &'static str, fallback: &'static str, enabled: bool) -> gpui::Stateful<gpui::Div> {
+        let theme = &self.theme;
+        let color = if enabled { theme.text } else { theme.text_muted };
+        let icon = self.icons.peek(&self.symbol_key_colored(symbol, color));
+        div()
+            .id(id)
+            .w(px(36.))
+            .h(px(30.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_lg()
+            .text_size(px(theme.font_size + 8.))
+            .text_color(color)
+            .when(enabled, |d| d.cursor_pointer().hover(|s| s.bg(theme.hover)))
+            .child(match icon {
+                Some(image) => img(image).w(px(18.)).h(px(18.)).object_fit(ObjectFit::Contain).into_any_element(),
+                None => div().child(fallback).into_any_element(),
+            })
     }
 
     /// Back/forward: click to navigate; long-press or right-click for history.
     fn nav_button(&self, back: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = &self.theme;
         let enabled = if back { self.can_go_back() } else { self.can_go_forward() };
-        let below = |p: Point<Pixels>| Point { x: p.x - px(10.), y: p.y + px(14.) };
-        div()
-            .id(if back { "back" } else { "forward" })
-            .w(px(26.))
-            .h(px(24.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_md()
-            .text_size(px(theme.font_size + 4.))
-            .cursor_pointer()
-            .hover(|s| s.bg(theme.hover))
-            .when(!enabled, |d| d.text_color(theme.text_muted.opacity(0.4)))
+        let below = |p: Point<Pixels>| Point { x: p.x - px(14.), y: p.y + px(18.) };
+        let (id, symbol, fallback) =
+            if back { ("back", "chevron.left", "‹") } else { ("forward", "chevron.right", "›") };
+        let hint = if back { "Back (⌘[) · hold for history" } else { "Forward (⌘]) · hold for history" };
+        self.symbol_button(id, symbol, fallback, enabled)
+            .tooltip(tooltip(hint))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    cx.stop_propagation();
                     this.menu = None;
                     this.press_nav(back, below(event.position), cx);
                 }),
             )
-            .on_mouse_up(MouseButton::Left, cx.listener(move |this, _, _, cx| this.release_nav(back, cx)))
+            .on_click(cx.listener(move |this, _, _, cx| this.click_nav(back, cx)))
             .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _, _, _| this.cancel_nav_press()))
             .on_mouse_down(
                 MouseButton::Right,
@@ -161,27 +204,14 @@ impl Browser {
                     this.open_history_menu(back, below(event.position), cx);
                 }),
             )
-            .child(if back { "‹" } else { "›" })
     }
 
-    fn toolbar_button(&self, id: &'static str, label: &'static str, enabled: bool, command: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = &self.theme;
-        div()
-            .id(id)
-            .w(px(26.))
-            .h(px(24.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_md()
-            .text_size(px(theme.font_size + 4.))
-            .when(!enabled, |d| d.text_color(theme.text_muted.opacity(0.4)))
-            .when(enabled, |d| {
-                d.cursor_pointer().hover(|s| s.bg(theme.hover)).on_click(cx.listener(move |this, _, window, cx| {
-                    this.run(command.parse().expect("built-in command"), window, cx)
-                }))
-            })
-            .child(label)
+    fn toolbar_button(&self, id: &'static str, symbol: &'static str, fallback: &'static str, enabled: bool, command: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
+        self.symbol_button(id, symbol, fallback, enabled).when(enabled, |d| {
+            d.on_click(cx.listener(move |this, _, window, cx| {
+                this.run(command.parse().expect("built-in command"), window, cx)
+            }))
+        })
     }
 
     fn toolbar_text_button(&self, id: &'static str, label: &'static str, command: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
@@ -289,22 +319,31 @@ impl Browser {
             let key = self.symbol_key(name);
             self.request_icon(key, cx);
         }
+        let (enabled, disabled) = (self.theme.text, self.theme.text_muted);
+        for name in ["chevron.left", "chevron.right", "chevron.up", "sidebar.right", "xmark"] {
+            for color in [enabled, disabled] {
+                let key = self.symbol_key_colored(name, color);
+                self.request_icon(key, cx);
+            }
+        }
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = &self.theme;
-        let mut list = div()
-            .id("sidebar")
+        div()
             .flex()
             .flex_col()
             .w(px(SIDEBAR_WIDTH))
             .flex_none()
             .h_full()
-            .overflow_y_scroll()
-            .py_2()
             .bg(theme.sidebar)
             .border_r_1()
-            .border_color(theme.border);
+            .border_color(theme.border)
+            .child(self.render_places(cx))
+    }
+
+    fn render_places(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut list = div().id("sidebar").flex().flex_col().flex_1().min_h_0().overflow_y_scroll().py_2();
 
         list = list.child(self.sidebar_item(
             "recents".into(),
@@ -547,7 +586,7 @@ impl Browser {
             .flex_row()
             .items_center()
             .h(px(theme.row_height))
-            .pl(px(30.))
+            .pl(px(TREE_GUTTER + 34.))
             .pr_2()
             .border_b_1()
             .border_color(theme.border)
@@ -664,6 +703,7 @@ impl Browser {
                     this.open_list_menu(event.position, true, cx);
                 }),
             )
+            .child(self.render_disclosure(ix, cx))
             .child(
                 div().w(px(22.)).flex_none().flex().items_center().child(match icon {
                     Some(icon) => img(icon).size(px(18.)).into_any_element(),
@@ -695,12 +735,214 @@ impl Browser {
             .into_any_element()
     }
 
+    fn render_info_panel(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.config.general.info_panel {
+            return None;
+        }
+        Some(
+            div()
+                .relative()
+                .flex_none()
+                .h_full()
+                .child(self.render_info_contents()?)
+                .child(self.info_close_button(cx)),
+        )
+    }
+
+    fn render_info_contents(&self) -> Option<impl IntoElement> {
+        let theme = &self.theme;
+        let panel = div()
+            .id("info-panel")
+            .w(px(INFO_PANEL_WIDTH))
+            .flex_none()
+            .h_full()
+            .overflow_y_scroll()
+            .bg(theme.sidebar)
+            .border_l_1()
+            .border_color(theme.border)
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_3();
+
+        if self.selected.len() > 1 {
+            let selected: Vec<&Entry> = self.entries.iter().filter(|e| self.selected.contains(&e.path)).collect();
+            let folders = selected.iter().filter(|e| e.is_dir).count();
+            let files = selected.len() - folders;
+            let bytes: u64 = selected.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
+            let mut rows = vec![];
+            if files > 0 {
+                rows.push(("Files", format!("{files} · {}", format_size(bytes))));
+            }
+            if folders > 0 {
+                rows.push(("Folders", folders.to_string()));
+            }
+            return Some(
+                panel
+                    .child(self.info_title(format!("{} selected", count_label(selected.len())), "Multiple items".into()))
+                    .child(self.info_rows(rows)),
+            );
+        }
+
+        let Some(info) = &self.info else {
+            return Some(panel.child(div().pt_8().w_full().text_center().text_color(theme.text_muted).child("No selection")));
+        };
+        let entry = self.entries.iter().find(|e| e.path == info.path).cloned().or_else(|| Entry::from_path(&info.path).ok())?;
+
+        // Preview: the image itself when gpui can decode it, else a large icon.
+        let decodable = matches!(
+            entry.extension().map(|e| e.to_ascii_lowercase()).as_deref(),
+            Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")
+        );
+        let preview: AnyElement = if decodable && entry.size <= MAX_PREVIEW_BYTES {
+            img(entry.path.clone()).w_full().max_h(px(220.)).object_fit(ObjectFit::Contain).rounded_md().into_any_element()
+        } else {
+            match info.icon_key.as_ref().and_then(|k| self.icons.peek(k)) {
+                Some(icon) => img(icon).size(px(96.)).into_any_element(),
+                None => div().text_size(px(64.)).child(icon_for(&entry)).into_any_element(),
+            }
+        };
+
+        let mut rows: Vec<(&'static str, String)> = Vec::new();
+        let size = if entry.is_dir || entry.is_package {
+            match (info.folder_size, info.computing) {
+                (Some((bytes, items)), _) => format!("{} · {}", format_size(bytes), count_label(items as usize)),
+                (None, true) => "Calculating…".into(),
+                (None, false) => "--".into(),
+            }
+        } else {
+            format!("{} ({} bytes)", format_size(entry.size), findest_core::info::group_digits(entry.size))
+        };
+        rows.push(("Size", size));
+        if let Some((w, h)) = info.dimensions {
+            rows.push(("Dimensions", format!("{w} × {h}")));
+        }
+        if let Some(file) = &info.file {
+            rows.extend(file.created.map(|t| ("Created", format_full_time(t))));
+            rows.extend(file.modified.map(|t| ("Modified", format_full_time(t))));
+            rows.extend(file.accessed.map(|t| ("Last opened", format_full_time(t))));
+        }
+        if let Some(parent) = entry.path.parent() {
+            rows.push(("Where", locations::breadcrumbs(&self.home, parent).iter().map(|p| p.label.as_str()).collect::<Vec<_>>().join(" › ")));
+        }
+        if let Some(file) = &info.file {
+            if let Some(target) = &file.link_target {
+                rows.push(("Links to", contract_tilde(target)));
+            }
+            let mode = file.mode & 0o777;
+            rows.push(("Permissions", format!("{} ({mode:o})", findest_core::info::permissions_string(mode))));
+        }
+        if entry.is_hidden {
+            rows.push(("Hidden", "Yes".into()));
+        }
+
+        Some(
+            panel
+                .child(div().w_full().flex().justify_center().py_2().child(preview))
+                .child(self.info_title(entry.display_name().to_string(), entry.kind()))
+                .child(self.info_rows(rows)),
+        )
+    }
+
+    /// Small ✕ pinned to the panel's top-right corner.
+    fn info_close_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = &self.theme;
+        let icon = self.icons.peek(&self.symbol_key_colored("xmark", theme.text_muted));
+        div()
+            .id("info-close")
+            .absolute()
+            .top(px(8.))
+            .right(px(8.))
+            .size(px(24.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .cursor_pointer()
+            .text_color(theme.text_muted)
+            .hover(|s| s.bg(theme.hover))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .tooltip(tooltip("Close info panel (⌘I)"))
+            .on_click(cx.listener(|this, _, window, cx| this.run(crate::command::Command::ToggleInfo, window, cx)))
+            .child(match icon {
+                Some(image) => img(image).size(px(11.)).object_fit(ObjectFit::Contain).into_any_element(),
+                None => div().child("✕").into_any_element(),
+            })
+    }
+
+    fn info_title(&self, title: String, subtitle: String) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(div().font_weight(FontWeight::SEMIBOLD).text_size(px(self.theme.font_size + 2.)).child(title))
+            .child(div().text_color(self.theme.text_muted).child(subtitle))
+    }
+
+    fn info_rows(&self, rows: Vec<(&'static str, String)>) -> impl IntoElement {
+        let theme = &self.theme;
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .pt_3()
+            .border_t_1()
+            .border_color(theme.border)
+            .children(rows.into_iter().map(|(label, value)| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(div().text_size(px(theme.font_size - 2.)).text_color(theme.text_muted).child(label))
+                    .child(div().overflow_hidden().child(value))
+            }))
+    }
+
+    /// Indentation plus the ▸/▾ toggle for folder rows.
+    fn render_disclosure(&self, ix: usize, cx: &mut Context<Self>) -> impl IntoElement {
+        let entry = &self.entries[ix];
+        let indent = self.depth(ix) as f32 * TREE_INDENT;
+        let toggle = self.is_expandable(ix);
+        let expanded = self.is_expanded(&entry.path);
+        let path = entry.path.clone();
+        let muted = if self.selected.contains(&entry.path) { self.theme.selection_text } else { self.theme.text_muted };
+        div()
+            .id(("disclosure", ix))
+            .flex_none()
+            .ml(px(indent))
+            .w(px(TREE_GUTTER))
+            .h_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(self.theme.font_size - 3.))
+            .text_color(muted)
+            .when(toggle, |d| {
+                d.cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.menu = None;
+                            this.toggle_expanded(path.clone(), cx);
+                        }),
+                    )
+                    .child(if expanded { "▼" } else { "▶" })
+            })
+    }
+
     fn render_status_bar(&self) -> impl IntoElement {
         let theme = &self.theme;
         let mut summary = count_label(self.entries.len());
         if !self.selected.is_empty() {
             summary = format!("{} of {summary} selected", self.selected.len());
+            let bytes = self.selection_size();
+            if bytes > 0 {
+                summary = format!("{summary} · {}", format_size(bytes));
+            }
         }
+        let capacity = self.volume.map(|(available, total)| {
+            format!("{} available of {}", format_size(available), format_size(total))
+        });
         let (message, color): (String, Hsla) = match &self.status {
             Some(status) => (status.message.clone(), if status.is_error { theme.danger } else { theme.text_muted }),
             None => (String::new(), theme.text_muted),
@@ -719,6 +961,7 @@ impl Browser {
             .text_color(theme.text_muted)
             .child(div().flex_none().whitespace_nowrap().child(summary))
             .child(div().flex_1().min_w_0().flex().justify_end().text_color(color).truncate().child(message))
+            .children(capacity.map(|c| div().flex_none().whitespace_nowrap().child(c)))
     }
 
     fn render_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -805,6 +1048,29 @@ impl Browser {
             this.drop_paths(files.paths().to_vec(), dest2.clone(), copy, cx);
         }))
     }
+}
+
+/// Hover hint for toolbar buttons.
+struct Tooltip(&'static str);
+
+impl Render for Tooltip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(gpui::rgb(0x2b2d31))
+            .border_1()
+            .border_color(gpui::rgb(0x45474d))
+            .text_color(gpui::rgb(0xf0f0f0))
+            .text_sm()
+            .shadow_md()
+            .child(self.0)
+    }
+}
+
+fn tooltip(text: &'static str) -> impl Fn(&mut Window, &mut gpui::App) -> gpui::AnyView {
+    move |_, cx| cx.new(|_| Tooltip(text)).into()
 }
 
 /// The floating label that follows the cursor while dragging.
@@ -901,6 +1167,12 @@ fn icon_for(entry: &Entry) -> &'static str {
         ) => "📝",
         _ => "📄",
     }
+}
+
+/// "15 October 2026 at 14:03".
+fn format_full_time(time: SystemTime) -> String {
+    let time: DateTime<Local> = time.into();
+    time.format("%-d %B %Y at %H:%M").to_string()
 }
 
 fn format_time(time: SystemTime) -> String {

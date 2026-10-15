@@ -99,6 +99,66 @@ pub fn read_dir(dir: &Path, show_hidden: bool) -> io::Result<Vec<Entry>> {
     Ok(entries)
 }
 
+/// One row of a tree listing: an entry and how deeply it's nested under the root.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TreeRow {
+    pub entry: Entry,
+    pub depth: usize,
+    /// For folders: whether there's anything (visible) inside to expand.
+    pub has_children: bool,
+}
+
+/// True if `dir` contains at least one entry that would be listed.
+pub fn has_visible_children(dir: &Path, show_hidden: bool) -> bool {
+    let Ok(read) = fs::read_dir(dir) else { return false };
+    read.filter_map(|item| item.ok()).any(|item| {
+        if show_hidden {
+            return true;
+        }
+        // Cheap name check first; only stat names that might be visible.
+        !item.file_name().to_string_lossy().starts_with('.')
+            && Entry::from_path(&item.path()).is_ok_and(|e| !e.is_hidden)
+    })
+}
+
+/// Guards against symlink cycles when expanding.
+const MAX_TREE_DEPTH: usize = 32;
+
+/// Lists `root`, with the contents of every folder in `expanded` inlined
+/// (depth-first, each level sorted) right after that folder's row. Only an
+/// error reading `root` itself is returned; unreadable subfolders show no children.
+pub fn read_tree(
+    root: &Path,
+    expanded: &std::collections::HashSet<PathBuf>,
+    show_hidden: bool,
+    order: SortOrder,
+) -> io::Result<Vec<TreeRow>> {
+    fn walk(
+        dir: &Path,
+        depth: usize,
+        expanded: &std::collections::HashSet<PathBuf>,
+        show_hidden: bool,
+        order: SortOrder,
+        out: &mut Vec<TreeRow>,
+    ) -> io::Result<()> {
+        let mut entries = read_dir(dir, show_hidden)?;
+        sort_entries(&mut entries, order);
+        for entry in entries {
+            let has_children = entry.is_dir && has_visible_children(&entry.path, show_hidden);
+            let recurse = has_children && depth < MAX_TREE_DEPTH && expanded.contains(&entry.path);
+            let path = entry.path.clone();
+            out.push(TreeRow { entry, depth, has_children });
+            if recurse {
+                let _ = walk(&path, depth + 1, expanded, show_hidden, order, out);
+            }
+        }
+        Ok(())
+    }
+    let mut rows = Vec::new();
+    walk(root, 0, expanded, show_hidden, order, &mut rows)?;
+    Ok(rows)
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SortKey {
@@ -193,6 +253,38 @@ pub fn format_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tree_inlines_expanded_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("a/inner")).unwrap();
+        fs::write(root.join("a/inner/deep.txt"), "").unwrap();
+        fs::write(root.join("a/x.txt"), "").unwrap();
+        fs::create_dir(root.join("b")).unwrap();
+        fs::write(root.join("b/y.txt"), "").unwrap();
+        fs::write(root.join("c.txt"), "").unwrap();
+        let order = SortOrder { key: SortKey::Name, ascending: true, folders_first: true };
+
+        fs::create_dir(root.join("empty")).unwrap();
+        fs::write(root.join("empty/.hidden"), "").unwrap();
+        let flat = read_tree(root, &Default::default(), false, order).unwrap();
+        assert_eq!(flat.iter().map(|r| r.entry.name.as_str()).collect::<Vec<_>>(), ["a", "b", "empty", "c.txt"]);
+        let expandable: Vec<bool> = flat.iter().map(|r| r.has_children).collect();
+        assert_eq!(expandable, [true, true, false, false]);
+        let with_hidden = read_tree(root, &Default::default(), true, order).unwrap();
+        assert!(with_hidden.iter().find(|r| r.entry.name == "empty").unwrap().has_children);
+
+        let expanded = [root.join("a"), root.join("a/inner")].into_iter().collect();
+        let rows = read_tree(root, &expanded, false, order).unwrap();
+        let shape: Vec<(String, usize)> = rows.iter().map(|r| (r.entry.name.clone(), r.depth)).collect();
+        let expect = [("a", 0), ("inner", 1), ("deep.txt", 2), ("x.txt", 1), ("b", 0), ("empty", 0), ("c.txt", 0)];
+        assert_eq!(shape, expect.map(|(n, d)| (n.to_string(), d)));
+
+        // An expanded folder whose parent is collapsed stays hidden.
+        let orphan = [root.join("a/inner")].into_iter().collect();
+        assert_eq!(read_tree(root, &orphan, false, order).unwrap().len(), 4);
+    }
 
     #[test]
     fn natural_ordering() {

@@ -3,6 +3,7 @@ mod command;
 mod icons;
 mod install;
 mod render;
+mod system;
 mod text_input;
 mod theme;
 mod watcher;
@@ -67,7 +68,11 @@ fn menus() -> Vec<Menu> {
         },
         Menu {
             name: "View".into(),
-            items: vec![item("Show/Hide Hidden Files", "toggle_hidden"), item("Refresh", "refresh")],
+            items: vec![
+                item("Show/Hide Info Panel", "toggle_info"),
+                item("Show/Hide Hidden Files", "toggle_hidden"),
+                item("Refresh", "refresh"),
+            ],
         },
         Menu {
             name: "Go".into(),

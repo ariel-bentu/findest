@@ -16,8 +16,9 @@ use objc2_app_kit::{
 use objc2_foundation::{NSDictionary, NSPoint, NSRect, NSSize, NSString};
 use objc2_uniform_type_identifiers::{UTType, UTTypeData, UTTypeFolder};
 
-/// Rendered icon edge in pixels; displayed at ~18pt, so this stays sharp on Retina.
-const ICON_PIXELS: f64 = 64.0;
+/// Rendered icon edge in pixels: sharp on Retina both in rows (~18pt) and
+/// in the info panel (64pt).
+const ICON_PIXELS: f64 = 128.0;
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum IconKey {
