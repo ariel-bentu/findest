@@ -12,6 +12,17 @@ crates/
 
 ## Install
 
+With Homebrew. This builds from source on your Mac, so there are no Gatekeeper warnings and no Apple developer account is needed:
+
+```sh
+brew install ariel-bentu/findest/findest
+findest            # first run installs Findest.app and opens it
+```
+
+Update with `brew upgrade findest`, then run `findest` once to refresh the app.
+
+From a clone:
+
 ```sh
 cargo install --path crates/findest
 findest            # installs/updates Findest.app, then opens it
