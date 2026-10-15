@@ -38,7 +38,7 @@ Findest also appears in Finder's "Open With" menu for folders.
 ```sh
 cargo run -p findest [-- <path>]   # debug builds always run in place
 cargo test --workspace
-./scripts/make_icon.sh             # regenerate assets/AppIcon.icns
+./scripts/make_icon.sh             # regenerate the app icon (needs Xcode 26+)
 ```
 
 Set `FINDEST_NO_BUNDLE=1` to run a release build in place.

@@ -13,6 +13,8 @@ use anyhow::{Context, Result, bail};
 
 pub const BUNDLE_ID: &str = "dev.findest.Findest";
 const ICON: &[u8] = include_bytes!("../../../assets/AppIcon.icns");
+/// Compiled asset catalog; macOS 26+ draws the icon full size only from this.
+const ASSETS: &[u8] = include_bytes!("../../../assets/Assets.car");
 
 /// Returns true if this process handed off to Findest.app and should exit.
 pub fn handoff_if_needed() -> bool {
@@ -96,6 +98,7 @@ fn write_bundle(exe: &Path, app: &Path, stamp: &str) -> Result<()> {
     fs::create_dir_all(contents.join("Resources"))?;
     fs::copy(exe, contents.join("MacOS/findest")).context("copying binary")?;
     fs::write(contents.join("Resources/AppIcon.icns"), ICON)?;
+    fs::write(contents.join("Resources/Assets.car"), ASSETS)?;
     fs::write(contents.join("Resources/install-stamp"), stamp)?;
     fs::write(contents.join("Info.plist"), info_plist())?;
     sign(&tmp, &current_signer(app))?;
@@ -170,6 +173,7 @@ fn info_plist() -> String {
     <key>CFBundleIdentifier</key><string>{BUNDLE_ID}</string>
     <key>CFBundleExecutable</key><string>findest</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
+    <key>CFBundleIconName</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>{version}</string>
     <key>CFBundleVersion</key><string>{version}</string>

@@ -22,17 +22,14 @@ func linear(_ colors: [CGColor], from: CGPoint, to: CGPoint) {
     ctx.drawLinearGradient(g, start: from, end: to, options: [.drawsBeforeStartLocation, .drawsAfterEndLocation])
 }
 
-// macOS icon grid: 824pt body centered in 1024, ~185pt corner radius.
+// Full-bleed square artwork: macOS (26+) applies its own rounded mask to an
+// opaque square icon; padded/transparent artwork instead gets shrunk onto a
+// gray plate. Draw on the classic 824pt grid, scaled up to fill the canvas.
 let body = CGRect(x: 100, y: 100, width: 824, height: 824)
-let bodyPath = CGPath(roundedRect: body, cornerWidth: 185, cornerHeight: 185, transform: nil)
-
-// Drop shadow under the body.
-ctx.saveGState()
-ctx.setShadow(offset: CGSize(width: 0, height: -14), blur: 34, color: rgb(0x000000, 0.35))
-ctx.addPath(bodyPath)
-ctx.setFillColor(rgb(0x2a7de1))
-ctx.fillPath()
-ctx.restoreGState()
+let bodyPath = CGPath(rect: body, transform: nil)
+let k = size / body.width
+ctx.scaleBy(x: k, y: k)
+ctx.translateBy(x: -body.minX, y: -body.minY)
 
 // Two-tone face: light left half, deep blue right half split by a soft S-curve.
 ctx.saveGState()
@@ -74,16 +71,16 @@ smile.addCurve(to: CGPoint(x: 744, y: 420), control1: CGPoint(x: 400, y: 280), c
 ctx.addPath(smile)
 ctx.strokePath()
 
-// The lightning bolt, large and diagonal, breaking out of the lower right corner.
+// The lightning bolt, large and diagonal, reaching down to the lower edge.
 let bolt = CGMutablePath()
 bolt.addLines(between: [
     CGPoint(x: 700, y: 760),
     CGPoint(x: 520, y: 420),
     CGPoint(x: 660, y: 420),
-    CGPoint(x: 560, y: 70),
-    CGPoint(x: 900, y: 500),
-    CGPoint(x: 745, y: 500),
-    CGPoint(x: 860, y: 760),
+    CGPoint(x: 580, y: 118),
+    CGPoint(x: 875, y: 500),
+    CGPoint(x: 735, y: 500),
+    CGPoint(x: 850, y: 760),
 ])
 bolt.closeSubpath()
 
@@ -97,7 +94,7 @@ ctx.restoreGState()
 ctx.saveGState()
 ctx.addPath(bolt)
 ctx.clip()
-linear([rgb(0xfff27a), rgb(0xffc21a), rgb(0xff8a00)], from: CGPoint(x: 0, y: 760), to: CGPoint(x: 0, y: 70))
+linear([rgb(0xfff27a), rgb(0xffc21a), rgb(0xff8a00)], from: CGPoint(x: 0, y: 760), to: CGPoint(x: 0, y: 118))
 ctx.restoreGState()
 
 ctx.addPath(bolt)
