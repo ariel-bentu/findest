@@ -2,6 +2,7 @@ mod browser;
 mod command;
 mod icons;
 mod install;
+mod native_drag;
 mod render;
 mod system;
 mod text_input;
@@ -13,10 +14,12 @@ use std::path::PathBuf;
 use futures::StreamExt;
 use gpui::{
     App, Application, Bounds, KeyBinding, Menu, MenuItem, SystemMenuType, TitlebarOptions,
-    WindowBounds, WindowOptions, prelude::*, px, size,
+    WindowBounds, WindowHandle, WindowOptions, prelude::*, px, size,
 };
 
-use crate::browser::Browser;
+use crate::browser::{Browser, BrowserInit, Quitting};
+use findest_core::config::Config;
+use findest_core::session::Session;
 use crate::command::{Quit, Run};
 
 /// Keys that work regardless of config (re-applied whenever the keymap reloads).
@@ -40,6 +43,7 @@ fn menus() -> Vec<Menu> {
         Menu {
             name: "File".into(),
             items: vec![
+                item("New Window", "new_window"),
                 item("New Folder", "new_folder"),
                 item("New File", "new_file"),
                 MenuItem::separator(),
@@ -53,6 +57,8 @@ fn menus() -> Vec<Menu> {
                 item("Move to Trash", "trash"),
                 item("Delete Permanently…", "delete_permanently"),
                 item("Empty Trash…", "empty_trash"),
+                MenuItem::separator(),
+                item("Close Window", "close_window"),
             ],
         },
         Menu {
@@ -89,6 +95,54 @@ fn menus() -> Vec<Menu> {
     ]
 }
 
+/// Opens a browser window, cascaded from any already open.
+pub fn open_browser_window(init: BrowserInit, cx: &mut App) -> Option<WindowHandle<Browser>> {
+    let offset = px(28. * cx.windows().len() as f32);
+    let mut bounds = Bounds::centered(None, size(px(1100.), px(700.)), cx);
+    bounds.origin.x += offset;
+    bounds.origin.y += offset;
+    let window = cx
+        .open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions { title: Some("Findest".into()), ..Default::default() }),
+                window_min_size: Some(size(px(600.), px(360.))),
+                ..Default::default()
+            },
+            |window, cx| cx.new(|cx| Browser::new(init, window, cx)),
+        )
+        .ok()?;
+    window
+        .update(cx, |browser, window, cx| {
+            window.focus(&browser.focus);
+            cx.activate(true);
+        })
+        .ok();
+    Some(window)
+}
+
+/// Windows to open at launch: an explicit path, else the last session's windows.
+fn initial_windows(start: Option<PathBuf>) -> Vec<BrowserInit> {
+    let session = Session::load(&Session::path());
+    if start.is_some() {
+        return vec![BrowserInit { start, info_panel: session.info_panel, ..Default::default() }];
+    }
+    let restore = Config::load(&Config::path()).map(|c| c.general.restore_session).unwrap_or(true);
+    let mut inits: Vec<BrowserInit> = if restore {
+        session
+            .windows
+            .into_iter()
+            .map(|w| BrowserInit { start: w.folder, recents: w.recents, expanded: w.expanded, info_panel: session.info_panel })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if inits.is_empty() {
+        inits.push(BrowserInit { info_panel: session.info_panel, ..Default::default() });
+    }
+    inits
+}
+
 fn main() {
     if install::handoff_if_needed() {
         return;
@@ -104,40 +158,44 @@ fn main() {
         let _ = url_tx.unbounded_send(urls);
     });
     app.run(move |cx: &mut App| {
-        cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.on_action(|_: &Quit, cx| {
+            cx.set_global(Quitting(true));
+            cx.quit();
+        });
         bind_global_keys(cx);
         text_input::bind_keys(cx);
         cx.set_menus(menus());
 
-        let bounds = Bounds::centered(None, size(px(1100.), px(700.)), cx);
-        let window = cx
-            .open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    titlebar: Some(TitlebarOptions { title: Some("Findest".into()), ..Default::default() }),
-                    window_min_size: Some(size(px(600.), px(360.))),
-                    ..Default::default()
-                },
-                |window, cx| cx.new(|cx| Browser::new(start, window, cx)),
-            )
-            .expect("failed to open window");
-        window
-            .update(cx, |browser, window, cx| {
-                window.focus(&browser.focus);
-                cx.activate(true);
-            })
-            .ok();
+        for init in initial_windows(start) {
+            open_browser_window(init, cx);
+        }
+
         cx.spawn(async move |cx| {
             while let Some(urls) = url_rx.next().await {
                 let Some(path) = urls.iter().rev().find_map(|u| findest_core::paths::path_from_file_url(u)) else {
                     continue;
                 };
-                window
-                    .update(cx, |browser, window, cx| {
-                        browser.navigate_to_path(path, cx);
-                        window.activate_window();
-                    })
-                    .ok();
+                // Show it in the frontmost window, or a new one if none is open.
+                cx.update(|cx| {
+                    let front = cx
+                        .active_window()
+                        .and_then(|w| w.downcast::<Browser>())
+                        .or_else(|| cx.windows().iter().rev().find_map(|w| w.downcast::<Browser>()));
+                    match front {
+                        Some(window) => {
+                            window
+                                .update(cx, |browser, window, cx| {
+                                    browser.navigate_to_path(path, cx);
+                                    window.activate_window();
+                                })
+                                .ok();
+                        }
+                        None => {
+                            open_browser_window(BrowserInit::at(Some(path)), cx);
+                        }
+                    }
+                })
+                .ok();
             }
         })
         .detach();

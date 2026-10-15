@@ -51,6 +51,8 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str)] = &[
     ("cmd-shift-r", "show_recents"),
     ("cmd-alt-r", "reveal_in_finder"),
     ("cmd-,", "open_config"),
+    ("cmd-n", "new_window"),
+    ("cmd-w", "close_window"),
     ("cmd-e", "open_with:VS Code"),
     ("cmd-alt-t", "open_with:Terminal"),
 ];

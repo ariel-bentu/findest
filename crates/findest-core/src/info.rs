@@ -71,6 +71,44 @@ pub fn dir_size(dir: &Path, cancel: &AtomicBool) -> Option<(u64, u64)> {
     Some((bytes, items))
 }
 
+/// Extensions previewed as text without sniffing their contents.
+const TEXT_EXTENSIONS: &[&str] = &[
+    "txt", "md", "markdown", "rst", "log", "csv", "tsv", "json", "jsonc", "toml", "yaml", "yml", "xml", "ini",
+    "cfg", "conf", "env", "properties", "rs", "py", "js", "mjs", "cjs", "ts", "tsx", "jsx", "go", "java", "kt",
+    "swift", "c", "h", "cc", "cpp", "hpp", "m", "mm", "rb", "php", "sh", "bash", "zsh", "fish", "ps1", "sql",
+    "html", "htm", "css", "scss", "less", "vue", "svelte", "lua", "pl", "r", "scala", "dart", "gradle", "tf",
+    "proto", "graphql", "lock", "gitignore", "dockerignore", "editorconfig", "plist", "srt", "tex",
+];
+
+/// Up to `max_lines` lines of a text file, or `None` for binary files.
+/// Reads at most 64 KB. Unknown extensions are sniffed: no NUL bytes and
+/// mostly valid UTF-8 counts as text.
+pub fn text_preview(path: &Path, max_lines: usize) -> Option<String> {
+    use std::io::Read;
+    const MAX_BYTES: usize = 64 * 1024;
+    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+    let known = ext.as_deref().is_some_and(|e| TEXT_EXTENSIONS.contains(&e))
+        || path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with('.') && !n[1..].contains('.'));
+    let mut buf = Vec::with_capacity(8192);
+    fs::File::open(path).ok()?.take(MAX_BYTES as u64).read_to_end(&mut buf).ok()?;
+    if buf.contains(&0) {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&buf);
+    if !known {
+        let replaced = text.chars().filter(|&c| c == char::REPLACEMENT_CHARACTER).count();
+        if replaced * 100 > text.chars().count().max(1) {
+            return None;
+        }
+    }
+    let mut out = String::new();
+    for line in text.lines().take(max_lines) {
+        out.push_str(&line.replace('\t', "    "));
+        out.push('\n');
+    }
+    Some(out.trim_end_matches('\n').to_string())
+}
+
 /// Formats a byte count with thousands separators: 1234567 -> "1,234,567".
 pub fn group_digits(n: u64) -> String {
     let digits = n.to_string();
@@ -93,6 +131,26 @@ mod tests {
         assert_eq!(permissions_string(0o644), "rw-r--r--");
         assert_eq!(permissions_string(0o755), "rwxr-xr-x");
         assert_eq!(permissions_string(0o100600), "rw-------");
+    }
+
+    #[test]
+    fn text_previews() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = tmp.path().join("main.rs");
+        fs::write(&code, "fn main() {\n\tprintln!();\n}\nextra\n").unwrap();
+        assert_eq!(text_preview(&code, 3).unwrap(), "fn main() {\n    println!();\n}");
+
+        let makefile = tmp.path().join("Makefile");
+        fs::write(&makefile, "all:\n\tcargo build\n").unwrap();
+        assert!(text_preview(&makefile, 10).is_some(), "sniffed as text");
+
+        let binary = tmp.path().join("blob.bin");
+        fs::write(&binary, [0x89u8, b'P', b'N', b'G', 0, 1, 2]).unwrap();
+        assert!(text_preview(&binary, 10).is_none());
+
+        let latin1 = tmp.path().join("data");
+        fs::write(&latin1, [0xff_u8, 0xfe, 0xfd, 0xfc, 0xfb].repeat(20)).unwrap();
+        assert!(text_preview(&latin1, 10).is_none(), "mostly invalid UTF-8");
     }
 
     #[test]

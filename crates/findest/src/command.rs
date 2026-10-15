@@ -66,6 +66,8 @@ pub enum Command {
     ShowRecents,
     RevealInFinder,
     OpenConfig,
+    NewWindow,
+    CloseWindow,
     OpenWith(String),
 }
 
@@ -114,6 +116,8 @@ impl FromStr for Command {
             "show_recents" => ShowRecents,
             "reveal_in_finder" => RevealInFinder,
             "open_config" => OpenConfig,
+            "new_window" => NewWindow,
+            "close_window" => CloseWindow,
             other => return Err(format!("unknown command \"{other}\"")),
         })
     }

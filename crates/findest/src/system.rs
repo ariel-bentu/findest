@@ -38,6 +38,29 @@ pub fn image_dimensions(path: &Path) -> Option<(u32, u32)> {
     })
 }
 
+/// Renders any image AppKit understands (HEIC, TIFF, PSD, RAW, PDF's first
+/// page, ...) to PNG, scaled so its longer side is at most `max_pixels`.
+pub fn image_preview_png(path: &Path, max_pixels: f64) -> Option<Vec<u8>> {
+    use objc2::AllocAnyThread;
+    use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSImage};
+    use objc2_foundation::{NSDictionary, NSPoint, NSRect, NSSize};
+    autoreleasepool(|_| {
+        let image = NSImage::initWithContentsOfFile(NSImage::alloc(), &NSString::from_str(path.to_str()?))?;
+        let size = image.size();
+        if size.width <= 0.0 || size.height <= 0.0 {
+            return None;
+        }
+        let scale = (max_pixels / size.width.max(size.height)).min(2.0);
+        let mut rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(size.width * scale, size.height * scale));
+        // SAFETY: `rect` is a valid pointer for the duration of the call.
+        let cg_image = unsafe { image.CGImageForProposedRect_context_hints(&mut rect, None, None) }?;
+        let rep = NSBitmapImageRep::initWithCGImage(NSBitmapImageRep::alloc(), &cg_image);
+        // SAFETY: an empty properties dictionary is valid.
+        let png = unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new()) }?;
+        Some(png.to_vec())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,6 +70,14 @@ mod tests {
         let icon = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/AppIcon.png");
         assert_eq!(image_dimensions(&icon), Some((1024, 1024)));
         assert_eq!(image_dimensions(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml").as_path()), None);
+    }
+
+    #[test]
+    fn renders_previews() {
+        let icon = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/AppIcon.icns");
+        let png = image_preview_png(&icon, 256.0).unwrap();
+        assert!(png.starts_with(b"\x89PNG"));
+        assert!(image_preview_png(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml").as_path(), 256.0).is_none());
     }
 
     #[test]

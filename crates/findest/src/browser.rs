@@ -11,11 +11,11 @@ use findest_core::listing::{self, Entry};
 use findest_core::locations::{self, Place};
 use findest_core::paths::{contract_tilde, display_name, home_dir};
 use findest_core::recents::Recents;
-use findest_core::session::Session;
+use findest_core::session::{Session, WindowSession};
 use findest_core::{launch, ops};
 use futures::StreamExt;
 use gpui::{
-    App, AppContext, ClipboardItem, Context, Entity, FocusHandle, Focusable, Pixels, Point,
+    App, AppContext, Global, WeakEntity, ClipboardItem, Context, Entity, FocusHandle, Focusable, Pixels, Point,
     PromptLevel, ScrollStrategy, Subscription, Task, UniformListScrollHandle, Window,
 };
 
@@ -24,6 +24,31 @@ use crate::icons::{IconCache, IconKey};
 use crate::text_input::{TextInput, TextInputEvent};
 use crate::theme::Theme;
 use crate::watcher::FsWatcher;
+
+/// How a new window starts out (from the last session, `findest <path>`, or ⌘N).
+#[derive(Default)]
+pub struct BrowserInit {
+    pub start: Option<PathBuf>,
+    pub recents: bool,
+    pub expanded: Vec<PathBuf>,
+    pub info_panel: Option<bool>,
+}
+
+impl BrowserInit {
+    pub fn at(start: Option<PathBuf>) -> Self {
+        Self { start, ..Default::default() }
+    }
+}
+
+/// Every open browser window, in opening order (used to save the session).
+#[derive(Default)]
+pub struct OpenBrowsers(pub Vec<WeakEntity<Browser>>);
+impl Global for OpenBrowsers {}
+
+/// Set while quitting, so closing windows don't overwrite the saved session.
+#[derive(Default)]
+pub struct Quitting(pub bool);
+impl Global for Quitting {}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Location {
@@ -77,6 +102,10 @@ pub struct InfoState {
     pub dimensions: Option<(u32, u32)>,
     /// For folders: `(bytes, items)` once the background walk finishes.
     pub folder_size: Option<(u64, u64)>,
+    /// First lines of a text file.
+    pub text: Option<String>,
+    /// AppKit-rendered preview for images gpui can't decode (HEIC, PSD, PDF...).
+    pub preview: Option<std::sync::Arc<gpui::Image>>,
     pub computing: bool,
     pub icon_key: Option<IconKey>,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -97,11 +126,6 @@ pub struct LoadError {
     pub not_permitted: bool,
 }
 
-/// Payload while dragging items around inside Findest.
-#[derive(Clone)]
-pub struct DraggedFiles {
-    pub paths: std::rc::Rc<Vec<PathBuf>>,
-}
 
 /// What to select (and optionally start renaming) once the next listing arrives.
 struct PendingSelect {
@@ -134,6 +158,8 @@ pub struct Browser {
     /// A pending press on back/forward: a quick click navigates, a long press opens history.
     nav_press: Option<Task<()>>,
     nav_long_pressed: bool,
+    /// Where the mouse went down on a selected row; moving far enough starts a drag.
+    pub(crate) drag_origin: Option<Point<Pixels>>,
     load_task: Option<Task<()>>,
     pending_select: Option<PendingSelect>,
     /// Set when a just-created item should enter rename mode on the next frame.
@@ -167,7 +193,7 @@ impl Focusable for Browser {
 }
 
 impl Browser {
-    pub fn new(start: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(init: BrowserInit, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let config_path = Config::path();
         let (config, mut errors) = match Config::load_or_init(&config_path) {
             Ok(config) => (config, Vec::new()),
@@ -204,11 +230,30 @@ impl Browser {
             this.apply_config(this.config.clone(), window, cx);
         })];
 
-        // An explicit path wins, then the last session, then the configured start folder.
-        let session = if config.general.restore_session { Session::load(&Session::path()) } else { Session::default() };
-        let restore_recents = start.is_none() && session.recents;
-        let restore_info_panel = session.info_panel;
-        let start = start.or(session.folder).unwrap_or_else(|| config.start_path());
+        let restore_recents = init.recents;
+        let restore_info_panel = init.info_panel;
+        let start = init.start.unwrap_or_else(|| config.start_path());
+
+        let me = cx.weak_entity();
+        let browsers = &mut cx.default_global::<OpenBrowsers>().0;
+        browsers.retain(|b| b.upgrade().is_some());
+        browsers.push(me);
+        let mut subscriptions = subscriptions;
+        subscriptions.push(cx.on_release(|_, cx| {
+            // Closing one of several windows drops it from the saved session.
+            // Closing the last one (or quitting) keeps what was saved.
+            if cx.try_global::<Quitting>().is_some_and(|q| q.0) {
+                return;
+            }
+            let windows: Vec<WindowSession> = cx
+                .try_global::<OpenBrowsers>()
+                .map(|b| b.0.iter().filter_map(|w| w.upgrade()).map(|b| b.read(cx).window_session()).collect())
+                .unwrap_or_default();
+            if let Some(first) = cx.try_global::<OpenBrowsers>().and_then(|b| b.0.iter().find_map(|w| w.upgrade())) {
+                let info_panel = Some(first.read(cx).config.general.info_panel);
+                let _ = Session::new(windows, info_panel).save(&Session::path());
+            }
+        }));
         let mut this = Self {
             focus: cx.focus_handle(),
             config,
@@ -224,11 +269,12 @@ impl Browser {
             volume: None,
             info: None,
             volume_task: None,
-            expanded: session.expanded.into_iter().collect(),
+            expanded: init.expanded.into_iter().collect(),
             loading: false,
             load_error: None,
             nav_press: None,
             nav_long_pressed: false,
+            drag_origin: None,
             load_task: None,
             pending_select: None,
             pending_rename: false,
@@ -365,13 +411,25 @@ impl Browser {
 
     /// Persists the open folder and expansions for the next launch.
     fn save_session(&self, cx: &mut Context<Self>) {
-        let session = Session {
+        let me = cx.entity_id();
+        let browsers = cx.try_global::<OpenBrowsers>().map(|b| b.0.clone()).unwrap_or_default();
+        let windows: Vec<WindowSession> = browsers
+            .iter()
+            .filter_map(|weak| {
+                // This window is mid-update, so it can't be read through its handle.
+                if weak.entity_id() == me { Some(self.window_session()) } else { weak.upgrade().map(|b| b.read(cx).window_session()) }
+            })
+            .collect();
+        let session = Session::new(windows, Some(self.config.general.info_panel));
+        cx.background_executor().spawn(async move { session.save(&Session::path()) }).detach();
+    }
+
+    pub fn window_session(&self) -> WindowSession {
+        WindowSession {
             folder: self.current_dir(),
             recents: self.location == Location::Recents,
             expanded: self.expanded.iter().cloned().collect(),
-            info_panel: Some(self.config.general.info_panel),
-        };
-        cx.background_executor().spawn(async move { session.save(&Session::path()) }).detach();
+        }
     }
 
     pub fn reload(&mut self, cx: &mut Context<Self>) {
@@ -692,6 +750,13 @@ impl Browser {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                 self.set_info(format!("Copied {}", if paths.len() == 1 { "path".into() } else { format!("{} paths", paths.len()) }), cx);
             }
+            NewWindow => {
+                let init = BrowserInit { start: self.current_dir(), info_panel: Some(self.config.general.info_panel), ..Default::default() };
+                cx.defer(move |cx| {
+                    crate::open_browser_window(init, cx);
+                });
+            }
+            CloseWindow => window.remove_window(),
             ToggleInfo => {
                 self.config.general.info_panel = !self.config.general.info_panel;
                 self.save_session(cx);
@@ -1262,6 +1327,26 @@ impl Browser {
         self.go_history(back, 1, cx);
     }
 
+    /// Starts a native drag of the selection once the mouse has moved a few
+    /// pixels with the button held since pressing on a selected row.
+    pub fn maybe_start_drag(&mut self, event: &gpui::MouseMoveEvent, window: &mut Window) {
+        let Some(origin) = self.drag_origin else { return };
+        if event.pressed_button != Some(gpui::MouseButton::Left) || self.edit.is_some() {
+            self.drag_origin = None;
+            return;
+        }
+        let delta = event.position - origin;
+        if f32::from(delta.x).hypot(f32::from(delta.y)) < 5.0 {
+            return;
+        }
+        // Disarm first: AppKit swallows the mouse-up that ends the drag.
+        self.drag_origin = None;
+        let paths = self.selection();
+        if !paths.is_empty() {
+            crate::native_drag::start_file_drag(window, &paths);
+        }
+    }
+
     pub fn cancel_nav_press(&mut self) {
         self.nav_press = None;
     }
@@ -1451,37 +1536,44 @@ impl Browser {
             self.request_icon(key, cx);
         }
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let task = (is_dir || is_image).then(|| {
+        let kind = if is_dir {
+            PreviewKind::Folder
+        } else if is_image {
+            if gpui_decodes(&path) { PreviewKind::Image } else { PreviewKind::RenderedImage }
+        } else if is_pdf(&path) {
+            PreviewKind::RenderedImage
+        } else {
+            PreviewKind::Text
+        };
+        let task = {
             let (path, cancel) = (path.clone(), cancel.clone());
-            let work = cx.background_executor().spawn(async move {
-                if is_dir {
-                    (None, findest_core::info::dir_size(&path, &cancel))
-                } else {
-                    (crate::system::image_dimensions(&path), None)
-                }
-            });
+            let work = cx.background_executor().spawn(async move { load_details(&path, kind, &cancel) });
             cx.spawn(async move |this, cx| {
-                let (dimensions, folder_size) = work.await;
+                let details = work.await;
                 this.update(cx, |this, cx| {
                     if let Some(info) = &mut this.info {
-                        info.dimensions = dimensions;
-                        info.folder_size = folder_size;
+                        info.dimensions = details.dimensions;
+                        info.folder_size = details.folder_size;
+                        info.text = details.text;
+                        info.preview = details.preview.map(|png| std::sync::Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, png)));
                         info.computing = false;
                         cx.notify();
                     }
                 })
                 .ok();
             })
-        });
+        };
         self.info = Some(InfoState {
             path,
             file,
             dimensions: None,
             folder_size: None,
-            computing: task.is_some(),
+            text: None,
+            preview: None,
+            computing: true,
             icon_key,
             cancel,
-            _task: task,
+            _task: Some(task),
         });
     }
 
@@ -1594,12 +1686,58 @@ pub fn go_to_target(text: &str) -> GoToTarget {
     }
 }
 
+fn has_extension(path: &Path, extensions: &[&str]) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| extensions.iter().any(|x| x.eq_ignore_ascii_case(e)))
+}
+
 pub fn is_image_path(path: &Path) -> bool {
-    const IMAGE_EXTENSIONS: &[&str] =
-        &["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "heic", "heif", "ico", "icns", "psd", "svg"];
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| IMAGE_EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(e)))
+    has_extension(path, &[
+        "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "heic", "heif", "ico", "icns", "psd", "svg",
+        "jp2", "tga", "cr2", "cr3", "nef", "arw", "dng", "raf", "orf", "rw2",
+    ])
+}
+
+/// Formats gpui can decode itself; the info panel shows the file directly.
+pub fn gpui_decodes(path: &Path) -> bool {
+    has_extension(path, &["png", "jpg", "jpeg", "gif", "webp", "bmp"])
+}
+
+fn is_pdf(path: &Path) -> bool {
+    has_extension(path, &["pdf"])
+}
+
+#[derive(Clone, Copy)]
+enum PreviewKind {
+    Folder,
+    /// gpui decodes the file itself; only dimensions are loaded.
+    Image,
+    /// Rendered to PNG by AppKit.
+    RenderedImage,
+    Text,
+}
+
+#[derive(Default)]
+struct Details {
+    dimensions: Option<(u32, u32)>,
+    folder_size: Option<(u64, u64)>,
+    text: Option<String>,
+    preview: Option<Vec<u8>>,
+}
+
+/// The slow parts of the info panel, run on a background thread.
+fn load_details(path: &Path, kind: PreviewKind, cancel: &std::sync::atomic::AtomicBool) -> Details {
+    const TEXT_PREVIEW_LINES: usize = 200;
+    const PREVIEW_PIXELS: f64 = 640.0;
+    match kind {
+        PreviewKind::Folder => Details { folder_size: findest_core::info::dir_size(path, cancel), ..Default::default() },
+        PreviewKind::Image => Details { dimensions: crate::system::image_dimensions(path), ..Default::default() },
+        PreviewKind::RenderedImage => Details {
+            dimensions: if is_pdf(path) { None } else { crate::system::image_dimensions(path) },
+            preview: crate::system::image_preview_png(path, PREVIEW_PIXELS),
+            ..Default::default()
+        },
+        PreviewKind::Text => Details { text: findest_core::info::text_preview(path, TEXT_PREVIEW_LINES), ..Default::default() },
+    }
 }
 
 pub fn count_label(n: usize) -> String {

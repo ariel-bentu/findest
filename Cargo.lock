@@ -1705,6 +1705,7 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "objc2-uniform-type-identifiers",
+ "raw-window-handle",
  "schemars",
  "serde",
  "unicode-segmentation",

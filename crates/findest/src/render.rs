@@ -1,7 +1,6 @@
 //! Rendering for [`Browser`]: toolbar, sidebar, file list, status bar and menus.
 
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -15,7 +14,7 @@ use gpui::{
 };
 
 use crate::browser::{
-    Browser, DraggedFiles, EditKind, GoToTarget, Location, MenuAction, MenuEntry, count_label, go_to_target,
+    Browser, EditKind, GoToTarget, Location, MenuAction, MenuEntry, count_label, go_to_target,
 };
 use crate::command::BROWSER_CONTEXT;
 
@@ -461,6 +460,9 @@ impl Browser {
                     .min_h_0()
                     .relative()
                     .when_some(self.current_dir(), |d, dir| self.drop_handlers(d, dir, cx))
+                    .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, window, _| {
+                        this.maybe_start_drag(event, window);
+                    }))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseDownEvent, window, cx| {
@@ -484,11 +486,10 @@ impl Browser {
                             "entries",
                             self.entries.len(),
                             cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
-                                let selection = Rc::new(if this.selected.is_empty() { Vec::new() } else { this.selection() });
                                 range
                                     .map(|ix| {
                                         let icon = this.icon(ix, cx);
-                                        this.render_row(ix, icon, &selection, cx)
+                                        this.render_row(ix, icon, cx)
                                     })
                                     .collect::<Vec<_>>()
                             }),
@@ -602,12 +603,11 @@ impl Browser {
             })
     }
 
-    fn render_row(&self, ix: usize, icon: Option<Arc<Image>>, selection: &Rc<Vec<PathBuf>>, cx: &mut Context<Self>) -> AnyElement {
+    fn render_row(&self, ix: usize, icon: Option<Arc<Image>>, cx: &mut Context<Self>) -> AnyElement {
         let theme = &self.theme;
         let entry = &self.entries[ix];
         let selected = self.selected.contains(&entry.path);
         let renaming = self.renaming().filter(|(p, _)| *p == entry.path).map(|(_, input)| input.clone());
-        let is_renaming = renaming.is_some();
         let recents = self.location == Location::Recents;
         let (fg, muted) = if selected { (theme.selection_text, theme.selection_text.opacity(0.8)) } else { (theme.text, theme.text_muted) };
         let dim = entry.is_hidden && !selected;
@@ -655,18 +655,18 @@ impl Browser {
             .when(dim, |d| d.opacity(0.6))
             .when(selected, |d| d.bg(theme.selection))
             .when(!selected, |d| d.hover(|s| s.bg(theme.hover)))
-            .when(!is_renaming, |d| {
-                let paths = if selected { selection.clone() } else { Rc::new(vec![entry.path.clone()]) };
-                let (bg, fg) = (theme.selection, theme.selection_text);
-                d.on_drag(DraggedFiles { paths }, move |files: &DraggedFiles, offset, _, cx| {
-                    let label = match files.paths.as_slice() {
-                        [one] => findest_core::paths::display_name(one),
-                        many => count_label(many.len()),
-                    };
-                    cx.new(|_| DragPreview { label, offset, bg, fg })
-                })
-            })
             .when(entry.is_dir, |d| self.drop_target(d, entry.path.clone(), cx))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, event: &gpui::MouseUpEvent, _, cx| {
+                    // A plain click on one item of a multi-selection (that didn't
+                    // turn into a drag) narrows the selection to it, like Finder.
+                    let m = event.modifiers;
+                    if this.drag_origin.take().is_some() && !m.platform && !m.shift && this.selected.len() > 1 {
+                        this.select_only(ix, cx);
+                    }
+                }),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -685,8 +685,12 @@ impl Browser {
                         this.select_range_to(ix, cx);
                     } else if event.click_count >= 2 {
                         this.open_entry(ix, cx);
-                    } else {
+                    } else if !path.as_ref().is_some_and(|p| this.selected.contains(p)) {
                         this.select_only(ix, cx);
+                    }
+                    // Pressing on a selected item may become a drag of the whole selection.
+                    if path.as_ref().is_some_and(|p| this.selected.contains(p)) && event.click_count < 2 {
+                        this.drag_origin = Some(event.position);
                     }
                 }),
             )
@@ -789,19 +793,34 @@ impl Browser {
         };
         let entry = self.entries.iter().find(|e| e.path == info.path).cloned().or_else(|| Entry::from_path(&info.path).ok())?;
 
-        // Preview: the image itself when gpui can decode it, else a large icon.
-        let decodable = matches!(
-            entry.extension().map(|e| e.to_ascii_lowercase()).as_deref(),
-            Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")
-        );
-        let preview: AnyElement = if decodable && entry.size <= MAX_PREVIEW_BYTES {
+        // Preview: the image itself, an AppKit rendering, or a large icon. Text
+        // files additionally get their first lines below the details.
+        let preview: AnyElement = if crate::browser::gpui_decodes(&entry.path) && entry.size <= MAX_PREVIEW_BYTES {
             img(entry.path.clone()).w_full().max_h(px(220.)).object_fit(ObjectFit::Contain).rounded_md().into_any_element()
+        } else if let Some(image) = info.preview.clone() {
+            img(image).w_full().max_h(px(260.)).object_fit(ObjectFit::Contain).rounded_md().into_any_element()
         } else {
             match info.icon_key.as_ref().and_then(|k| self.icons.peek(k)) {
                 Some(icon) => img(icon).size(px(96.)).into_any_element(),
                 None => div().text_size(px(64.)).child(icon_for(&entry)).into_any_element(),
             }
         };
+        let text_preview = info.text.clone().filter(|t| !t.is_empty()).map(|text| {
+            div()
+                .id("text-preview")
+                .w_full()
+                .max_h(px(360.))
+                .overflow_y_scroll()
+                .p_2()
+                .rounded_md()
+                .bg(theme.background)
+                .border_1()
+                .border_color(theme.border)
+                .font_family("Menlo")
+                .text_size(px(theme.font_size - 2.))
+                .line_height(px(theme.font_size + 3.))
+                .child(text)
+        });
 
         let mut rows: Vec<(&'static str, String)> = Vec::new();
         let size = if entry.is_dir || entry.is_package {
@@ -840,7 +859,8 @@ impl Browser {
             panel
                 .child(div().w_full().flex().justify_center().py_2().child(preview))
                 .child(self.info_title(entry.display_name().to_string(), entry.kind()))
-                .child(self.info_rows(rows)),
+                .child(self.info_rows(rows))
+                .children(text_preview),
         )
     }
 
@@ -891,9 +911,19 @@ impl Browser {
             .children(rows.into_iter().map(|(label, value)| {
                 div()
                     .flex()
-                    .flex_col()
-                    .child(div().text_size(px(theme.font_size - 2.)).text_color(theme.text_muted).child(label))
-                    .child(div().overflow_hidden().child(value))
+                    .flex_row()
+                    .gap_3()
+                    .child(
+                        div()
+                            .w(px(78.))
+                            .flex_none()
+                            .flex()
+                            .justify_end()
+                            .text_size(px(theme.font_size - 1.))
+                            .text_color(theme.text_muted)
+                            .child(label),
+                    )
+                    .child(div().flex_1().min_w_0().overflow_hidden().text_size(px(theme.font_size - 1.)).child(value))
             }))
     }
 
@@ -1030,22 +1060,16 @@ impl Browser {
     /// Accepts drops (from Findest or other apps) into `dest`, highlighting on hover.
     fn drop_target<E: InteractiveElement + StatefulInteractiveElement + Styled>(&self, el: E, dest: PathBuf, cx: &mut Context<Self>) -> E {
         let highlight = self.theme.accent.opacity(0.25);
-        self.drop_handlers(el, dest, cx)
-            .drag_over::<DraggedFiles>(move |s, _, _, _| s.bg(highlight))
-            .drag_over::<ExternalPaths>(move |s, _, _, _| s.bg(highlight))
+        self.drop_handlers(el, dest, cx).drag_over::<ExternalPaths>(move |s, _, _, _| s.bg(highlight))
     }
 
+    /// All drops, including drags started in Findest itself, arrive as native
+    /// file drags (see `native_drag`).
     fn drop_handlers<E: InteractiveElement>(&self, el: E, dest: PathBuf, cx: &mut Context<Self>) -> E {
-        let dest2 = dest.clone();
-        el.on_drop(cx.listener(move |this, files: &DraggedFiles, window, cx| {
+        el.on_drop(cx.listener(move |this, files: &ExternalPaths, _, cx| {
             cx.stop_propagation();
-            let copy = window.modifiers().alt;
-            this.drop_paths(files.paths.to_vec(), dest.clone(), copy, cx);
-        }))
-        .on_drop(cx.listener(move |this, files: &ExternalPaths, window, cx| {
-            cx.stop_propagation();
-            let copy = window.modifiers().alt;
-            this.drop_paths(files.paths().to_vec(), dest2.clone(), copy, cx);
+            let copy = crate::native_drag::option_key_down();
+            this.drop_paths(files.paths().to_vec(), dest.clone(), copy, cx);
         }))
     }
 }
@@ -1071,34 +1095,6 @@ impl Render for Tooltip {
 
 fn tooltip(text: &'static str) -> impl Fn(&mut Window, &mut gpui::App) -> gpui::AnyView {
     move |_, cx| cx.new(|_| Tooltip(text)).into()
-}
-
-/// The floating label that follows the cursor while dragging.
-struct DragPreview {
-    label: String,
-    offset: Point<Pixels>,
-    bg: Hsla,
-    fg: Hsla,
-}
-
-impl Render for DragPreview {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .pl(self.offset.x + px(12.))
-            .pt(self.offset.y + px(6.))
-            .child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .bg(self.bg.opacity(0.9))
-                    .text_color(self.fg)
-                    .text_sm()
-                    .shadow_md()
-                    .whitespace_nowrap()
-                    .child(self.label.clone()),
-            )
-    }
 }
 
 /// macOS grants privacy permissions to the app that *launched* a process.

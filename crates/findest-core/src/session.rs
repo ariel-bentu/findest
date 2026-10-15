@@ -6,31 +6,61 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+/// One browser window's state.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct Session {
+pub struct WindowSession {
     /// The folder that was open; `None` with `recents` means the Recents view.
     pub folder: Option<PathBuf>,
     pub recents: bool,
     /// Folders expanded in place (tree view).
     pub expanded: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Session {
+    /// Open windows, front to back as last saved.
+    pub windows: Vec<WindowSession>,
     /// Whether the info panel was open; `None` defers to the config.
     pub info_panel: Option<bool>,
+
+    // Single-window format from earlier versions; migrated on load.
+    #[serde(skip_serializing)]
+    folder: Option<PathBuf>,
+    #[serde(skip_serializing)]
+    recents: bool,
+    #[serde(skip_serializing)]
+    expanded: Vec<PathBuf>,
 }
 
 impl Session {
+    pub fn new(windows: Vec<WindowSession>, info_panel: Option<bool>) -> Session {
+        Session { windows, info_panel, ..Default::default() }
+    }
+
     /// `~/Library/Application Support/findest/session.json`.
     pub fn path() -> PathBuf {
         crate::recents::Recents::path().with_file_name("session.json")
     }
 
     /// Missing or unreadable files yield an empty session. Folders that no
-    /// longer exist are dropped.
+    /// longer exist are dropped, and so are windows left with nothing to show.
     pub fn load(path: &Path) -> Session {
         let mut session: Session =
             fs::read(path).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
-        session.folder = session.folder.filter(|p| p.is_dir());
-        session.expanded.retain(|p| p.is_dir());
+        if session.windows.is_empty() && (session.folder.is_some() || session.recents) {
+            session.windows.push(WindowSession {
+                folder: session.folder.take(),
+                recents: session.recents,
+                expanded: std::mem::take(&mut session.expanded),
+            });
+        }
+        for window in &mut session.windows {
+            window.folder = window.folder.take().filter(|p| p.is_dir());
+            window.expanded.retain(|p| p.is_dir());
+        }
+        session.windows.retain(|w| w.folder.is_some() || w.recents);
         session
     }
 
@@ -50,17 +80,33 @@ mod tests {
     fn round_trips_and_drops_missing_folders() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("session.json");
-        let session = Session {
-            folder: Some(tmp.path().to_path_buf()),
-            recents: false,
-            expanded: vec![tmp.path().to_path_buf(), tmp.path().join("gone")],
-            info_panel: Some(false),
-        };
+        let here = tmp.path().to_path_buf();
+        let session = Session::new(
+            vec![
+                WindowSession { folder: Some(here.clone()), recents: false, expanded: vec![here.clone(), here.join("gone")] },
+                WindowSession { folder: Some(here.join("gone")), recents: false, expanded: vec![] },
+                WindowSession { folder: None, recents: true, expanded: vec![] },
+            ],
+            Some(false),
+        );
         session.save(&path).unwrap();
         let loaded = Session::load(&path);
-        assert_eq!(loaded.folder, session.folder);
-        assert_eq!(loaded.expanded, vec![tmp.path().to_path_buf()]);
+        assert_eq!(loaded.windows.len(), 2, "window on a deleted folder is dropped");
+        assert_eq!(loaded.windows[0].expanded, vec![here.clone()]);
+        assert!(loaded.windows[1].recents);
         assert_eq!(loaded.info_panel, Some(false));
         assert_eq!(Session::load(&tmp.path().join("missing.json")), Session::default());
+    }
+
+    #[test]
+    fn migrates_single_window_format() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.json");
+        let old = format!(r#"{{"folder": "{}", "recents": false, "expanded": [], "info_panel": true}}"#, tmp.path().display());
+        fs::write(&path, old).unwrap();
+        let loaded = Session::load(&path);
+        assert_eq!(loaded.windows.len(), 1);
+        assert_eq!(loaded.windows[0].folder.as_deref(), Some(tmp.path()));
+        assert_eq!(loaded.info_panel, Some(true));
     }
 }
