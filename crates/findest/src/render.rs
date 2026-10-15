@@ -90,6 +90,7 @@ impl Render for Browser {
                             .child(self.render_file_list(cx))
                             .children(self.render_info_panel(cx)),
                     )
+                    .child(self.render_path_bar(cx))
                     .child(self.render_status_bar(cx)),
             )
             .children(self.render_menu(cx))
@@ -104,41 +105,6 @@ impl Render for Browser {
 impl Browser {
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = &self.theme;
-        let mut crumbs = div().flex().flex_row().items_center().gap_1().flex_1().min_w_0().overflow_hidden();
-        match &self.location {
-            Location::Dir(dir) => {
-                let parts = locations::breadcrumbs(&self.home, dir);
-                let count = parts.len();
-                for (i, place) in parts.into_iter().enumerate() {
-                    let last = i + 1 == count;
-                    let label = if place.path == self.home { "~".to_string() } else { place.label };
-                    if i > 0 {
-                        crumbs = crumbs.child(div().text_color(theme.text_muted).child("›"));
-                    }
-                    let target = place.path.clone();
-                    crumbs = crumbs.child(
-                        div()
-                            .id(SharedString::from(format!("crumb-{i}")))
-                            .map(|d| self.drop_target(d, target.clone(), cx))
-                            .px_1()
-                            .rounded_sm()
-                            .whitespace_nowrap()
-                            .cursor_pointer()
-                            .when(last, |d| d.font_weight(FontWeight::SEMIBOLD))
-                            .when(!last, |d| d.text_color(theme.text_muted))
-                            .hover(|s| s.bg(theme.hover))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.navigate(Location::Dir(target.clone()), true, cx)
-                            }))
-                            .child(label),
-                    );
-                }
-            }
-            Location::Recents => {
-                crumbs = crumbs.child(div().font_weight(FontWeight::SEMIBOLD).child("Recents"));
-            }
-        }
-
         let hidden_label = if self.config.general.show_hidden { "Hidden: shown" } else { "Hidden: off" };
         div()
             .flex()
@@ -153,8 +119,7 @@ impl Browser {
             .child(self.nav_button(true, cx))
             .child(self.nav_button(false, cx))
             .child(self.toolbar_button("up", "chevron.up", "↑", self.current_dir().is_some_and(|d| d.parent().is_some()), "go_up", cx))
-            .child(crumbs)
-            .when(self.loading, |d| d.child(div().text_color(theme.text_muted).child("Loading…")))
+            .child(div().flex_1().min_w_0().when(self.loading, |d| d.text_color(theme.text_muted).child("Loading…")))
             .child(self.render_search_field(cx))
             .child(self.syntax_help_button(cx))
             .child(self.toolbar_text_button("goto", "Go to…", "go_to_folder", cx))
@@ -163,6 +128,70 @@ impl Browser {
             .child(self.view_button(ViewMode::Tiles, cx))
             .child(self.folder_menu_button(cx))
             .child(self.info_toggle_button(cx))
+    }
+
+    /// The current folder's path, above the status bar. Click a part to go
+    /// there, right-click it for a menu; when it doesn't fit, the start is cut
+    /// so the current folder stays visible.
+    fn render_path_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = &self.theme;
+        let mut crumbs = div().flex().flex_row().flex_none().items_center().gap_1();
+        match &self.location {
+            Location::Dir(dir) => {
+                let parts = locations::breadcrumbs(&self.home, dir);
+                let count = parts.len();
+                for (i, place) in parts.into_iter().enumerate() {
+                    let last = i + 1 == count;
+                    let label = if place.path == self.home { "~".to_string() } else { place.label };
+                    if i > 0 {
+                        crumbs = crumbs.child(div().text_color(theme.text_muted).child("›"));
+                    }
+                    let target = place.path.clone();
+                    let menu_target = place.path.clone();
+                    crumbs = crumbs.child(
+                        div()
+                            .id(SharedString::from(format!("crumb-{i}")))
+                            .map(|d| self.drop_target(d, target.clone(), cx))
+                            .px_1()
+                            .rounded_sm()
+                            .whitespace_nowrap()
+                            .cursor_pointer()
+                            .when(last, |d| d.font_weight(FontWeight::SEMIBOLD))
+                            .when(!last, |d| d.text_color(theme.text_muted))
+                            .hover(|s| s.bg(theme.hover))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.navigate(Location::Dir(target.clone()), true, cx)
+                            }))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.open_path_menu(event.position, menu_target.clone(), cx);
+                                }),
+                            )
+                            .child(label),
+                    );
+                }
+            }
+            Location::Recents => {
+                crumbs = crumbs.child(div().px_1().font_weight(FontWeight::SEMIBOLD).child("Recents"));
+            }
+        }
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_end()
+            .h(px(26.))
+            .px_2()
+            .overflow_hidden()
+            .bg(theme.surface)
+            .border_t_1()
+            .border_color(theme.border)
+            .text_size(px(theme.font_size - 1.))
+            // At least full width, so it's left-aligned while it fits; when it
+            // doesn't, justify_end makes the overflow (and the cut) on the left.
+            .child(crumbs.min_w_full())
     }
 
     /// The toolbar search box: a button until opened (⌘F), then a text field.

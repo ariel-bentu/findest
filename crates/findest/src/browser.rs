@@ -102,6 +102,9 @@ pub enum MenuAction {
     OpenPathWith(PathBuf, String),
     RevealPath(PathBuf),
     Navigate(PathBuf),
+    CopyPath(PathBuf),
+    AddFavoritePath(PathBuf),
+    NewWindowAt(PathBuf),
     /// Jump `steps` entries back (or forward) through history.
     History { back: bool, steps: usize },
 }
@@ -891,6 +894,23 @@ impl Browser {
             }
             MenuAction::OpenPathWith(path, opener) => self.open_with(&opener, &[path], cx),
             MenuAction::Navigate(path) => self.navigate_to_path(path, cx),
+            MenuAction::CopyPath(path) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(path.display().to_string()));
+                self.set_info("Copied path", cx);
+            }
+            MenuAction::AddFavoritePath(path) => self.add_favorite_path(path, cx),
+            MenuAction::NewWindowAt(path) => {
+                let init = BrowserInit {
+                    start: Some(path),
+                    info_panel: Some(self.config.general.info_panel),
+                    view: Some(self.view),
+                    tile_size: Some(self.tile_size),
+                    ..Default::default()
+                };
+                cx.defer(move |cx| {
+                    crate::open_browser_window(init, cx);
+                });
+            }
             MenuAction::History { back, steps } => self.go_history(back, steps, cx),
             MenuAction::RevealPath(path) => {
                 let result = launch::reveal_in_finder(&path);
@@ -1096,6 +1116,10 @@ impl Browser {
                 None => return self.set_error("Select a folder to add to Favorites", cx),
             },
         };
+        self.add_favorite_path(target, cx);
+    }
+
+    fn add_favorite_path(&mut self, target: PathBuf, cx: &mut Context<Self>) {
         if self.config.favorites.iter().any(|f| f.resolved_path() == target) {
             return self.set_info(format!("{} is already a favorite", display_name(&target)), cx);
         }
@@ -1347,6 +1371,29 @@ impl Browser {
                 });
             }
         }
+        self.menu = Some(ContextMenu { position, entries });
+        cx.notify();
+    }
+
+    /// Menu for a folder in the path bar.
+    pub fn open_path_menu(&mut self, position: Point<Pixels>, path: PathBuf, cx: &mut Context<Self>) {
+        let item = |label: &str, action: MenuAction| MenuEntry::Item { label: label.into(), detail: None, action, danger: false };
+        let mut entries: Vec<MenuEntry> = self
+            .config
+            .openers
+            .iter()
+            .filter(|o| o.applies_to(true))
+            .map(|o| item(&format!("Open in {}", o.name), MenuAction::OpenPathWith(path.clone(), o.name.clone())))
+            .collect();
+        if !entries.is_empty() {
+            entries.push(MenuEntry::Separator);
+        }
+        entries.push(item("Open in New Window", MenuAction::NewWindowAt(path.clone())));
+        entries.push(item("Copy Path", MenuAction::CopyPath(path.clone())));
+        if !self.config.favorites.iter().any(|f| f.resolved_path() == path) {
+            entries.push(item("Add to Favorites", MenuAction::AddFavoritePath(path.clone())));
+        }
+        entries.push(item("Reveal in Finder", MenuAction::RevealPath(path)));
         self.menu = Some(ContextMenu { position, entries });
         cx.notify();
     }
