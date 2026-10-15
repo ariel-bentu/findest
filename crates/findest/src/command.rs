@@ -47,6 +47,10 @@ pub enum Command {
     NewFolder,
     NewFile,
     Duplicate,
+    /// Zip the selection next to it.
+    Compress,
+    /// Unzip selected .zip files next to them.
+    Extract,
     /// Move to Trash, asking first only if `confirm_trash` is set.
     Trash,
     /// Move to Trash, always asking first.
@@ -55,7 +59,13 @@ pub enum Command {
     TrashNow,
     DeletePermanently,
     EmptyTrash,
+    /// Reverse the last paste, drop or duplicate.
+    Undo,
     Copy,
+    /// Like Copy, but Paste then moves the items.
+    Cut,
+    /// Forget what was copied or cut.
+    ClearClipboard,
     Paste,
     MoveHere,
     CopyPath,
@@ -107,12 +117,17 @@ impl FromStr for Command {
             "new_folder" => NewFolder,
             "new_file" => NewFile,
             "duplicate" => Duplicate,
+            "compress" => Compress,
+            "extract" => Extract,
             "trash" => Trash,
             "trash_confirm" => TrashConfirm,
             "trash_now" => TrashNow,
             "empty_trash" => EmptyTrash,
             "delete_permanently" => DeletePermanently,
             "copy" => Copy,
+            "undo" => Undo,
+            "cut" => Cut,
+            "clear_clipboard" => ClearClipboard,
             "paste" => Paste,
             "move_here" => MoveHere,
             "copy_path" => CopyPath,

@@ -590,6 +590,8 @@ impl Browser {
             "magnifyingglass",
             "questionmark.circle",
             "ellipsis.circle",
+            "scissors",
+            "doc.on.doc",
             "list.bullet.indent",
             "square.grid.2x2",
         ] {
@@ -738,8 +740,11 @@ impl Browser {
                     .min_h_0()
                     .relative()
                     .when_some(self.current_dir(), |d, dir| self.drop_handlers(d, dir, cx))
-                    .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, window, _| {
-                        this.maybe_start_drag(event, window);
+                    .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, window, cx| {
+                        this.maybe_start_drag(event, window, cx);
+                        if cx.has_active_drag() {
+                            this.drag_autoscroll(window, cx);
+                        }
                     }))
                     .on_mouse_down(
                         MouseButton::Left,
@@ -969,7 +974,7 @@ impl Browser {
             .pt(px(6.))
             .gap_1()
             .text_size(px(theme.font_size - 1.))
-            .when(entry.is_hidden && !selected, |d| d.opacity(0.6))
+            .when((entry.is_hidden || self.is_cut(&entry.path)) && !selected, |d| d.opacity(0.5))
             .when(entry.is_dir, |d| self.drop_target(d, entry.path.clone(), cx))
             .map(|d| self.item_mouse_handlers(d, ix, cx))
             .child(picture)
@@ -1039,7 +1044,7 @@ impl Browser {
         let renaming = self.renaming().filter(|(p, _)| *p == entry.path).map(|(_, input)| input.clone());
         let recents = self.location == Location::Recents || self.search_active(cx);
         let (fg, muted) = if selected { (theme.selection_text, theme.selection_text.opacity(0.8)) } else { (theme.text, theme.text_muted) };
-        let dim = entry.is_hidden && !selected;
+        let dim = (entry.is_hidden || self.is_cut(&entry.path)) && !selected;
 
         let name: AnyElement = match renaming {
             Some(input) => div()
@@ -1370,8 +1375,107 @@ impl Browser {
             .text_color(theme.text_muted)
             .child(div().flex_none().whitespace_nowrap().child(summary))
             .child(div().flex_1().min_w_0().flex().justify_end().text_color(color).truncate().child(message))
+            .children(self.render_transfers(cx))
+            .children(self.render_clipboard(cx))
             .children(capacity.map(|c| div().flex_none().whitespace_nowrap().child(c)))
             .when(self.view == ViewMode::Tiles, |d| d.child(self.render_tile_slider(cx)))
+    }
+
+    /// Progress of running copies/moves, with a cancel button. Quick ones
+    /// finish before it would appear, so they don't flash.
+    fn render_transfers(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let shown: Vec<_> = self.transfers.iter().filter(|t| t.started.elapsed().as_millis() > 400).collect();
+        if shown.is_empty() {
+            return None;
+        }
+        let theme = &self.theme;
+        let sum = |f: fn(&findest_core::ops::Progress) -> u64| shown.iter().map(|t| f(&t.progress)).sum::<u64>();
+        let (total_files, done_files) = (sum(|p| p.total_files.load(Relaxed)), sum(|p| p.done_files.load(Relaxed)));
+        let (total_bytes, done_bytes) = (sum(|p| p.total_bytes.load(Relaxed)), sum(|p| p.done_bytes.load(Relaxed)));
+        let counted = shown.iter().all(|t| t.progress.counted.load(Relaxed));
+        let verb = if shown.iter().all(|t| t.verb == shown[0].verb) { shown[0].verb } else { "Transferring" };
+        let label = if !counted {
+            format!("{verb}… counting items")
+        } else if total_bytes > 0 {
+            format!("{verb} {done_files} of {} · {} of {}", count_label(total_files as usize), format_size(done_bytes), format_size(total_bytes))
+        } else {
+            format!("{verb} {done_files} of {}", count_label(total_files as usize))
+        };
+        let fraction = if !counted {
+            0.0
+        } else if total_bytes > 0 {
+            done_bytes as f32 / total_bytes as f32
+        } else if total_files > 0 {
+            done_files as f32 / total_files as f32
+        } else {
+            1.0
+        };
+        Some(
+            div()
+                .flex()
+                .flex_row()
+                .flex_none()
+                .items_center()
+                .gap_2()
+                .child(div().whitespace_nowrap().text_color(theme.text).child(label))
+                .child(
+                    div()
+                        .w(px(120.))
+                        .h(px(5.))
+                        .rounded_full()
+                        .bg(theme.border)
+                        .child(div().h_full().w(px(120. * fraction.clamp(0., 1.))).rounded_full().bg(theme.accent)),
+                )
+                .child(
+                    div()
+                        .id("cancel-transfer")
+                        .px_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.hover).text_color(theme.text))
+                        .tooltip(tooltip("Cancel"))
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_transfers(cx)))
+                        .child("✕"),
+                ),
+        )
+    }
+
+    /// What's waiting to be pasted (⌘C / ⌘X), with a button to forget it.
+    fn render_clipboard(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let first = self.file_clipboard.first()?;
+        let theme = &self.theme;
+        let n = self.file_clipboard.len();
+        let what = if n == 1 { format!("“{}”", findest_core::paths::display_name(first)) } else { count_label(n) };
+        let (symbol, verb) = if self.clipboard_cut { ("scissors", "cut") } else { ("doc.on.doc", "copied") };
+        let icon = self.icons.peek(&self.symbol_key_colored(symbol, theme.text_muted));
+        Some(
+            div()
+                .id("clipboard")
+                .flex()
+                .flex_row()
+                .flex_none()
+                .max_w(px(320.))
+                .items_center()
+                .gap_1()
+                .pl_2()
+                .rounded_md()
+                .bg(theme.hover)
+                .tooltip(tooltip(if self.clipboard_cut { "⌘V moves these here" } else { "⌘V copies these here" }))
+                .children(icon.map(|i| img(i).size(px(12.)).flex_none()))
+                .child(div().min_w_0().truncate().child(format!("{what} {verb}")))
+                .child(
+                    div()
+                        .id("clear-clipboard")
+                        .flex_none()
+                        .px_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .hover(|s| s.text_color(theme.text))
+                        .on_click(cx.listener(|this, _, window, cx| this.run(crate::command::Command::ClearClipboard, window, cx)))
+                        .child("✕"),
+                ),
+        )
     }
 
     /// Tile size slider. Dragging is tracked window-wide so it keeps working

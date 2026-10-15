@@ -3,9 +3,10 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use findest_core::config::{Config, Favorite, ViewMode};
 use findest_core::listing::{self, Entry};
 use findest_core::locations::{self, Place};
@@ -76,6 +77,26 @@ pub struct Edit {
     pub kind: EditKind,
     pub input: Entity<TextInput>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// A file operation ⌘Z can reverse.
+enum UndoOp {
+    /// Items created by a copy, with their modification time right after, so
+    /// undo can refuse if one was edited since.
+    Copy(Vec<(PathBuf, Option<SystemTime>)>),
+    /// `(original, current)` locations of moved items.
+    Move(Vec<(PathBuf, PathBuf)>),
+}
+
+/// How many operations ⌘Z can step back through.
+const MAX_UNDO: usize = 20;
+
+/// A copy or move running in the background, shown in the status bar.
+pub struct Transfer {
+    /// "Copying" or "Moving".
+    pub verb: &'static str,
+    pub progress: Arc<ops::Progress>,
+    pub started: Instant,
 }
 
 pub struct Status {
@@ -195,7 +216,16 @@ pub struct Browser {
     cursor: Option<PathBuf>,
     anchor: Option<PathBuf>,
     pub(crate) edit: Option<Edit>,
-    file_clipboard: Vec<PathBuf>,
+    /// Items copied (or cut) with ⌘C / ⌘X, waiting for Paste.
+    pub(crate) file_clipboard: Vec<PathBuf>,
+    /// The clipboard was filled by Cut: Paste moves instead of copying.
+    pub(crate) clipboard_cut: bool,
+    pub(crate) transfers: Vec<Transfer>,
+    undo: Vec<UndoOp>,
+    /// Redraws the status bar while transfers run.
+    transfer_ticker: Option<Task<()>>,
+    /// When drag auto-scrolling last moved the list; `None` when it isn't running.
+    autoscroll_since: Option<Instant>,
     pub(crate) status: Option<Status>,
     pub(crate) menu: Option<ContextMenu>,
     pub(crate) scroll: UniformListScrollHandle,
@@ -321,6 +351,11 @@ impl Browser {
             anchor: None,
             edit: None,
             file_clipboard: Vec::new(),
+            clipboard_cut: false,
+            transfers: Vec::new(),
+            undo: Vec::new(),
+            transfer_ticker: None,
+            autoscroll_since: None,
             status: None,
             menu: None,
             scroll: UniformListScrollHandle::new(),
@@ -790,40 +825,87 @@ impl Browser {
                 self.run_op(
                     cx,
                     move || paths.iter().map(|p| ops::duplicate(p)).collect::<Result<Vec<_>>>(),
-                    |this, created, cx| this.reload_and_select(created, false, cx),
+                    |this, created, cx| {
+                        this.set_info(format!("Duplicated {}", count_label(created.len())), cx);
+                        this.record_copy(&created);
+                        this.reload_and_select(created, false, cx);
+                    },
                 );
+            }
+            Compress => {
+                let paths = self.selection();
+                if paths.is_empty() {
+                    return;
+                }
+                self.set_info(format!("Compressing {}…", describe(&paths)), cx);
+                self.run_op(cx, move || ops::compress(&paths), |this, zip, cx| {
+                    this.set_info(format!("Compressed to {}", display_name(&zip)), cx);
+                    this.record_copy(std::slice::from_ref(&zip));
+                    this.reload_and_select(vec![zip], false, cx);
+                });
+            }
+            Extract => {
+                let zips: Vec<PathBuf> = self.selection().into_iter().filter(|p| ops::is_zip(p)).collect();
+                if zips.is_empty() {
+                    return self.set_error("Select a .zip file to uncompress", cx);
+                }
+                self.extract(zips, cx);
             }
             Trash => self.trash(self.config.general.confirm_trash, window, cx),
             TrashConfirm => self.trash(true, window, cx),
             TrashNow => self.trash(false, window, cx),
             DeletePermanently => self.delete_permanently(window, cx),
             EmptyTrash => self.empty_trash(window, cx),
-            Copy => {
+            Copy | Cut => {
                 let paths = self.selection();
                 if paths.is_empty() {
                     return;
                 }
-                self.set_info(format!("Copied {}", count_label(paths.len())), cx);
+                // Nothing happens to the items until Paste; the status bar shows what's pending.
                 self.file_clipboard = paths;
+                self.clipboard_cut = command == Cut;
+                cx.notify();
+            }
+            ClearClipboard => {
+                self.file_clipboard.clear();
+                self.clipboard_cut = false;
+                cx.notify();
             }
             Paste | MoveHere => {
                 let Some(dir) = self.current_dir() else {
                     return self.set_error("Open a folder to paste into", cx);
                 };
                 if self.file_clipboard.is_empty() {
-                    return self.set_error("Nothing to paste — copy items with ⌘C first", cx);
+                    return self.set_error("Nothing to paste — copy (⌘C) or cut (⌘X) items first", cx);
                 }
                 let sources = self.file_clipboard.clone();
-                let moving = command == MoveHere;
+                let originals = sources.clone();
+                let moving = command == MoveHere || self.clipboard_cut;
                 if moving {
+                    // Moved items aren't where they were any more.
                     self.file_clipboard.clear();
+                    self.clipboard_cut = false;
                 }
-                self.run_op(
+                self.run_transfer(
+                    if moving { "Moving" } else { "Copying" },
                     cx,
-                    move || if moving { ops::move_into(&sources, &dir) } else { ops::copy_into(&sources, &dir) },
-                    |this, created, cx| this.reload_and_select(created, false, cx),
+                    move |progress| {
+                        if moving { ops::move_into(&sources, &dir, progress) } else { ops::copy_into(&sources, &dir, progress) }
+                    },
+                    move |this, created, cx| {
+                        let n = count_label(created.len());
+                        if moving {
+                            this.set_info(format!("Moved {n} here"), cx);
+                            this.record_move(originals, &created);
+                        } else {
+                            this.set_info(format!("Pasted {n}"), cx);
+                            this.record_copy(&created);
+                        }
+                        this.reload_and_select(created, false, cx);
+                    },
                 );
             }
+            Undo => self.undo(cx),
             CopyPath => {
                 let paths = self.selection_or_current();
                 let text = paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n");
@@ -948,6 +1030,196 @@ impl Browser {
         .detach();
     }
 
+    /// Runs a copy/move off the UI thread with progress in the status bar.
+    fn run_transfer<T: Send + 'static>(
+        &mut self,
+        verb: &'static str,
+        cx: &mut Context<Self>,
+        op: impl FnOnce(&ops::Progress) -> Result<T> + Send + 'static,
+        done: impl FnOnce(&mut Self, T, &mut Context<Self>) + 'static,
+    ) {
+        let progress = Arc::new(ops::Progress::default());
+        self.transfers.push(Transfer { verb, progress: progress.clone(), started: Instant::now() });
+        if self.transfer_ticker.is_none() {
+            self.transfer_ticker = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(Duration::from_millis(100)).await;
+                    let running = this.update(cx, |this, cx| {
+                        cx.notify();
+                        !this.transfers.is_empty()
+                    });
+                    if !running.unwrap_or(false) {
+                        break;
+                    }
+                }
+                this.update(cx, |this, _| this.transfer_ticker = None).ok();
+            }));
+        }
+        let task = cx.background_executor().spawn({
+            let progress = progress.clone();
+            async move { op(&progress) }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.transfers.retain(|t| !Arc::ptr_eq(&t.progress, &progress));
+                match result {
+                    Ok(value) => done(this, value, cx),
+                    Err(_) if progress.is_cancelled() => {
+                        this.set_info(if verb == "Moving" { "Move cancelled" } else { "Copy cancelled" }, cx);
+                        this.reload(cx);
+                    }
+                    Err(e) => {
+                        this.set_error(format!("{e:#}"), cx);
+                        this.reload(cx);
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn push_undo(&mut self, op: UndoOp) {
+        if self.undo.len() == MAX_UNDO {
+            self.undo.remove(0);
+        }
+        self.undo.push(op);
+    }
+
+    fn record_copy(&mut self, created: &[PathBuf]) {
+        let items = created.iter().map(|p| (p.clone(), std::fs::symlink_metadata(p).and_then(|m| m.modified()).ok())).collect();
+        self.push_undo(UndoOp::Copy(items));
+    }
+
+    /// `created` is in the same order as `originals` (as `ops::move_into` returns it).
+    fn record_move(&mut self, originals: Vec<PathBuf>, created: &[PathBuf]) {
+        let pairs: Vec<(PathBuf, PathBuf)> =
+            originals.into_iter().zip(created.iter().cloned()).filter(|(from, to)| from != to).collect();
+        if !pairs.is_empty() {
+            self.push_undo(UndoOp::Move(pairs));
+        }
+    }
+
+    /// Reverses the last copy (copies go to the Trash) or move (items go back).
+    /// Refuses, changing nothing, if things changed since.
+    fn undo(&mut self, cx: &mut Context<Self>) {
+        let Some(op) = self.undo.pop() else {
+            return self.set_info("Nothing to undo", cx);
+        };
+        let exists = |p: &Path| std::fs::symlink_metadata(p).is_ok();
+        match op {
+            UndoOp::Copy(items) => {
+                for (path, modified) in &items {
+                    match std::fs::symlink_metadata(path) {
+                        Err(_) => return self.set_error(format!("Can't undo: “{}” is gone", display_name(path)), cx),
+                        Ok(meta) if meta.modified().ok() != *modified => {
+                            return self.set_error(format!("Can't undo: “{}” changed after it was copied", display_name(path)), cx);
+                        }
+                        Ok(_) => {}
+                    }
+                }
+                let paths: Vec<PathBuf> = items.into_iter().map(|(p, _)| p).collect();
+                let n = paths.len();
+                self.run_op(cx, move || ops::move_to_trash(&paths), move |this, (), cx| {
+                    this.set_info(format!("Undid copy: moved {} to the Trash", count_label(n)), cx);
+                    this.reload(cx);
+                });
+            }
+            UndoOp::Move(pairs) => {
+                for (original, current) in &pairs {
+                    if !exists(current) {
+                        return self.set_error(format!("Can't undo: “{}” was moved or renamed since", display_name(current)), cx);
+                    }
+                    if exists(original) {
+                        return self.set_error(
+                            format!("Can't undo: something named “{}” is in its old folder", display_name(original)),
+                            cx,
+                        );
+                    }
+                }
+                let n = pairs.len();
+                let back: Vec<PathBuf> = pairs.iter().map(|(original, _)| original.clone()).collect();
+                self.run_transfer(
+                    "Moving",
+                    cx,
+                    move |progress| {
+                        for (original, current) in &pairs {
+                            let dir = original.parent().context("no parent folder")?;
+                            ops::move_into(std::slice::from_ref(current), dir, progress)?;
+                        }
+                        Ok(())
+                    },
+                    move |this, (), cx| {
+                        this.set_info(format!("Undid move: put {} back", count_label(n)), cx);
+                        // Still showing where they were moved from: select them again.
+                        this.reload_and_select(back, false, cx);
+                    },
+                );
+            }
+        }
+    }
+
+    /// Cut items are shown dimmed until they're pasted.
+    pub fn is_cut(&self, path: &Path) -> bool {
+        self.clipboard_cut && self.file_clipboard.iter().any(|p| p == path)
+    }
+
+    pub fn cancel_transfers(&mut self, cx: &mut Context<Self>) {
+        for transfer in &self.transfers {
+            transfer.progress.cancel();
+        }
+        cx.notify();
+    }
+
+    /// While a drag hovers near the list's top or bottom edge, keeps scrolling
+    /// it (faster closer to the edge) until the pointer moves away or the drag
+    /// ends. Runs once per frame, scaled by elapsed time, so it stays smooth.
+    pub fn drag_autoscroll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.autoscroll_since.is_some() || self.autoscroll_speed(window.mouse_position()) == 0.0 {
+            return;
+        }
+        self.autoscroll_since = Some(Instant::now());
+        cx.on_next_frame(window, Self::autoscroll_frame);
+        cx.notify();
+    }
+
+    fn autoscroll_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let speed = self.autoscroll_speed(window.mouse_position());
+        let Some(last) = self.autoscroll_since.filter(|_| cx.has_active_drag() && speed != 0.0) else {
+            self.autoscroll_since = None;
+            return;
+        };
+        let now = Instant::now();
+        let dt = now.duration_since(last).as_secs_f32().min(0.05);
+        self.autoscroll_since = Some(now);
+        let handle = self.scroll.0.borrow().base_handle.clone();
+        let mut offset = handle.offset();
+        offset.y = (offset.y - gpui::px(speed * dt)).clamp(-handle.max_offset().height, gpui::px(0.));
+        handle.set_offset(offset);
+        cx.on_next_frame(window, Self::autoscroll_frame);
+        cx.notify();
+    }
+
+    /// Points per second to scroll for a drag at `position`: negative scrolls up.
+    fn autoscroll_speed(&self, position: Point<Pixels>) -> f32 {
+        const EDGE: f32 = 40.0;
+        let bounds = self.scroll.0.borrow().base_handle.bounds();
+        if !bounds.contains(&position) {
+            return 0.0;
+        }
+        let from_top = f32::from(position.y - bounds.top());
+        let from_bottom = f32::from(bounds.bottom() - position.y);
+        let ramp = |d: f32| 150.0 + 1350.0 * (1.0 - d / EDGE);
+        if from_top < EDGE {
+            -ramp(from_top)
+        } else if from_bottom < EDGE {
+            ramp(from_bottom)
+        } else {
+            0.0
+        }
+    }
+
     fn reload_and_select(&mut self, paths: Vec<PathBuf>, name_new: bool, cx: &mut Context<Self>) {
         self.pending_select = Some(PendingSelect { paths, name_new });
         self.reload(cx);
@@ -965,7 +1237,12 @@ impl Browser {
         {
             return self.navigate(Location::Dir(entry.path.clone()), true, cx);
         }
-        for entry in entries.iter().filter(|e| !e.is_dir) {
+        // Zips are unpacked here rather than handed to Archive Utility (which shows Finder).
+        let zips: Vec<PathBuf> = entries.iter().filter(|e| ops::is_zip(&e.path)).map(|e| e.path.clone()).collect();
+        if !zips.is_empty() {
+            self.extract(zips, cx);
+        }
+        for entry in entries.iter().filter(|e| !e.is_dir && !ops::is_zip(&e.path)) {
             let result = launch::open_default(&entry.path);
             if result.is_ok() {
                 self.remember(&entry.path);
@@ -973,6 +1250,16 @@ impl Browser {
             self.report(result, cx);
         }
         self.save_recents(cx);
+    }
+
+    fn extract(&mut self, zips: Vec<PathBuf>, cx: &mut Context<Self>) {
+        self.set_info(format!("Uncompressing {}…", describe(&zips)), cx);
+        self.run_op(cx, move || zips.iter().map(|z| ops::extract(z)).collect::<Result<Vec<_>>>(), |this, created, cx| {
+            let names = describe(&created);
+            this.set_info(format!("Uncompressed to {names}"), cx);
+            this.record_copy(&created);
+            this.reload_and_select(created, false, cx);
+        });
     }
 
     fn open_with(&mut self, name: &str, targets: &[PathBuf], cx: &mut Context<Self>) {
@@ -1330,6 +1617,15 @@ impl Browser {
                 entries.push(self.item("Rename", Rename, "rename"));
             }
             entries.push(self.item("Duplicate", Duplicate, "duplicate"));
+            let compress = match &selection[..] {
+                [one] => format!("Compress “{}”", one.display_name()),
+                many => format!("Compress {}", count_label(many.len())),
+            };
+            entries.push(self.item(compress, Compress, "compress"));
+            if selection.iter().any(|e| ops::is_zip(&e.path)) {
+                entries.push(self.item("Uncompress", Extract, "extract"));
+            }
+            entries.push(self.item("Cut", Cut, "cut"));
             entries.push(self.item("Copy", Copy, "copy"));
             entries.push(self.item(if single { "Copy Path" } else { "Copy Paths" }, CopyPath, "copy_path"));
             if single && all_dirs {
@@ -1349,8 +1645,12 @@ impl Browser {
                 entries.push(self.item("New File", NewFile, "new_file"));
                 if !self.file_clipboard.is_empty() {
                     let n = count_label(self.file_clipboard.len());
-                    entries.push(self.item(format!("Paste {n}"), Paste, "paste"));
-                    entries.push(self.item(format!("Move {n} Here"), MoveHere, "move_here"));
+                    if self.clipboard_cut {
+                        entries.push(self.item(format!("Move {n} Here"), Paste, "paste"));
+                    } else {
+                        entries.push(self.item(format!("Paste {n}"), Paste, "paste"));
+                        entries.push(self.item(format!("Move {n} Here"), MoveHere, "move_here"));
+                    }
                 }
                 entries.push(MenuEntry::Separator);
                 entries.extend(self.opener_items(true));
@@ -1482,7 +1782,7 @@ impl Browser {
 
     /// Starts a native drag of the selection once the mouse has moved a few
     /// pixels with the button held since pressing on a selected row.
-    pub fn maybe_start_drag(&mut self, event: &gpui::MouseMoveEvent, window: &mut Window) {
+    pub fn maybe_start_drag(&mut self, event: &gpui::MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
         let Some(origin) = self.drag_origin else { return };
         if event.pressed_button != Some(gpui::MouseButton::Left) || self.edit.is_some() {
             self.drag_origin = None;
@@ -1495,8 +1795,23 @@ impl Browser {
         // Disarm first: AppKit swallows the mouse-up that ends the drag.
         self.drag_origin = None;
         let paths = self.selection();
-        if !paths.is_empty() {
-            crate::native_drag::start_file_drag(window, &paths);
+        if paths.is_empty() {
+            return;
+        }
+        let handle = self.scroll.0.borrow().base_handle.clone();
+        let start_offset = handle.offset();
+        if let Some(ended) = crate::native_drag::start_file_drag(window, &paths) {
+            // Cancelled (Esc) or dropped nowhere: scroll back to where the dragged items are.
+            cx.spawn(async move |this, cx| {
+                if ended.await == Ok(false) {
+                    this.update(cx, |_, cx| {
+                        handle.set_offset(start_offset);
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            })
+            .detach();
         }
     }
 
@@ -1664,12 +1979,15 @@ impl Browser {
         let copy = force_copy || !ops::same_volume(&paths[0], &dest);
         let n = paths.len();
         let dest_name = locations::friendly_name(&self.home, &dest);
-        self.run_op(
+        let originals = paths.clone();
+        self.run_transfer(
+            if copy { "Copying" } else { "Moving" },
             cx,
-            move || if copy { ops::copy_into(&paths, &dest) } else { ops::move_into(&paths, &dest) },
-            move |this, _, cx| {
+            move |progress| if copy { ops::copy_into(&paths, &dest, progress) } else { ops::move_into(&paths, &dest, progress) },
+            move |this, created, cx| {
                 let verb = if copy { "Copied" } else { "Moved" };
                 this.set_info(format!("{verb} {} to {dest_name}", count_label(n)), cx);
+                if copy { this.record_copy(&created) } else { this.record_move(originals, &created) }
                 this.reload(cx);
             },
         );

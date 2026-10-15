@@ -3,8 +3,59 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
+
+/// Live progress of a copy or move, shared with the UI; also how it's cancelled.
+/// Totals are filled in by a quick scan before any data is copied.
+#[derive(Default)]
+pub struct Progress {
+    pub total_files: AtomicU64,
+    pub total_bytes: AtomicU64,
+    pub done_files: AtomicU64,
+    pub done_bytes: AtomicU64,
+    /// Set once the totals are known.
+    pub counted: AtomicBool,
+    cancelled: AtomicBool,
+}
+
+impl Progress {
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+
+    /// Adds `paths` (recursively) to the totals.
+    fn count(&self, paths: &[PathBuf]) {
+        fn walk(path: &Path, p: &Progress) {
+            let Ok(meta) = fs::symlink_metadata(path) else { return };
+            if meta.is_dir() {
+                for item in fs::read_dir(path).into_iter().flatten().flatten() {
+                    walk(&item.path(), p);
+                }
+            } else {
+                p.total_files.fetch_add(1, Ordering::Relaxed);
+                p.total_bytes.fetch_add(meta.len(), Ordering::Relaxed);
+            }
+        }
+        for path in paths {
+            walk(path, self);
+        }
+    }
+
+    fn file_done(&self, bytes: u64) -> Result<()> {
+        self.done_files.fetch_add(1, Ordering::Relaxed);
+        self.done_bytes.fetch_add(bytes, Ordering::Relaxed);
+        if self.is_cancelled() {
+            bail!("Cancelled");
+        }
+        Ok(())
+    }
+}
 
 /// Returns `dir/stem ext`, or `dir/stem N ext` with the smallest N >= 2 that
 /// doesn't exist yet. `ext` includes the leading dot, or is empty.
@@ -114,12 +165,15 @@ pub fn duplicate(path: &Path) -> Result<PathBuf> {
     let dir = path.parent().context("can't duplicate the root folder")?;
     let (stem, ext) = split_name(path);
     let target = unique_path(dir, &format!("{stem} copy"), &ext);
-    copy_recursive(path, &target)?;
+    copy_recursive(path, &target, &Progress::default())?;
     Ok(target)
 }
 
-/// Copies each path into `dest_dir`. Name clashes get a " copy" suffix.
-pub fn copy_into(paths: &[PathBuf], dest_dir: &Path) -> Result<Vec<PathBuf>> {
+/// Copies each path into `dest_dir`. Name clashes get a " copy" suffix. A
+/// failed or cancelled copy removes the partly copied item.
+pub fn copy_into(paths: &[PathBuf], dest_dir: &Path, progress: &Progress) -> Result<Vec<PathBuf>> {
+    progress.count(paths);
+    progress.counted.store(true, Ordering::Relaxed);
     let mut created = Vec::new();
     for src in paths {
         ensure_not_into_itself(src, dest_dir)?;
@@ -129,14 +183,99 @@ pub fn copy_into(paths: &[PathBuf], dest_dir: &Path) -> Result<Vec<PathBuf>> {
             let (stem, ext) = split_name(src);
             target = unique_path(dest_dir, &format!("{stem} copy"), &ext);
         }
-        copy_recursive(src, &target)?;
+        copy_fresh(src, &target, progress)?;
         created.push(target);
     }
     Ok(created)
 }
 
+/// Zips `paths` next to them, like Finder's Compress: one item becomes
+/// "name.zip", several become "Archive.zip" (" 2", " 3"... on clashes).
+/// The items must share a folder.
+pub fn compress(paths: &[PathBuf]) -> Result<PathBuf> {
+    let first = paths.first().context("nothing to compress")?;
+    let dir = first.parent().context("can't compress the root folder")?;
+    if paths.iter().any(|p| p.parent() != Some(dir)) {
+        bail!("Items to compress together must be in the same folder");
+    }
+    let stem = if paths.len() == 1 { crate::paths::display_name(first) } else { "Archive".to_string() };
+    let target = unique_path(dir, &stem, ".zip");
+    let status = if paths.len() == 1 {
+        // ditto is what Finder uses: keeps permissions, symlinks and Mac metadata.
+        std::process::Command::new("/usr/bin/ditto")
+            .args(["-c", "-k", "--sequesterRsrc", "--keepParent"])
+            .arg(first)
+            .arg(&target)
+            .status()
+    } else {
+        let names: Vec<_> = paths.iter().filter_map(|p| p.file_name()).collect();
+        std::process::Command::new("/usr/bin/zip")
+            .args(["-r", "-y", "-q"])
+            .arg(&target)
+            .args(names)
+            .current_dir(dir)
+            .status()
+    }
+    .context("running the zip tool")?;
+    if !status.success() {
+        let _ = fs::remove_file(&target);
+        bail!("Couldn't compress ({status})");
+    }
+    Ok(target)
+}
+
+pub fn is_zip(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip")) && path.is_file()
+}
+
+/// Unzips `zip` next to it, like Archive Utility: a single top-level item is
+/// placed beside the zip, several go into a folder named after it. Names
+/// that clash get " 2", " 3"... Returns what was created.
+pub fn extract(zip: &Path) -> Result<PathBuf> {
+    let dir = zip.parent().context("no parent folder")?;
+    // Unpack into a hidden staging folder first so a failure leaves nothing behind.
+    let staging = unique_path(dir, ".findest-extract", "");
+    fs::create_dir(&staging).with_context(|| format!("creating {}", staging.display()))?;
+    let result = (|| {
+        let status = std::process::Command::new("/usr/bin/ditto")
+            .args(["-x", "-k"])
+            .arg(zip)
+            .arg(&staging)
+            .status()
+            .context("running ditto")?;
+        if !status.success() {
+            bail!("Couldn't extract \"{}\" ({status})", crate::paths::display_name(zip));
+        }
+        let items: Vec<PathBuf> = fs::read_dir(&staging)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.file_name().is_some_and(|n| n != "__MACOSX" && n != ".DS_Store"))
+            .collect();
+        if let [single] = items.as_slice() {
+            let (stem, ext) = split_name(single);
+            let target = unique_path(dir, &stem, &ext);
+            fs::rename(single, &target)?;
+            fs::remove_dir_all(&staging)?;
+            Ok(target)
+        } else {
+            let (stem, _) = split_name(zip);
+            let target = unique_path(dir, &stem, "");
+            fs::rename(&staging, &target)?;
+            let _ = fs::remove_dir_all(target.join("__MACOSX"));
+            Ok(target)
+        }
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    result
+}
+
 /// Moves each path into `dest_dir`. Refuses to overwrite existing items.
-pub fn move_into(paths: &[PathBuf], dest_dir: &Path) -> Result<Vec<PathBuf>> {
+/// Only moves to another volume copy data, so only those count as progress.
+pub fn move_into(paths: &[PathBuf], dest_dir: &Path, progress: &Progress) -> Result<Vec<PathBuf>> {
+    let across: Vec<PathBuf> = paths.iter().filter(|p| !same_volume(p, dest_dir)).cloned().collect();
+    progress.count(&across);
+    progress.counted.store(true, Ordering::Relaxed);
     let mut moved = Vec::new();
     for src in paths {
         ensure_not_into_itself(src, dest_dir)?;
@@ -152,7 +291,7 @@ pub fn move_into(paths: &[PathBuf], dest_dir: &Path) -> Result<Vec<PathBuf>> {
             Ok(()) => {}
             // Different volume: copy then remove.
             Err(e) if e.raw_os_error() == Some(18 /* EXDEV */) => {
-                copy_recursive(src, &target)?;
+                copy_fresh(src, &target, progress)?;
                 delete_permanently(std::slice::from_ref(src))?;
             }
             Err(e) => return Err(e).with_context(|| format!("moving {}", src.display())),
@@ -178,21 +317,32 @@ fn ensure_not_into_itself(src: &Path, dest_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn copy_recursive(src: &Path, dst: &Path) -> Result<()> {
+/// Copies to a `dst` that doesn't exist yet, removing whatever was copied if it fails.
+fn copy_fresh(src: &Path, dst: &Path, progress: &Progress) -> Result<()> {
+    let result = copy_recursive(src, dst, progress);
+    if result.is_err() && exists(dst) {
+        let _ = delete_permanently(&[dst.to_path_buf()]);
+    }
+    result
+}
+
+fn copy_recursive(src: &Path, dst: &Path, progress: &Progress) -> Result<()> {
     let meta = fs::symlink_metadata(src)?;
     let ft = meta.file_type();
     if ft.is_symlink() {
         std::os::unix::fs::symlink(fs::read_link(src)?, dst)?;
+        progress.file_done(0)?;
     } else if ft.is_dir() {
         fs::create_dir(dst)?;
         for item in fs::read_dir(src)? {
             let item = item?;
-            copy_recursive(&item.path(), &dst.join(item.file_name()))?;
+            copy_recursive(&item.path(), &dst.join(item.file_name()), progress)?;
         }
         fs::set_permissions(dst, meta.permissions())?;
     } else {
         // std uses clonefile/fcopyfile on macOS, so this is cheap on APFS.
         fs::copy(src, dst).with_context(|| format!("copying {}", src.display()))?;
+        progress.file_done(meta.len())?;
     }
     Ok(())
 }
@@ -264,16 +414,16 @@ mod tests {
         let f = src.join("f.txt");
         fs::write(&f, "1").unwrap();
 
-        copy_into(std::slice::from_ref(&f), &dst).unwrap();
-        let again = copy_into(std::slice::from_ref(&f), &dst).unwrap();
+        copy_into(std::slice::from_ref(&f), &dst, &Progress::default()).unwrap();
+        let again = copy_into(std::slice::from_ref(&f), &dst, &Progress::default()).unwrap();
         assert_eq!(again[0].file_name().unwrap(), "f copy.txt");
 
-        assert!(move_into(std::slice::from_ref(&f), &dst).is_err(), "must not overwrite");
-        assert!(copy_into(std::slice::from_ref(&src), &src).is_err(), "no copying into itself");
+        assert!(move_into(std::slice::from_ref(&f), &dst, &Progress::default()).is_err(), "must not overwrite");
+        assert!(copy_into(std::slice::from_ref(&src), &src, &Progress::default()).is_err(), "no copying into itself");
 
         let g = src.join("g.txt");
         fs::write(&g, "2").unwrap();
-        let moved = move_into(std::slice::from_ref(&g), &dst).unwrap();
+        let moved = move_into(std::slice::from_ref(&g), &dst, &Progress::default()).unwrap();
         assert!(!g.exists() && moved[0].exists());
     }
 
@@ -294,5 +444,55 @@ mod tests {
         fs::write(d.join("e/f"), "").unwrap();
         delete_permanently(std::slice::from_ref(&d)).unwrap();
         assert!(!d.exists());
+    }
+
+    #[test]
+    fn copy_reports_progress_and_cancels_cleanly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("a"), "12345").unwrap();
+        fs::write(src.join("sub/b"), "123").unwrap();
+        let dst = tmp.path().join("dst");
+        fs::create_dir(&dst).unwrap();
+
+        let progress = Progress::default();
+        copy_into(std::slice::from_ref(&src), &dst, &progress).unwrap();
+        let get = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        assert_eq!((get(&progress.total_files), get(&progress.total_bytes)), (2, 8));
+        assert_eq!((get(&progress.done_files), get(&progress.done_bytes)), (2, 8));
+
+        let cancelled = Progress::default();
+        cancelled.cancel();
+        assert!(copy_into(std::slice::from_ref(&src), &dst, &cancelled).is_err());
+        assert!(!dst.join("src copy").exists(), "partial copy is removed");
+    }
+
+    #[test]
+    fn compresses_like_finder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("x.txt");
+        let folder = tmp.path().join("docs");
+        fs::write(&file, "hello").unwrap();
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("a.md"), "a").unwrap();
+
+        assert_eq!(compress(std::slice::from_ref(&file)).unwrap(), tmp.path().join("x.txt.zip"));
+        assert_eq!(compress(std::slice::from_ref(&folder)).unwrap(), tmp.path().join("docs.zip"));
+        let both = [file.clone(), folder.clone()];
+        assert_eq!(compress(&both).unwrap(), tmp.path().join("Archive.zip"));
+        assert_eq!(compress(&both).unwrap(), tmp.path().join("Archive 2.zip"));
+        let listing = std::process::Command::new("unzip").arg("-l").arg(tmp.path().join("Archive.zip")).output().unwrap();
+        let listing = String::from_utf8_lossy(&listing.stdout);
+        assert!(listing.contains("x.txt") && listing.contains("docs/a.md"), "{listing}");
+        assert!(compress(&[file, tmp.path().join("docs/a.md")]).is_err(), "different folders");
+
+        // A single item comes out beside the zip (renamed on a clash); several get a folder.
+        assert_eq!(extract(&tmp.path().join("docs.zip")).unwrap(), tmp.path().join("docs 2"));
+        assert!(tmp.path().join("docs 2/a.md").exists());
+        let unpacked = extract(&tmp.path().join("Archive.zip")).unwrap();
+        assert_eq!(unpacked, tmp.path().join("Archive"));
+        assert!(unpacked.join("x.txt").exists() && unpacked.join("docs/a.md").exists());
+        assert!(!fs::read_dir(tmp.path()).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().starts_with(".findest")));
     }
 }

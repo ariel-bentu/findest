@@ -52,6 +52,8 @@ fn menus() -> Vec<Menu> {
                 item("Open", "open"),
                 item("Rename", "rename"),
                 item("Duplicate", "duplicate"),
+                item("Compress", "compress"),
+                item("Uncompress", "extract"),
                 MenuItem::separator(),
                 item("Add to Favorites", "add_favorite"),
                 item("Reveal in Finder", "reveal_in_finder"),
@@ -66,6 +68,9 @@ fn menus() -> Vec<Menu> {
         Menu {
             name: "Edit".into(),
             items: vec![
+                item("Undo", "undo"),
+                MenuItem::separator(),
+                item("Cut", "cut"),
                 item("Copy", "copy"),
                 item("Paste", "paste"),
                 item("Move Here", "move_here"),

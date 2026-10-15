@@ -41,6 +41,8 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str)] = &[
     ("cmd-alt-backspace", "delete_permanently"),
     ("cmd-shift-backspace", "empty_trash"),
     ("cmd-c", "copy"),
+    ("cmd-x", "cut"),
+    ("cmd-z", "undo"),
     ("cmd-v", "paste"),
     ("cmd-alt-v", "move_here"),
     ("cmd-alt-c", "copy_path"),

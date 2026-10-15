@@ -6,6 +6,8 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 
+use futures::channel::oneshot;
+
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{AllocAnyThread, MainThreadMarker, MainThreadOnly, define_class, msg_send};
@@ -31,6 +33,13 @@ define_class!(
             // Let the destination choose, as Finder does: move within a volume, copy across.
             NSDragOperation::Copy | NSDragOperation::Move | NSDragOperation::Generic
         }
+
+        #[unsafe(method(draggingSession:endedAtPoint:operation:))]
+        fn ended(&self, _session: &NSDraggingSession, _point: NSPoint, operation: NSDragOperation) {
+            if let Some(tx) = ENDED.with(|e| e.borrow_mut().take()) {
+                let _ = tx.send(operation != NSDragOperation::None);
+            }
+        }
     }
 );
 
@@ -45,18 +54,22 @@ impl DragSource {
 thread_local! {
     /// Keeps the current drag source alive for the duration of the session.
     static SOURCE: RefCell<Option<Retained<DragSource>>> = const { RefCell::new(None) };
+    /// Told when the session ends: whether the items were dropped somewhere.
+    static ENDED: RefCell<Option<oneshot::Sender<bool>>> = const { RefCell::new(None) };
 }
 
 /// Starts a native drag of `paths` from `window`. Must be called while gpui
-/// is handling the mouse-drag event (AppKit needs that event). Returns false
-/// if the session couldn't be started.
-pub fn start_file_drag(window: &gpui::Window, paths: &[PathBuf]) -> bool {
-    let Some(mtm) = MainThreadMarker::new() else { return false };
-    let Ok(handle) = HasWindowHandle::window_handle(window) else { return false };
-    let RawWindowHandle::AppKit(handle) = handle.as_raw() else { return false };
+/// is handling the mouse-drag event (AppKit needs that event). Returns `None`
+/// if the session couldn't be started, else a receiver that gets `true` if
+/// the items were dropped somewhere and `false` if the drag was cancelled
+/// (Esc) or released where nothing accepts files.
+pub fn start_file_drag(window: &gpui::Window, paths: &[PathBuf]) -> Option<oneshot::Receiver<bool>> {
+    let mtm = MainThreadMarker::new()?;
+    let handle = HasWindowHandle::window_handle(window).ok()?;
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else { return None };
     // SAFETY: gpui hands out its live content view; we only use it during this call.
     let view: &NSView = unsafe { handle.ns_view.cast().as_ref() };
-    let Some(event) = NSApplication::sharedApplication(mtm).currentEvent() else { return false };
+    let event = NSApplication::sharedApplication(mtm).currentEvent()?;
     let origin = view.convertPoint_fromView(event.locationInWindow(), None);
 
     let workspace = NSWorkspace::sharedWorkspace();
@@ -78,7 +91,7 @@ pub fn start_file_drag(window: &gpui::Window, paths: &[PathBuf]) -> bool {
         })
         .collect();
     if items.is_empty() {
-        return false;
+        return None;
     }
 
     let source = DragSource::new(mtm);
@@ -88,7 +101,9 @@ pub fn start_file_drag(window: &gpui::Window, paths: &[PathBuf]) -> bool {
         ProtocolObject::from_ref(&*source),
     );
     SOURCE.with(|s| *s.borrow_mut() = Some(source));
-    true
+    let (tx, rx) = oneshot::channel();
+    ENDED.with(|e| *e.borrow_mut() = Some(tx));
+    Some(rx)
 }
 
 /// Whether ⌥ is held right now. gpui's modifier state can be stale after an
