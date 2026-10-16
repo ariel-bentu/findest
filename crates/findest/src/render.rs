@@ -1375,6 +1375,7 @@ impl Browser {
             .text_color(theme.text_muted)
             .child(div().flex_none().whitespace_nowrap().child(summary))
             .child(div().flex_1().min_w_0().flex().justify_end().text_color(color).truncate().child(message))
+            .children(self.render_type_ahead())
             .children(self.render_transfers(cx))
             .children(self.render_clipboard(cx))
             .children(capacity.map(|c| div().flex_none().whitespace_nowrap().child(c)))
@@ -1442,6 +1443,26 @@ impl Browser {
     }
 
     /// What's waiting to be pasted (⌘C / ⌘X), with a button to forget it.
+    /// What's been typed to jump to a name; red when nothing matches.
+    fn render_type_ahead(&self) -> Option<impl IntoElement> {
+        let ta = &self.type_ahead;
+        if !ta.is_active() {
+            return None;
+        }
+        let theme = &self.theme;
+        Some(
+            div()
+                .flex_none()
+                .max_w(px(240.))
+                .px_2()
+                .rounded_md()
+                .bg(theme.hover)
+                .text_color(if ta.missed { theme.danger } else { theme.text })
+                .truncate()
+                .child(format!("Go to “{}”", ta.query)),
+        )
+    }
+
     fn render_clipboard(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let first = self.file_clipboard.first()?;
         let theme = &self.theme;

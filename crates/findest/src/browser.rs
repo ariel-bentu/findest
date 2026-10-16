@@ -91,6 +91,49 @@ enum UndoOp {
 /// How many operations ⌘Z can step back through.
 const MAX_UNDO: usize = 20;
 
+/// Typing pauses longer than this start a new type-ahead query.
+const TYPE_AHEAD_RESET: Duration = Duration::from_millis(1000);
+
+/// Jump-to-name state: what was typed since the last pause.
+#[derive(Default)]
+pub(crate) struct TypeAhead {
+    pub(crate) query: String,
+    /// Nothing matches `query`.
+    pub(crate) missed: bool,
+    reset: Option<Task<()>>,
+}
+
+impl TypeAhead {
+    pub(crate) fn is_active(&self) -> bool {
+        !self.query.is_empty()
+    }
+}
+
+/// The entry to jump to for a typed `query`, given lowercased display names
+/// with their tree depth. Items of the current folder (depth 0) beat ones in
+/// expanded subfolders, and a name prefix beats a match inside the name.
+/// Repeating one letter ("ppp") cycles through the names starting with it.
+fn type_ahead_match(query: &str, names: &[(String, usize)], cursor: Option<usize>) -> Option<usize> {
+    let best = |hit: &dyn Fn(&str) -> bool| {
+        let top = names.iter().position(|(name, depth)| *depth == 0 && hit(name));
+        top.or_else(|| names.iter().position(|(name, _)| hit(name)))
+    };
+    if let Some(ix) = best(&|name| name.starts_with(query)) {
+        return Some(ix);
+    }
+    let mut chars = query.chars();
+    if let Some(first) = chars.next()
+        && chars.clone().next().is_some()
+        && chars.all(|c| c == first)
+    {
+        let hits: Vec<usize> = (0..names.len()).filter(|&ix| names[ix].0.starts_with(first)).collect();
+        let min_depth = hits.iter().map(|&ix| names[ix].1).min()?;
+        let hits: Vec<usize> = hits.into_iter().filter(|&ix| names[ix].1 == min_depth).collect();
+        return hits.iter().copied().find(|&ix| Some(ix) > cursor).or(hits.first().copied());
+    }
+    best(&|name| name.contains(query))
+}
+
 /// A copy or move running in the background, shown in the status bar.
 pub struct Transfer {
     /// "Copying" or "Moving".
@@ -237,7 +280,7 @@ pub struct Browser {
     /// Recently visited folders, most recent first.
     visited: Recents,
     watcher: Option<FsWatcher>,
-    type_ahead: (String, Instant),
+    pub(crate) type_ahead: TypeAhead,
     pub(crate) last_title: String,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -366,7 +409,7 @@ impl Browser {
             icons: IconCache::default(),
             visited: Recents::load(&Recents::locations_path()),
             watcher,
-            type_ahead: (String::new(), Instant::now()),
+            type_ahead: TypeAhead::default(),
             last_title: String::new(),
             _tasks: tasks,
             _subscriptions: subscriptions,
@@ -705,15 +748,33 @@ impl Browser {
     }
 
     fn type_ahead(&mut self, ch: &str, cx: &mut Context<Self>) {
-        let (buffer, last) = &mut self.type_ahead;
-        if last.elapsed() > Duration::from_millis(900) {
-            buffer.clear();
+        self.type_ahead.query.push_str(&ch.to_lowercase());
+        self.type_ahead_find(cx);
+    }
+
+    /// Selects the best match for the typed query and (re)starts the timer
+    /// that clears it after a pause.
+    fn type_ahead_find(&mut self, cx: &mut Context<Self>) {
+        if !self.type_ahead.query.is_empty() {
+            let names: Vec<(String, usize)> =
+                self.entries.iter().enumerate().map(|(ix, e)| (e.display_name().to_lowercase(), self.depth(ix))).collect();
+            let found = type_ahead_match(&self.type_ahead.query, &names, self.cursor_index());
+            self.type_ahead.missed = found.is_none();
+            if let Some(ix) = found {
+                self.select_only(ix, cx);
+            }
         }
-        *last = Instant::now();
-        buffer.push_str(&ch.to_lowercase());
-        let needle = buffer.clone();
-        if let Some(ix) = self.entries.iter().position(|e| e.display_name().to_lowercase().starts_with(&needle)) {
-            self.select_only(ix, cx);
+        self.type_ahead.reset = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(TYPE_AHEAD_RESET).await;
+            this.update(cx, |this, cx| this.clear_type_ahead(cx)).ok();
+        }));
+        cx.notify();
+    }
+
+    fn clear_type_ahead(&mut self, cx: &mut Context<Self>) {
+        if self.type_ahead.is_active() {
+            self.type_ahead = TypeAhead::default();
+            cx.notify();
         }
     }
 
@@ -725,7 +786,7 @@ impl Browser {
         }
         if let Some(ch) = event.keystroke.key_char.as_deref()
             && !ch.chars().any(char::is_control)
-            && !(ch == " " && self.type_ahead.0.is_empty())
+            && !(ch == " " && !self.type_ahead.is_active())
         {
             self.type_ahead(ch, cx);
             cx.stop_propagation();
@@ -762,6 +823,18 @@ impl Browser {
         use Command::*;
         self.menu = None;
         self.syntax_help = None;
+        if self.type_ahead.is_active() {
+            match command {
+                // Backspace edits the query instead of trashing the match.
+                TrashConfirm => {
+                    self.type_ahead.query.pop();
+                    self.type_ahead_find(cx);
+                    return;
+                }
+                ClearSelection => return self.clear_type_ahead(cx),
+                _ => self.clear_type_ahead(cx),
+            }
+        }
         if !matches!(command, SelectPrev | SelectNext | ExtendPrev | ExtendNext) {
             self.status = None;
         }
@@ -2282,6 +2355,29 @@ fn describe(paths: &[PathBuf]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn names(list: &[(&str, usize)]) -> Vec<(String, usize)> {
+        list.iter().map(|(n, d)| (n.to_string(), *d)).collect()
+    }
+
+    #[test]
+    fn type_ahead_prefers_prefix_in_current_folder() {
+        let names = names(&[("apps", 0), ("photos", 1), ("pictures", 0), ("zip", 0)]);
+        assert_eq!(type_ahead_match("p", &names, None), Some(2));
+        assert_eq!(type_ahead_match("pho", &names, None), Some(1));
+        assert_eq!(type_ahead_match("ip", &names, None), Some(3));
+        assert_eq!(type_ahead_match("q", &names, None), None);
+    }
+
+    #[test]
+    fn type_ahead_repeated_letter_cycles() {
+        let names = names(&[("pa", 0), ("pb", 0), ("pc", 0)]);
+        assert_eq!(type_ahead_match("pp", &names, Some(0)), Some(1));
+        assert_eq!(type_ahead_match("ppp", &names, Some(2)), Some(0));
+        // A real name with the repeated letters wins over cycling.
+        let names = self::names(&[("pa", 0), ("ppt", 0)]);
+        assert_eq!(type_ahead_match("pp", &names, Some(0)), Some(1));
+    }
 
     #[test]
     fn go_to_targets() {
