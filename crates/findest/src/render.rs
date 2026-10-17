@@ -1763,10 +1763,10 @@ impl Browser {
     /// All drops, including drags started in Findest itself, arrive as native
     /// file drags (see `native_drag`).
     fn drop_handlers<E: InteractiveElement>(&self, el: E, dest: PathBuf, cx: &mut Context<Self>) -> E {
-        el.on_drop(cx.listener(move |this, files: &ExternalPaths, _, cx| {
+        el.on_drop(cx.listener(move |this, files: &ExternalPaths, window, cx| {
             cx.stop_propagation();
             let copy = crate::native_drag::option_key_down();
-            this.drop_paths(files.paths().to_vec(), dest.clone(), copy, cx);
+            this.drop_paths(files.paths().to_vec(), dest.clone(), copy, window, cx);
         }))
     }
 }

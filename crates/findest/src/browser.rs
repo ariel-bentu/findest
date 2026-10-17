@@ -1010,37 +1010,22 @@ impl Browser {
                 if self.file_clipboard.is_empty() {
                     return self.set_error("Nothing to paste — copy (⌘C) or cut (⌘X) items first", cx);
                 }
-                let sources = self.file_clipboard.clone();
-                let originals = sources.clone();
-                let target = dir.clone();
                 let moving = command == MoveHere || self.clipboard_cut;
-                if moving {
-                    // Moved items aren't where they were any more.
-                    self.file_clipboard.clear();
-                    self.clipboard_cut = false;
-                }
-                self.run_transfer(
-                    if moving { "Moving" } else { "Copying" },
-                    cx,
-                    move |progress| {
-                        if moving { ops::move_into(&sources, &target, progress) } else { ops::copy_into(&sources, &target, progress) }
-                    },
-                    move |this, created, cx| {
-                        let n = count_label(created.len());
-                        let here = this.current_dir().as_deref() == Some(dir.as_path());
-                        let place = if here { "here".to_string() } else { format!("into “{}”", display_name(&dir)) };
-                        if moving {
-                            this.set_info(format!("Moved {n} {place}"), cx);
-                            this.record_move(originals, &created);
-                        } else {
-                            this.set_info(format!("Pasted {n} {place}"), cx);
-                            this.record_copy(&created);
-                        }
-                        // Pasted into a collapsed folder: keep that folder selected.
-                        let visible = here || this.expanded.contains(&dir);
-                        this.reload_and_select(if visible { created } else { vec![dir] }, false, cx);
-                    },
-                );
+                let sources = self.file_clipboard.clone();
+                self.transfer_into(sources, dir.clone(), moving, window, cx, move |this, created, cx| {
+                    if moving {
+                        // Moved items aren't where they were any more.
+                        this.file_clipboard.clear();
+                        this.clipboard_cut = false;
+                    }
+                    let n = count_label(created.len());
+                    let here = this.current_dir().as_deref() == Some(dir.as_path());
+                    let place = if here { "here".to_string() } else { format!("into “{}”", display_name(&dir)) };
+                    this.set_info(format!("{} {n} {place}", if moving { "Moved" } else { "Pasted" }), cx);
+                    // Pasted into a collapsed folder: keep that folder selected.
+                    let visible = here || this.expanded.contains(&dir);
+                    this.reload_and_select(if visible { created } else { vec![dir] }, false, cx);
+                });
             }
             Undo => self.undo(cx),
             CopyPath => {
@@ -1231,10 +1216,9 @@ impl Browser {
         self.push_undo(UndoOp::Copy(items));
     }
 
-    /// `created` is in the same order as `originals` (as `ops::move_into` returns it).
-    fn record_move(&mut self, originals: Vec<PathBuf>, created: &[PathBuf]) {
-        let pairs: Vec<(PathBuf, PathBuf)> =
-            originals.into_iter().zip(created.iter().cloned()).filter(|(from, to)| from != to).collect();
+    /// `moved` is `(from, to)` per item, as `ops::move_into` returns it.
+    fn record_move(&mut self, moved: Vec<(PathBuf, PathBuf)>) {
+        let pairs: Vec<(PathBuf, PathBuf)> = moved.into_iter().filter(|(from, to)| from != to).collect();
         if !pairs.is_empty() {
             self.push_undo(UndoOp::Move(pairs));
         }
@@ -1285,7 +1269,7 @@ impl Browser {
                     move |progress| {
                         for (original, current) in &pairs {
                             let dir = original.parent().context("no parent folder")?;
-                            ops::move_into(std::slice::from_ref(current), dir, progress)?;
+                            ops::move_into(std::slice::from_ref(current), dir, ops::OnConflict::Fail, progress)?;
                         }
                         Ok(())
                     },
@@ -2189,7 +2173,7 @@ impl Browser {
 
     /// Drops `paths` into `dest`: moves within a volume, copies across volumes
     /// or when ⌥ is held (like Finder).
-    pub fn drop_paths(&mut self, paths: Vec<PathBuf>, dest: PathBuf, force_copy: bool, cx: &mut Context<Self>) {
+    pub fn drop_paths(&mut self, paths: Vec<PathBuf>, dest: PathBuf, force_copy: bool, window: &mut Window, cx: &mut Context<Self>) {
         // Dropping onto itself or into the folder it's already in is a no-op.
         let paths: Vec<PathBuf> =
             paths.into_iter().filter(|p| *p != dest && p.parent() != Some(dest.as_path())).collect();
@@ -2207,18 +2191,85 @@ impl Browser {
         let copy = force_copy || !ops::same_volume(&paths[0], &dest);
         let n = paths.len();
         let dest_name = locations::friendly_name(&self.home, &dest);
-        let originals = paths.clone();
-        self.run_transfer(
-            if copy { "Copying" } else { "Moving" },
-            cx,
-            move |progress| if copy { ops::copy_into(&paths, &dest, progress) } else { ops::move_into(&paths, &dest, progress) },
-            move |this, created, cx| {
-                let verb = if copy { "Copied" } else { "Moved" };
-                this.set_info(format!("{verb} {} to {dest_name}", count_label(n)), cx);
-                if copy { this.record_copy(&created) } else { this.record_move(originals, &created) }
-                this.reload(cx);
-            },
-        );
+        self.transfer_into(paths, dest, !copy, window, cx, move |this, created, cx| {
+            let verb = if copy { "Copied" } else { "Moved" };
+            let skipped = n - created.len();
+            let skipped = if skipped > 0 { format!(" ({skipped} skipped)") } else { String::new() };
+            this.set_info(format!("{verb} {} to {dest_name}{skipped}", count_label(created.len())), cx);
+            this.reload(cx);
+        });
+    }
+
+    /// Copies or moves `sources` into `dest`, first asking what to do about
+    /// names already taken there (copying an item into its own folder never
+    /// asks: the copy is named "… copy"). Records it for Undo, then calls
+    /// `done` with what was created.
+    fn transfer_into(
+        &mut self,
+        sources: Vec<PathBuf>,
+        dest: PathBuf,
+        moving: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        done: impl FnOnce(&mut Self, Vec<PathBuf>, &mut Context<Self>) + 'static,
+    ) {
+        let clashes = ops::conflicts(&sources, &dest);
+        let total = sources.len();
+        let dest_name = display_name(&dest);
+        let start = move |this: &mut Self, on_conflict: ops::OnConflict, cx: &mut Context<Self>| {
+            this.run_transfer(
+                if moving { "Moving" } else { "Copying" },
+                cx,
+                move |progress| {
+                    if moving {
+                        ops::move_into(&sources, &dest, on_conflict, progress)
+                    } else {
+                        // Copies have no "from" to undo back to.
+                        Ok(ops::copy_into(&sources, &dest, on_conflict, progress)?.into_iter().map(|to| (PathBuf::new(), to)).collect())
+                    }
+                },
+                move |this, moved: Vec<(PathBuf, PathBuf)>, cx| {
+                    let created: Vec<PathBuf> = moved.iter().map(|(_, to)| to.clone()).collect();
+                    if moving { this.record_move(moved) } else { this.record_copy(&created) }
+                    done(this, created, cx);
+                },
+            );
+        };
+        if clashes.is_empty() {
+            return start(self, ops::OnConflict::Fail, cx);
+        }
+
+        let message = match clashes.as_slice() {
+            [one] => format!("“{}” already exists in “{dest_name}”", display_name(one)),
+            many => format!("{} items already exist in “{dest_name}”", many.len()),
+        };
+        let mut detail = if clashes.len() == 1 {
+            "Replace moves the existing item to the Trash.".to_string()
+        } else {
+            let mut names: Vec<String> = clashes.iter().take(5).map(|p| display_name(p)).collect();
+            if clashes.len() > 5 {
+                names.push(format!("and {} more", clashes.len() - 5));
+            }
+            format!("{}\n\nReplace moves the existing items to the Trash.", names.join(", "))
+        };
+        if !moving {
+            detail.push_str(" Keep Both names the copies “… 2”.");
+        }
+        // Skipping only makes sense when other items can still go.
+        let answers: Vec<&'static str> =
+            if total > clashes.len() { vec!["Replace", "Keep Both", "Skip These", "Stop"] } else { vec!["Replace", "Keep Both", "Stop"] };
+        let answer = window.prompt(PromptLevel::Warning, &message, Some(&detail), &answers, cx);
+        cx.spawn(async move |this, cx| {
+            let Ok(i) = answer.await else { return };
+            let on_conflict = match answers.get(i).copied() {
+                Some("Replace") => ops::OnConflict::Replace,
+                Some("Keep Both") => ops::OnConflict::KeepBoth,
+                Some("Skip These") => ops::OnConflict::Skip,
+                _ => return,
+            };
+            this.update(cx, |this, cx| start(this, on_conflict, cx)).ok();
+        })
+        .detach();
     }
 
     pub fn set_sort(&mut self, key: listing::SortKey, cx: &mut Context<Self>) {

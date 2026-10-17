@@ -171,18 +171,67 @@ pub fn duplicate(path: &Path) -> Result<PathBuf> {
 
 /// Copies each path into `dest_dir`. Name clashes get a " copy" suffix. A
 /// failed or cancelled copy removes the partly copied item.
-pub fn copy_into(paths: &[PathBuf], dest_dir: &Path, progress: &Progress) -> Result<Vec<PathBuf>> {
+/// What to do when something with the same name is already where an item
+/// is going.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnConflict {
+    /// Move the existing item to the Trash, then put the new one there.
+    Replace,
+    /// Give the new one a free name ("report 2.pdf").
+    KeepBoth,
+    /// Leave that item where it is.
+    Skip,
+    /// Stop with an error.
+    Fail,
+}
+
+/// The items in `paths` whose name is already taken in `dest_dir`. Copying
+/// an item into its own folder doesn't count (the copy is named "… copy"),
+/// and neither does moving it there (nothing to do).
+pub fn conflicts(paths: &[PathBuf], dest_dir: &Path) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .filter(|src| src.parent() != Some(dest_dir) && exists(&dest_dir.join(crate::paths::display_name(src))))
+        .cloned()
+        .collect()
+}
+
+/// Where `src` goes in `dest_dir`, or `None` to skip it. Copies into an
+/// item's own folder are named "… copy"; other clashes follow `on_conflict`
+/// (replacing moves the existing item to the Trash).
+fn place(src: &Path, dest_dir: &Path, copying: bool, on_conflict: OnConflict) -> Result<Option<PathBuf>> {
+    let name = crate::paths::display_name(src);
+    let target = dest_dir.join(&name);
+    let (stem, ext) = split_name(src);
+    if copying && target == src {
+        return Ok(Some(unique_path(dest_dir, &format!("{stem} copy"), &ext)));
+    }
+    if !exists(&target) || target == src {
+        return Ok(Some(target)); // free, or a move to where it already is
+    }
+    match on_conflict {
+        OnConflict::Skip => Ok(None),
+        OnConflict::KeepBoth => Ok(Some(unique_path(dest_dir, &stem, &ext))),
+        OnConflict::Replace => {
+            if src.starts_with(&target) {
+                bail!("Can't replace “{name}”: it contains the item being moved");
+            }
+            move_to_trash(std::slice::from_ref(&target))?;
+            Ok(Some(target))
+        }
+        OnConflict::Fail => bail!("\"{name}\" already exists in {}", dest_dir.display()),
+    }
+}
+
+/// Copies `paths` into `dest_dir`; returns what was created (skipped items
+/// are left out).
+pub fn copy_into(paths: &[PathBuf], dest_dir: &Path, on_conflict: OnConflict, progress: &Progress) -> Result<Vec<PathBuf>> {
     progress.count(paths);
     progress.counted.store(true, Ordering::Relaxed);
     let mut created = Vec::new();
     for src in paths {
         ensure_not_into_itself(src, dest_dir)?;
-        let name = crate::paths::display_name(src);
-        let mut target = dest_dir.join(&name);
-        if exists(&target) {
-            let (stem, ext) = split_name(src);
-            target = unique_path(dest_dir, &format!("{stem} copy"), &ext);
-        }
+        let Some(target) = place(src, dest_dir, true, on_conflict)? else { continue };
         copy_fresh(src, &target, progress)?;
         created.push(target);
     }
@@ -272,20 +321,19 @@ pub fn extract(zip: &Path) -> Result<PathBuf> {
 
 /// Moves each path into `dest_dir`. Refuses to overwrite existing items.
 /// Only moves to another volume copy data, so only those count as progress.
-pub fn move_into(paths: &[PathBuf], dest_dir: &Path, progress: &Progress) -> Result<Vec<PathBuf>> {
+/// Moves `paths` into `dest_dir`; returns `(from, to)` for each item moved
+/// (skipped items are left out).
+pub fn move_into(paths: &[PathBuf], dest_dir: &Path, on_conflict: OnConflict, progress: &Progress) -> Result<Vec<(PathBuf, PathBuf)>> {
     let across: Vec<PathBuf> = paths.iter().filter(|p| !same_volume(p, dest_dir)).cloned().collect();
     progress.count(&across);
     progress.counted.store(true, Ordering::Relaxed);
     let mut moved = Vec::new();
     for src in paths {
         ensure_not_into_itself(src, dest_dir)?;
-        let target = dest_dir.join(crate::paths::display_name(src));
+        let Some(target) = place(src, dest_dir, false, on_conflict)? else { continue };
         if target == *src {
-            moved.push(target);
+            moved.push((src.clone(), target));
             continue;
-        }
-        if exists(&target) {
-            bail!("\"{}\" already exists in {}", crate::paths::display_name(src), dest_dir.display());
         }
         match fs::rename(src, &target) {
             Ok(()) => {}
@@ -296,7 +344,7 @@ pub fn move_into(paths: &[PathBuf], dest_dir: &Path, progress: &Progress) -> Res
             }
             Err(e) => return Err(e).with_context(|| format!("moving {}", src.display())),
         }
-        moved.push(target);
+        moved.push((src.clone(), target));
     }
     Ok(moved)
 }
@@ -414,17 +462,40 @@ mod tests {
         let f = src.join("f.txt");
         fs::write(&f, "1").unwrap();
 
-        copy_into(std::slice::from_ref(&f), &dst, &Progress::default()).unwrap();
-        let again = copy_into(std::slice::from_ref(&f), &dst, &Progress::default()).unwrap();
-        assert_eq!(again[0].file_name().unwrap(), "f copy.txt");
+        let p = Progress::default();
+        let one = |path: &PathBuf| std::slice::from_ref(path).to_vec();
+        copy_into(&one(&f), &dst, OnConflict::Fail, &p).unwrap();
+        let dup = copy_into(&one(&f), &src, OnConflict::Fail, &p).unwrap();
+        assert_eq!(dup[0].file_name().unwrap(), "f copy.txt", "a copy into its own folder never asks");
 
-        assert!(move_into(std::slice::from_ref(&f), &dst, &Progress::default()).is_err(), "must not overwrite");
-        assert!(copy_into(std::slice::from_ref(&src), &src, &Progress::default()).is_err(), "no copying into itself");
+        assert_eq!(conflicts(&one(&f), &dst), one(&f));
+        assert!(conflicts(&one(&f), &src).is_empty(), "its own folder isn't a conflict");
+        assert!(copy_into(&one(&f), &dst, OnConflict::Fail, &p).is_err(), "must not overwrite");
+        assert!(move_into(&one(&f), &dst, OnConflict::Fail, &p).is_err(), "must not overwrite");
+        assert!(copy_into(&one(&src), &src, OnConflict::Fail, &p).is_err(), "no copying into itself");
+
+        let kept = copy_into(&one(&f), &dst, OnConflict::KeepBoth, &p).unwrap();
+        assert_eq!(kept[0].file_name().unwrap(), "f 2.txt");
+        assert!(copy_into(&one(&f), &dst, OnConflict::Skip, &p).unwrap().is_empty());
+        assert!(move_into(&one(&f), &dst, OnConflict::Skip, &p).unwrap().is_empty() && f.exists());
 
         let g = src.join("g.txt");
         fs::write(&g, "2").unwrap();
-        let moved = move_into(std::slice::from_ref(&g), &dst, &Progress::default()).unwrap();
-        assert!(!g.exists() && moved[0].exists());
+        let moved = move_into(&one(&g), &dst, OnConflict::Fail, &p).unwrap();
+        assert!(!g.exists() && moved[0].1.exists() && moved[0].0 == g);
+    }
+
+    #[test]
+    #[ignore = "moves a file to the real Trash"]
+    fn replace_trashes_the_existing_item() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(src.join("f.txt"), "new").unwrap();
+        fs::write(dst.join("f.txt"), "old").unwrap();
+        let moved = move_into(&[src.join("f.txt")], &dst, OnConflict::Replace, &Progress::default()).unwrap();
+        assert_eq!(fs::read_to_string(&moved[0].1).unwrap(), "new");
     }
 
     #[test]
@@ -457,14 +528,14 @@ mod tests {
         fs::create_dir(&dst).unwrap();
 
         let progress = Progress::default();
-        copy_into(std::slice::from_ref(&src), &dst, &progress).unwrap();
+        copy_into(std::slice::from_ref(&src), &dst, OnConflict::Fail, &progress).unwrap();
         let get = |a: &AtomicU64| a.load(Ordering::Relaxed);
         assert_eq!((get(&progress.total_files), get(&progress.total_bytes)), (2, 8));
         assert_eq!((get(&progress.done_files), get(&progress.done_bytes)), (2, 8));
 
         let cancelled = Progress::default();
         cancelled.cancel();
-        assert!(copy_into(std::slice::from_ref(&src), &dst, &cancelled).is_err());
+        assert!(copy_into(std::slice::from_ref(&src), &dst, OnConflict::Fail, &cancelled).is_err());
         assert!(!dst.join("src copy").exists(), "partial copy is removed");
     }
 
