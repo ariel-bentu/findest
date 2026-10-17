@@ -326,12 +326,15 @@ impl Index {
         None
     }
 
-    /// A listing entry for `id`, built from indexed data (no disk access).
+    /// A listing entry for `id`, built from indexed data (folders also read
+    /// their color label).
     pub fn entry(&self, id: u32) -> crate::listing::Entry {
         let flags = self.flags(id);
+        let path = self.path(id);
         crate::listing::Entry {
             name: self.name(id).to_string(),
-            path: self.path(id),
+            color: if flags & FLAG_DIR != 0 { crate::listing::read_color(&path) } else { None },
+            path,
             is_dir: flags & FLAG_DIR != 0,
             is_package: flags & FLAG_PACKAGE != 0,
             is_symlink: flags & FLAG_SYMLINK != 0,

@@ -25,6 +25,7 @@ unicode-segmentation = "1"
 futures = "0.3"
 rayon = "1"
 libc = "0.2"
+image = { version = "0.25", default-features = false, features = ["png"] }
 regex = "1"
 memchr = "2"
 objc2 = "0.6"

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use findest_core::listing::Entry;
+use findest_core::listing::{Entry, TagColor};
 use gpui::{Image, ImageFormat};
 use objc2::{AllocAnyThread, Message};
 use objc2::rc::autoreleasepool;
@@ -35,6 +35,8 @@ pub enum IconKey {
     Symbol { name: &'static str, rgb: u32 },
     /// Another icon rendered at a higher resolution, for big tiles.
     Large(Box<IconKey>),
+    /// Another icon recolored for a folder's color label.
+    Tinted(Box<IconKey>, TagColor),
     /// An image file's own contents, longer side at most `pixels`. `modified`
     /// is part of the key so an edited image gets a fresh thumbnail.
     Thumbnail { path: PathBuf, modified: Option<SystemTime>, pixels: u32 },
@@ -48,10 +50,14 @@ impl IconKey {
         if entry.is_dir {
             // Top-level folders like ~/Desktop or /Applications have custom icons.
             let parent = entry.path.parent();
-            return if parent == Some(home) || parent == Some(Path::new("/")) {
+            let icon = if parent == Some(home) || parent == Some(Path::new("/")) {
                 IconKey::Path(entry.path.clone())
             } else {
                 IconKey::Folder
+            };
+            return match entry.color {
+                Some(color) => IconKey::Tinted(Box::new(icon), color),
+                None => icon,
             };
         }
         match entry.extension() {
@@ -69,6 +75,7 @@ impl IconKey {
         match self {
             IconKey::Symbol { name, rgb } => return render_symbol(name, *rgb),
             IconKey::Large(inner) => return inner.load_at(LARGE_ICON_PIXELS),
+            IconKey::Tinted(inner, color) => return tint_png(&inner.load_at(pixels)?, color.rgb()),
             IconKey::Thumbnail { path, pixels, .. } => return crate::system::image_preview_png(path, *pixels as f64),
             _ => {}
         }
@@ -85,7 +92,9 @@ impl IconKey {
                 // SAFETY: immutable framework constants.
                 IconKey::Folder => workspace.iconForContentType(unsafe { UTTypeFolder }),
                 IconKey::File => workspace.iconForContentType(unsafe { UTTypeData }),
-                IconKey::Symbol { .. } | IconKey::Large(_) | IconKey::Thumbnail { .. } => unreachable!("handled above"),
+                IconKey::Symbol { .. } | IconKey::Large(_) | IconKey::Tinted(..) | IconKey::Thumbnail { .. } => {
+                    unreachable!("handled above")
+                }
             };
             let size = NSSize::new(pixels, pixels);
             image.setSize(size);
@@ -98,6 +107,35 @@ impl IconKey {
             Some(png.to_vec())
         })
     }
+}
+
+/// Recolors an icon (a PNG) with `rgb`, keeping its shading.
+fn tint_png(png: &[u8], rgb: [u8; 3]) -> Option<Vec<u8>> {
+    let mut image = image::load_from_memory_with_format(png, image::ImageFormat::Png).ok()?.to_rgba8();
+    for pixel in image.pixels_mut() {
+        pixel.0 = tint_pixel(pixel.0, rgb);
+    }
+    let mut out = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut out, image::ImageFormat::Png).ok()?;
+    Some(out.into_inner())
+}
+
+/// Brightness of the standard folder icon's body: pixels this bright get
+/// exactly `rgb`, brighter ones (highlights) are lighter, darker ones darker.
+const FOLDER_LUMA: f32 = 0.64;
+
+fn tint_pixel([r, g, b, a]: [u8; 4], rgb: [u8; 3]) -> [u8; 4] {
+    if a == 0 {
+        return [r, g, b, a];
+    }
+    let luma = (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) / 255.0;
+    let k = luma / FOLDER_LUMA;
+    let shade = |c: u8| {
+        let c = c as f32 / 255.0;
+        let v = if k <= 1.0 { c * k } else { c + (1.0 - c) * (k - 1.0).min(1.0) };
+        (v.clamp(0.0, 1.0) * 255.0).round() as u8
+    };
+    [shade(rgb[0]), shade(rgb[1]), shade(rgb[2]), a]
 }
 
 /// Renders an SF Symbol at Retina resolution, keeping its aspect ratio.
@@ -174,6 +212,58 @@ mod tests {
 
     fn is_png(bytes: &[u8]) -> bool {
         bytes.starts_with(b"\x89PNG")
+    }
+
+    #[test]
+    fn tinting_keeps_shading_and_transparency() {
+        let red = TagColor::Red.rgb();
+        assert_eq!(tint_pixel([1, 2, 3, 0], red), [1, 2, 3, 0], "transparent pixels untouched");
+        // The folder body's own brightness maps to exactly the tag color.
+        let body = [89, 189, 235, 255];
+        let tinted = tint_pixel(body, red);
+        assert!(tinted[..3].iter().zip(red).all(|(a, b)| a.abs_diff(b) <= 3), "{tinted:?}");
+        let dark = tint_pixel([20, 40, 60, 200], red);
+        let light = tint_pixel([230, 240, 250, 255], red);
+        assert!(dark[0] < tinted[0] && dark[3] == 200, "darker stays darker, alpha kept");
+        assert!(light[1] > tinted[1] && light[2] > tinted[2], "highlights get lighter");
+    }
+
+    #[test]
+    fn tinted_folder_icons_render() {
+        let folder = IconKey::Folder.load().unwrap();
+        let tinted = IconKey::Tinted(Box::new(IconKey::Folder), TagColor::Green).load().unwrap();
+        assert!(is_png(&tinted));
+        let decode = |png: &[u8]| image::load_from_memory(png).unwrap().to_rgba8();
+        let (plain, green) = (decode(&folder), decode(&tinted));
+        assert_eq!(plain.dimensions(), green.dimensions());
+        // Sum colors over opaque pixels: green dominates after tinting.
+        let sums = |img: &image::RgbaImage| {
+            img.pixels().filter(|p| p.0[3] > 128).fold([0u64; 3], |s, p| [s[0] + p.0[0] as u64, s[1] + p.0[1] as u64, s[2] + p.0[2] as u64])
+        };
+        let (p, g) = (sums(&plain), sums(&green));
+        assert!(p[2] > p[1], "the stock folder is blue");
+        assert!(g[1] > g[0] && g[1] > g[2], "the tinted one is green: {g:?}");
+    }
+
+    #[test]
+    fn colored_folders_get_tinted_icons() {
+        let home = Path::new("/Users/someone");
+        let mut entry = Entry {
+            name: "Projects".into(),
+            path: home.join("code/Projects"),
+            is_dir: true,
+            is_package: false,
+            is_symlink: false,
+            is_hidden: false,
+            size: 0,
+            modified: None,
+            color: None,
+        };
+        assert_eq!(IconKey::for_entry(&entry, home), IconKey::Folder);
+        entry.color = Some(TagColor::Purple);
+        assert_eq!(IconKey::for_entry(&entry, home), IconKey::Tinted(Box::new(IconKey::Folder), TagColor::Purple));
+        entry.path = home.join("Documents"); // special icon, tinted too
+        assert_eq!(IconKey::for_entry(&entry, home), IconKey::Tinted(Box::new(IconKey::Path(entry.path.clone())), TagColor::Purple));
     }
 
     #[test]

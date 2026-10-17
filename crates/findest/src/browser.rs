@@ -203,6 +203,8 @@ pub enum MenuEntry {
     Item { label: String, detail: Option<String>, action: MenuAction, danger: bool },
     Separator,
     Header(String),
+    /// A row of color dots for the selected folders; `current` is ringed.
+    Colors { current: Option<listing::TagColor> },
 }
 
 #[derive(Clone)]
@@ -217,6 +219,8 @@ pub enum MenuAction {
     NewWindowAt(PathBuf),
     /// Jump `steps` entries back (or forward) through history.
     History { back: bool, steps: usize },
+    /// Color the selected folders (`None` clears it).
+    SetColor(Option<listing::TagColor>),
 }
 
 /// Details of the single selected item, shown in the info panel.
@@ -1121,6 +1125,7 @@ impl Browser {
         self.menu = None;
         match action {
             MenuAction::Command(command) => self.run(command, window, cx),
+            MenuAction::SetColor(color) => self.set_folder_color(color, cx),
             MenuAction::RemoveFavorite(ix) => {
                 if ix < self.config.favorites.len() {
                     let mut favorites = self.config.favorites.clone();
@@ -1857,6 +1862,55 @@ impl Browser {
 
     /// Context menu for the file list. With `on_item`, the clicked row is
     /// already part of the selection.
+    /// Colors the selected folders (Finder's color label / tag).
+    fn set_folder_color(&mut self, color: Option<listing::TagColor>, cx: &mut Context<Self>) {
+        let folders: Vec<PathBuf> =
+            self.entries.iter().filter(|e| e.is_dir && self.selected.contains(&e.path)).map(|e| e.path.clone()).collect();
+        let errors: Vec<String> = folders
+            .iter()
+            .filter_map(|p| crate::system::set_color(p, color).err().map(|e| format!("{}: {e:#}", display_name(p))))
+            .collect();
+        if errors.is_empty() {
+            let what = if folders.len() == 1 { format!("“{}”", display_name(&folders[0])) } else { count_label(folders.len()) };
+            match color {
+                Some(c) => self.set_info(format!("Colored {what} {}", c.name().to_lowercase()), cx),
+                None => self.set_info(format!("Removed the color from {what}"), cx),
+            }
+        } else {
+            self.set_error(format!("Couldn't set the color: {}", errors.join("; ")), cx);
+        }
+        self.reload(cx);
+    }
+
+    /// The icon shown next to the folder name in the toolbar.
+    pub fn title_icon_key(&self) -> Option<IconKey> {
+        match &self.location {
+            Location::Dir(dir) => Entry::from_path(dir).ok().map(|e| IconKey::for_entry(&e, &self.home)),
+            Location::Recents => Some(self.symbol_key("clock")),
+        }
+    }
+
+    /// The folders above the current one, nearest first, to jump to.
+    pub fn open_enclosing_menu(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(dir) = self.current_dir() else { return };
+        let entries: Vec<MenuEntry> = locations::breadcrumbs(&self.home, &dir)
+            .into_iter()
+            .rev()
+            .skip(1)
+            .map(|place| MenuEntry::Item {
+                label: place.label,
+                detail: Some(contract_tilde(&place.path)),
+                action: MenuAction::Navigate(place.path),
+                danger: false,
+            })
+            .collect();
+        if entries.is_empty() {
+            return;
+        }
+        self.menu = Some(ContextMenu { position, entries });
+        cx.notify();
+    }
+
     /// Lists the status message's details (e.g. files that couldn't be copied).
     pub fn open_status_details(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         let Some(status) = &self.status else { return };
@@ -1936,6 +1990,13 @@ impl Browser {
                 entries.push(self.item("Add to Favorites", AddFavorite, "add_favorite"));
             }
             entries.push(self.item("Reveal in Finder", RevealInFinder, "reveal_in_finder"));
+            if all_dirs {
+                // Ring the color they share, if any.
+                let colors: HashSet<Option<listing::TagColor>> = selection.iter().map(|e| e.color).collect();
+                let current = if colors.len() == 1 { colors.into_iter().next().flatten() } else { None };
+                entries.push(MenuEntry::Separator);
+                entries.push(MenuEntry::Colors { current });
+            }
             entries.push(MenuEntry::Separator);
             entries.push(MenuEntry::Item {
                 label: "Move to Trash".into(),
@@ -2725,6 +2786,7 @@ mod tests {
             is_hidden: false,
             size: 0,
             modified: None,
+            color: None,
         }
     }
 

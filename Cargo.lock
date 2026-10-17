@@ -1700,6 +1700,7 @@ dependencies = [
  "findest-core",
  "futures",
  "gpui",
+ "image",
  "libc",
  "notify",
  "objc2",

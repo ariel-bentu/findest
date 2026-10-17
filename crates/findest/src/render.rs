@@ -52,7 +52,9 @@ impl Render for Browser {
             }
             self.tile_columns = ((width / px(self.tile_cell_width())).floor() as usize).max(1);
         }
-        let title = format!("Findest — {}", self.location_label());
+        // Folder first: it's what tells windows apart in the title bar,
+        // the Window menu and Mission Control.
+        let title = format!("{} — Findest", self.location_label());
         if title != self.last_title {
             window.set_window_title(&title);
             self.last_title = title;
@@ -121,7 +123,7 @@ impl Browser {
             .child(self.nav_button(true, cx))
             .child(self.nav_button(false, cx))
             .child(self.toolbar_button("up", "chevron.up", "↑", self.current_dir().is_some_and(|d| d.parent().is_some()), "go_up", cx))
-            .child(div().flex_1().min_w_0().when(self.loading, |d| d.text_color(theme.text_muted).child("Loading…")))
+            .child(self.render_title(cx))
             .child(self.render_search_field(cx))
             .child(self.syntax_help_button(cx))
             .child(self.toolbar_text_button("goto", "Go to…", "go_to_folder", cx))
@@ -130,6 +132,59 @@ impl Browser {
             .child(self.view_button(ViewMode::Tiles, cx))
             .child(self.folder_menu_button(cx))
             .child(self.info_toggle_button(cx))
+    }
+
+    /// The current folder's icon and name, next to the navigation buttons.
+    /// Click for the folders above it (like ⌘-clicking Finder's title),
+    /// right-click for the folder menu.
+    fn render_title(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = &self.theme;
+        let icon = self.title_icon_key().and_then(|key| self.icons.peek(&key));
+        let dir = self.current_dir();
+        div().flex_1().min_w_0().flex().flex_row().items_center().gap_2().child(
+            div()
+                .id("folder-title")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1p5()
+                .min_w_0()
+                .px_1p5()
+                .py_0p5()
+                .rounded_md()
+                .when(dir.is_some(), |d| {
+                    d.cursor_pointer()
+                        .hover(|s| s.bg(theme.hover))
+                        .tooltip(tooltip("Click for enclosing folders, right-click for more"))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.open_enclosing_menu(Point { x: e.position.x - px(20.), y: e.position.y + px(16.) }, cx);
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                if let Some(dir) = this.current_dir() {
+                                    this.open_path_menu(e.position, dir, cx);
+                                }
+                            }),
+                        )
+                })
+                .children(icon.map(|icon| img(icon).size(px(18.)).flex_none()))
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(px(theme.font_size + 1.))
+                        .text_color(theme.text)
+                        .child(self.location_label()),
+                )
+                .when(self.loading, |d| d.child(div().flex_none().text_color(theme.text_muted).child("Loading…"))),
+        )
     }
 
     /// The current folder's path, above the status bar. Click a part to go
@@ -582,6 +637,9 @@ impl Browser {
 
     /// Requests any sidebar symbols not yet rendered (call before `render_sidebar`).
     pub(crate) fn load_sidebar_icons(&mut self, cx: &mut Context<Self>) {
+        if let Some(key) = self.title_icon_key() {
+            self.request_icon(key, cx);
+        }
         let names: Vec<&'static str> =
             ["clock"].into_iter().chain(self.sidebar_places().iter().map(|p| p.symbol)).collect();
         for name in names {
@@ -1774,6 +1832,38 @@ impl Browser {
                         .text_color(theme.text_muted)
                         .child(text.clone()),
                 ),
+                MenuEntry::Colors { current } => {
+                    let current = *current;
+                    let dot = |id: usize, fill: Option<Hsla>, ringed: bool, hint: &'static str, action: MenuAction| {
+                        div()
+                            .id(("color", id))
+                            .size(px(18.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .border_2()
+                            .border_color(if ringed { theme.text } else { gpui::transparent_black() })
+                            .cursor_pointer()
+                            .hover(|s| s.border_color(theme.text_muted))
+                            .tooltip(tooltip(hint))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                window.focus(&this.focus);
+                                this.run_menu_action(action.clone(), window, cx);
+                            }))
+                            .child(match fill {
+                                Some(color) => div().size(px(12.)).rounded_full().bg(color).into_any_element(),
+                                None => div().text_size(px(theme.font_size - 2.)).text_color(theme.text_muted).child("✕").into_any_element(),
+                            })
+                    };
+                    let mut row = div().mx_1().px_2().py_1().flex().flex_row().items_center().gap_1();
+                    for (n, color) in findest_core::listing::TagColor::ALL.into_iter().enumerate() {
+                        let [r, g, b] = color.rgb();
+                        let fill = gpui::Rgba { r: r as f32 / 255., g: g as f32 / 255., b: b as f32 / 255., a: 1. };
+                        row = row.child(dot(i * 16 + n, Some(fill.into()), current == Some(color), color.name(), MenuAction::SetColor(Some(color))));
+                    }
+                    list.child(row.child(dot(i * 16 + 15, None, false, "No color", MenuAction::SetColor(None))))
+                }
                 MenuEntry::Item { label, detail, action, danger } => {
                     let action: MenuAction = action.clone();
                     list.child(

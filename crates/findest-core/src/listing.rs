@@ -25,6 +25,75 @@ pub struct Entry {
     pub is_hidden: bool,
     pub size: u64,
     pub modified: Option<SystemTime>,
+    /// A folder's color label (read for folders only).
+    pub color: Option<TagColor>,
+}
+
+/// Finder's color labels (the color tags), numbered as macOS stores them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TagColor {
+    Gray = 1,
+    Green = 2,
+    Purple = 3,
+    Blue = 4,
+    Yellow = 5,
+    Red = 6,
+    Orange = 7,
+}
+
+impl TagColor {
+    /// In Finder's menu order.
+    pub const ALL: [TagColor; 7] =
+        [TagColor::Red, TagColor::Orange, TagColor::Yellow, TagColor::Green, TagColor::Blue, TagColor::Purple, TagColor::Gray];
+
+    pub fn from_label(label: u8) -> Option<TagColor> {
+        TagColor::ALL.into_iter().find(|c| *c as u8 == label)
+    }
+
+    pub fn label(self) -> u8 {
+        self as u8
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            TagColor::Gray => "Gray",
+            TagColor::Green => "Green",
+            TagColor::Purple => "Purple",
+            TagColor::Blue => "Blue",
+            TagColor::Yellow => "Yellow",
+            TagColor::Red => "Red",
+            TagColor::Orange => "Orange",
+        }
+    }
+
+    /// sRGB, close to Finder's tag colors.
+    pub fn rgb(self) -> [u8; 3] {
+        match self {
+            TagColor::Gray => [0x98, 0x98, 0x9d],
+            TagColor::Green => [0x34, 0xc7, 0x59],
+            TagColor::Purple => [0xaf, 0x52, 0xde],
+            TagColor::Blue => [0x00, 0x7a, 0xff],
+            TagColor::Yellow => [0xff, 0xcc, 0x00],
+            TagColor::Red => [0xff, 0x3b, 0x30],
+            TagColor::Orange => [0xff, 0x95, 0x00],
+        }
+    }
+}
+
+/// The item's color label, from its Finder info (one small read; Finder
+/// keeps it in step with the first color tag).
+pub fn read_color(path: &Path) -> Option<TagColor> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut info = [0u8; 32];
+    // SAFETY: valid C string and a buffer of the given size.
+    let n = unsafe {
+        libc::getxattr(path.as_ptr(), c"com.apple.FinderInfo".as_ptr(), info.as_mut_ptr().cast(), info.len(), 0, 0)
+    };
+    if n != 32 {
+        return None;
+    }
+    TagColor::from_label((info[9] >> 1) & 7)
 }
 
 impl Entry {
@@ -36,9 +105,11 @@ impl Entry {
         let meta = if is_symlink { fs::metadata(path).unwrap_or(link_meta.clone()) } else { link_meta.clone() };
         let raw_dir = meta.is_dir();
         let is_package = raw_dir && is_package_name(&name);
+        let is_dir = raw_dir && !is_package;
         Ok(Entry {
+            color: if is_dir { read_color(path) } else { None },
             is_hidden: name.starts_with('.') || link_meta.st_flags() & UF_HIDDEN != 0,
-            is_dir: raw_dir && !is_package,
+            is_dir,
             is_package,
             is_symlink,
             size: if raw_dir { 0 } else { meta.len() },

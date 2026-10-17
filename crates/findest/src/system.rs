@@ -1,4 +1,4 @@
-//! Volume information from Foundation.
+//! Volume information and color labels via Foundation.
 
 use std::path::Path;
 
@@ -7,6 +7,19 @@ use objc2_foundation::{
     NSArray, NSNumber, NSString, NSURL, NSURLResourceKey, NSURLVolumeAvailableCapacityForImportantUsageKey,
     NSURLVolumeAvailableCapacityKey, NSURLVolumeTotalCapacityKey,
 };
+
+/// Sets (or with `None`, clears) the item's color label. Goes through
+/// Foundation so Finder's color tags stay in step.
+pub fn set_color(path: &Path, color: Option<findest_core::listing::TagColor>) -> anyhow::Result<()> {
+    autoreleasepool(|_| {
+        let path_str = path.to_str().ok_or_else(|| anyhow::anyhow!("unusual path"))?;
+        let url = NSURL::fileURLWithPath(&NSString::from_str(path_str));
+        let label = NSNumber::new_u8(color.map_or(0, |c| c.label()));
+        // SAFETY: an NSNumber for the label-number key, as documented.
+        unsafe { url.setResourceValue_forKey_error(Some(&label), objc2_foundation::NSURLLabelNumberKey) }
+            .map_err(|e| anyhow::anyhow!("{}", e.localizedDescription()))
+    })
+}
 
 /// `(available, total)` bytes for the volume containing `path`. "Available"
 /// matches Finder: it counts purgeable space macOS can reclaim on demand.
@@ -64,6 +77,36 @@ pub fn image_preview_png(path: &Path, max_pixels: f64) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use findest_core::listing::{Entry, TagColor, read_color};
+
+    #[test]
+    fn sets_reads_and_clears_folder_colors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("Projects");
+        std::fs::create_dir(&dir).unwrap();
+        assert_eq!(read_color(&dir), None);
+        assert_eq!(Entry::from_path(&dir).unwrap().color, None);
+
+        for color in TagColor::ALL {
+            set_color(&dir, Some(color)).unwrap();
+            assert_eq!(read_color(&dir), Some(color), "{}", color.name());
+        }
+        set_color(&dir, Some(TagColor::Blue)).unwrap();
+        assert_eq!(Entry::from_path(&dir).unwrap().color, Some(TagColor::Blue), "listing picks it up");
+
+        set_color(&dir, None).unwrap();
+        assert_eq!(read_color(&dir), None);
+    }
+
+    #[test]
+    fn files_have_no_color_in_listings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("notes.txt");
+        std::fs::write(&file, "x").unwrap();
+        set_color(&file, Some(TagColor::Red)).unwrap();
+        assert_eq!(read_color(&file), Some(TagColor::Red), "the tag is set");
+        assert_eq!(Entry::from_path(&file).unwrap().color, None, "but only folders show it");
+    }
 
     #[test]
     fn reads_image_dimensions() {
