@@ -2,13 +2,17 @@
 //! them off the UI thread.
 
 use std::fs;
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-/// Live progress of a copy or move, shared with the UI; also how it's cancelled.
-/// Totals are filled in by a quick scan before any data is copied.
+/// Live progress of a copy or move, shared with the UI; also how it's
+/// paused, cancelled and resumed. Totals are filled in by a quick scan
+/// before any data is copied.
 #[derive(Default)]
 pub struct Progress {
     pub total_files: AtomicU64,
@@ -18,6 +22,14 @@ pub struct Progress {
     /// Set once the totals are known.
     pub counted: AtomicBool,
     cancelled: AtomicBool,
+    paused: AtomicBool,
+    /// Items fully transferred: a resumed transfer continues after them.
+    items_done: AtomicUsize,
+    /// What the item in progress is being written to, so a transfer that
+    /// stopped can be discarded.
+    partial: Mutex<Option<PathBuf>>,
+    /// Files left out because they couldn't be read, with the reason.
+    pub skipped: Mutex<Vec<(PathBuf, String)>>,
 }
 
 impl Progress {
@@ -27,6 +39,39 @@ impl Progress {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Relaxed);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+
+    /// Waits while paused; fails once cancelled.
+    fn checkpoint(&self) -> Result<()> {
+        while self.is_paused() && !self.is_cancelled() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if self.is_cancelled() {
+            bail!("Cancelled");
+        }
+        Ok(())
+    }
+
+    /// Notes an unreadable file and carries on.
+    fn skip(&self, path: &Path, error: &std::io::Error) -> Result<()> {
+        self.skipped.lock().unwrap().push((path.to_path_buf(), error.to_string()));
+        Ok(())
+    }
+
+    /// Removes what the stopped transfer had partly written (a stopped move
+    /// still has its original).
+    pub fn discard_partial(&self) {
+        if let Some(path) = self.partial.lock().unwrap().take() {
+            let _ = delete_permanently(&[path]);
+        }
     }
 
     /// Adds `paths` (recursively) to the totals.
@@ -50,10 +95,7 @@ impl Progress {
     fn file_done(&self, bytes: u64) -> Result<()> {
         self.done_files.fetch_add(1, Ordering::Relaxed);
         self.done_bytes.fetch_add(bytes, Ordering::Relaxed);
-        if self.is_cancelled() {
-            bail!("Cancelled");
-        }
-        Ok(())
+        self.checkpoint()
     }
 }
 
@@ -165,12 +207,10 @@ pub fn duplicate(path: &Path) -> Result<PathBuf> {
     let dir = path.parent().context("can't duplicate the root folder")?;
     let (stem, ext) = split_name(path);
     let target = unique_path(dir, &format!("{stem} copy"), &ext);
-    copy_recursive(path, &target, &Progress::default())?;
+    copy_recursive(path, &target, false, false, &Progress::default())?;
     Ok(target)
 }
 
-/// Copies each path into `dest_dir`. Name clashes get a " copy" suffix. A
-/// failed or cancelled copy removes the partly copied item.
 /// What to do when something with the same name is already where an item
 /// is going.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,19 +263,87 @@ fn place(src: &Path, dest_dir: &Path, copying: bool, on_conflict: OnConflict) ->
     }
 }
 
+/// One item of a copy or move: where from, where to.
+pub type Planned = (PathBuf, PathBuf);
+
+/// Decides where each of `paths` goes in `dest_dir`, settling name clashes
+/// (replacing moves the existing item to the Trash now). Skipped items are
+/// left out.
+pub fn plan(paths: &[PathBuf], dest_dir: &Path, copying: bool, on_conflict: OnConflict) -> Result<Vec<Planned>> {
+    let mut items = Vec::new();
+    for src in paths {
+        ensure_not_into_itself(src, dest_dir)?;
+        if let Some(target) = place(src, dest_dir, copying, on_conflict)? {
+            items.push((src.clone(), target));
+        }
+    }
+    Ok(items)
+}
+
+/// Copies or moves the planned items. Copies within a volume are clones;
+/// to another volume data goes in chunks, so progress moves within big
+/// files and pausing or cancelling takes effect quickly.
+///
+/// Unreadable files are skipped and listed in `progress.skipped` (a move
+/// then keeps that item's original). A cancelled transfer removes the item
+/// it was on. Any other failure (a network volume going away, a full disk)
+/// keeps what was written: run it again with `resume` to continue, from the
+/// item it stopped on, keeping files that are complete and finishing a
+/// partly copied one; or call `progress.discard_partial()`.
+pub fn transfer(items: &[Planned], moving: bool, resume: bool, progress: &Progress) -> Result<()> {
+    if !resume {
+        progress.items_done.store(0, Ordering::Relaxed);
+        let to_copy: Vec<PathBuf> = items
+            .iter()
+            .filter(|(src, dst)| !moving || dst.parent().is_some_and(|d| !same_volume(src, d)))
+            .map(|(src, _)| src.clone())
+            .collect();
+        progress.count(&to_copy);
+        progress.counted.store(true, Ordering::Relaxed);
+    }
+    let start = progress.items_done.load(Ordering::Relaxed);
+    for (src, dst) in items.iter().skip(start) {
+        progress.checkpoint()?;
+        transfer_item(src, dst, moving, resume, progress)?;
+        progress.items_done.fetch_add(1, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+fn transfer_item(src: &Path, dst: &Path, moving: bool, resume: bool, progress: &Progress) -> Result<()> {
+    if moving && src == dst {
+        return Ok(());
+    }
+    if moving && !resume {
+        match fs::rename(src, dst) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.raw_os_error() == Some(18 /* EXDEV */) => {} // other volume: copy, then remove
+            Err(e) => return Err(e).with_context(|| format!("moving {}", src.display())),
+        }
+    }
+    let chunked = dst.parent().is_some_and(|d| !same_volume(src, d));
+    *progress.partial.lock().unwrap() = Some(dst.to_path_buf());
+    let skipped_before = progress.skipped.lock().unwrap().len();
+    if let Err(e) = copy_recursive(src, dst, chunked, resume, progress) {
+        if progress.is_cancelled() {
+            progress.discard_partial();
+        }
+        return Err(e);
+    }
+    *progress.partial.lock().unwrap() = None;
+    // Don't remove originals of files that couldn't be copied.
+    if moving && progress.skipped.lock().unwrap().len() == skipped_before {
+        delete_permanently(&[src.to_path_buf()])?;
+    }
+    Ok(())
+}
+
 /// Copies `paths` into `dest_dir`; returns what was created (skipped items
 /// are left out).
 pub fn copy_into(paths: &[PathBuf], dest_dir: &Path, on_conflict: OnConflict, progress: &Progress) -> Result<Vec<PathBuf>> {
-    progress.count(paths);
-    progress.counted.store(true, Ordering::Relaxed);
-    let mut created = Vec::new();
-    for src in paths {
-        ensure_not_into_itself(src, dest_dir)?;
-        let Some(target) = place(src, dest_dir, true, on_conflict)? else { continue };
-        copy_fresh(src, &target, progress)?;
-        created.push(target);
-    }
-    Ok(created)
+    let items = plan(paths, dest_dir, true, on_conflict)?;
+    transfer(&items, false, false, progress)?;
+    Ok(items.into_iter().map(|(_, dst)| dst).collect())
 }
 
 /// Zips `paths` next to them, like Finder's Compress: one item becomes
@@ -319,34 +427,13 @@ pub fn extract(zip: &Path) -> Result<PathBuf> {
     result
 }
 
-/// Moves each path into `dest_dir`. Refuses to overwrite existing items.
-/// Only moves to another volume copy data, so only those count as progress.
-/// Moves `paths` into `dest_dir`; returns `(from, to)` for each item moved
+/// Moves `paths` into `dest_dir` (only moves to another volume copy data,
+/// so only those count as progress); returns `(from, to)` for each item
 /// (skipped items are left out).
-pub fn move_into(paths: &[PathBuf], dest_dir: &Path, on_conflict: OnConflict, progress: &Progress) -> Result<Vec<(PathBuf, PathBuf)>> {
-    let across: Vec<PathBuf> = paths.iter().filter(|p| !same_volume(p, dest_dir)).cloned().collect();
-    progress.count(&across);
-    progress.counted.store(true, Ordering::Relaxed);
-    let mut moved = Vec::new();
-    for src in paths {
-        ensure_not_into_itself(src, dest_dir)?;
-        let Some(target) = place(src, dest_dir, false, on_conflict)? else { continue };
-        if target == *src {
-            moved.push((src.clone(), target));
-            continue;
-        }
-        match fs::rename(src, &target) {
-            Ok(()) => {}
-            // Different volume: copy then remove.
-            Err(e) if e.raw_os_error() == Some(18 /* EXDEV */) => {
-                copy_fresh(src, &target, progress)?;
-                delete_permanently(std::slice::from_ref(src))?;
-            }
-            Err(e) => return Err(e).with_context(|| format!("moving {}", src.display())),
-        }
-        moved.push((src.clone(), target));
-    }
-    Ok(moved)
+pub fn move_into(paths: &[PathBuf], dest_dir: &Path, on_conflict: OnConflict, progress: &Progress) -> Result<Vec<Planned>> {
+    let items = plan(paths, dest_dir, false, on_conflict)?;
+    transfer(&items, true, false, progress)?;
+    Ok(items)
 }
 
 /// True when both paths are on the same filesystem, so a move is a cheap rename.
@@ -365,34 +452,101 @@ fn ensure_not_into_itself(src: &Path, dest_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Copies to a `dst` that doesn't exist yet, removing whatever was copied if it fails.
-fn copy_fresh(src: &Path, dst: &Path, progress: &Progress) -> Result<()> {
-    let result = copy_recursive(src, dst, progress);
-    if result.is_err() && exists(dst) {
-        let _ = delete_permanently(&[dst.to_path_buf()]);
-    }
-    result
+/// An error reading the source that means "skip this file" rather than
+/// "stop": it's unreadable or vanished.
+fn skippable(e: &std::io::Error) -> bool {
+    matches!(e.kind(), std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound)
 }
 
-fn copy_recursive(src: &Path, dst: &Path, progress: &Progress) -> Result<()> {
-    let meta = fs::symlink_metadata(src)?;
+fn copy_recursive(src: &Path, dst: &Path, chunked: bool, resume: bool, progress: &Progress) -> Result<()> {
+    let meta = match fs::symlink_metadata(src) {
+        Ok(meta) => meta,
+        Err(e) if skippable(&e) => return progress.skip(src, &e),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", src.display())),
+    };
     let ft = meta.file_type();
     if ft.is_symlink() {
-        std::os::unix::fs::symlink(fs::read_link(src)?, dst)?;
+        if !(resume && exists(dst)) {
+            std::os::unix::fs::symlink(fs::read_link(src)?, dst)?;
+        }
         progress.file_done(0)?;
     } else if ft.is_dir() {
-        fs::create_dir(dst)?;
-        for item in fs::read_dir(src)? {
+        let entries = match fs::read_dir(src) {
+            Ok(entries) => entries,
+            Err(e) if skippable(&e) => return progress.skip(src, &e),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", src.display())),
+        };
+        if !(resume && dst.is_dir()) {
+            fs::create_dir(dst).with_context(|| format!("creating {}", dst.display()))?;
+        }
+        for item in entries {
             let item = item?;
-            copy_recursive(&item.path(), &dst.join(item.file_name()), progress)?;
+            copy_recursive(&item.path(), &dst.join(item.file_name()), chunked, resume, progress)?;
         }
         fs::set_permissions(dst, meta.permissions())?;
     } else {
-        // std uses clonefile/fcopyfile on macOS, so this is cheap on APFS.
-        fs::copy(src, dst).with_context(|| format!("copying {}", src.display()))?;
-        progress.file_done(meta.len())?;
+        copy_file(src, dst, &meta, chunked, resume, progress)?;
     }
     Ok(())
+}
+
+/// Bytes per chunk when copying to another volume.
+const CHUNK: usize = 4 << 20;
+
+fn copy_file(src: &Path, dst: &Path, meta: &fs::Metadata, chunked: bool, resume: bool, progress: &Progress) -> Result<()> {
+    let len = meta.len();
+    // Resuming: a file finished before the interruption has the source's
+    // size and date (the date is set last); a shorter one is continued.
+    let existing = if resume { fs::symlink_metadata(dst).ok().filter(|d| d.is_file()) } else { None };
+    if existing.as_ref().is_some_and(|d| d.len() == len && d.modified().ok() == meta.modified().ok()) {
+        return progress.checkpoint(); // counted before the interruption
+    }
+    let mut input = match fs::File::open(src) {
+        Ok(file) => file,
+        Err(e) if skippable(&e) => return progress.skip(src, &e),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", src.display())),
+    };
+    if !chunked {
+        // std uses clonefile/fcopyfile on macOS, so this is cheap on APFS.
+        drop(input);
+        fs::copy(src, dst).with_context(|| format!("copying {}", src.display()))?;
+        return progress.file_done(len);
+    }
+
+    let offset = existing.map(|d| d.len()).filter(|&n| n < len).unwrap_or(0);
+    let mut output = if offset > 0 {
+        input.seek(std::io::SeekFrom::Start(offset))?;
+        fs::OpenOptions::new().append(true).open(dst)
+    } else {
+        fs::File::create(dst)
+    }
+    .with_context(|| format!("writing {}", dst.display()))?;
+    let mut buf = vec![0u8; CHUNK.min(len as usize).max(1)];
+    loop {
+        progress.checkpoint()?;
+        let n = input.read(&mut buf).with_context(|| format!("reading {}", src.display()))?;
+        if n == 0 {
+            break;
+        }
+        output.write_all(&buf[..n]).with_context(|| format!("writing {}", dst.display()))?;
+        progress.done_bytes.fetch_add(n as u64, Ordering::Relaxed);
+    }
+    output.sync_all().with_context(|| format!("writing {}", dst.display()))?;
+    drop(output);
+    copy_metadata(src, dst, meta);
+    progress.file_done(0)
+}
+
+/// Permissions, extended attributes (tags, Finder info) and dates, like
+/// Finder keeps them. The date goes last: it marks the file complete.
+fn copy_metadata(src: &Path, dst: &Path, meta: &fs::Metadata) {
+    use std::os::unix::ffi::OsStrExt;
+    if let (Ok(from), Ok(to)) = (std::ffi::CString::new(src.as_os_str().as_bytes()), std::ffi::CString::new(dst.as_os_str().as_bytes())) {
+        unsafe { libc::copyfile(from.as_ptr(), to.as_ptr(), std::ptr::null_mut(), libc::COPYFILE_METADATA) };
+    }
+    if let (Ok(file), Ok(modified)) = (fs::OpenOptions::new().write(true).open(dst), meta.modified()) {
+        let _ = file.set_modified(modified);
+    }
 }
 
 #[cfg(test)]
@@ -498,6 +652,160 @@ mod tests {
         assert_eq!(fs::read_to_string(&moved[0].1).unwrap(), "new");
     }
 
+    /// 9 MB of varied bytes: more than two chunks.
+    fn big_file(path: &Path) -> Vec<u8> {
+        let data: Vec<u8> = (0..9_000_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+        fs::write(path, &data).unwrap();
+        data
+    }
+
+    #[test]
+    fn chunked_copy_keeps_contents_and_date() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dst) = (tmp.path().join("big.bin"), tmp.path().join("copy.bin"));
+        let data = big_file(&src);
+        let p = Progress::default();
+        copy_recursive(&src, &dst, true, false, &p).unwrap();
+        assert!(fs::read(&dst).unwrap() == data);
+        assert_eq!(fs::metadata(&dst).unwrap().modified().unwrap(), fs::metadata(&src).unwrap().modified().unwrap());
+        assert_eq!(p.done_bytes.load(Ordering::Relaxed), data.len() as u64);
+        assert_eq!(p.done_files.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn resume_finishes_a_partial_file_and_keeps_complete_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dst) = (tmp.path().join("big.bin"), tmp.path().join("copy.bin"));
+        let data = big_file(&src);
+        fs::write(&dst, &data[..3_000_000]).unwrap(); // interrupted after 3 MB
+        let p = Progress::default();
+        copy_recursive(&src, &dst, true, true, &p).unwrap();
+        assert!(fs::read(&dst).unwrap() == data, "continued, not restarted or corrupted");
+        assert_eq!(p.done_bytes.load(Ordering::Relaxed), 6_000_000, "only the rest is copied");
+
+        let again = Progress::default();
+        copy_recursive(&src, &dst, true, true, &again).unwrap();
+        assert_eq!(again.done_bytes.load(Ordering::Relaxed), 0, "a complete file is kept as is");
+    }
+
+    #[test]
+    fn unreadable_files_are_skipped_and_listed() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("ok.txt"), "fine").unwrap();
+        fs::write(src.join("secret.txt"), "no").unwrap();
+        fs::set_permissions(src.join("secret.txt"), fs::Permissions::from_mode(0o000)).unwrap();
+        let dst = tmp.path().join("dst");
+        fs::create_dir(&dst).unwrap();
+
+        let p = Progress::default();
+        let items = vec![(src.clone(), dst.join("src"))];
+        transfer(&items, false, false, &p).unwrap();
+        assert!(dst.join("src/ok.txt").exists() && !dst.join("src/secret.txt").exists());
+        let skipped = p.skipped.lock().unwrap();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].0, src.join("secret.txt"));
+        fs::set_permissions(src.join("secret.txt"), fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    #[test]
+    fn pause_holds_and_resume_continues() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dst) = (tmp.path().join("big.bin"), tmp.path().join("copy.bin"));
+        let data = big_file(&src);
+        let p = std::sync::Arc::new(Progress::default());
+        p.set_paused(true);
+        let worker = {
+            let (p, src, dst) = (p.clone(), src.clone(), dst.clone());
+            std::thread::spawn(move || copy_recursive(&src, &dst, true, false, &p))
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(p.done_bytes.load(Ordering::Relaxed), 0, "nothing copied while paused");
+        p.set_paused(false);
+        worker.join().unwrap().unwrap();
+        assert!(fs::read(&dst).unwrap() == data);
+    }
+
+    #[test]
+    fn a_failed_transfer_resumes_from_the_item_it_stopped_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("dst");
+        fs::create_dir(&dst).unwrap();
+        let (a, b) = (tmp.path().join("a.txt"), tmp.path().join("b.txt"));
+        fs::write(&a, "a").unwrap();
+        fs::write(&b, "b").unwrap();
+        // b's destination folder is missing, like a volume that went away.
+        let items = vec![(a.clone(), dst.join("a.txt")), (b.clone(), dst.join("gone/b.txt"))];
+        let p = Progress::default();
+        assert!(transfer(&items, false, false, &p).is_err());
+        assert!(dst.join("a.txt").exists(), "work done before the failure stays");
+        assert_eq!(*p.partial.lock().unwrap(), Some(dst.join("gone/b.txt")), "remembers what to discard");
+
+        fs::write(dst.join("a.txt"), "edited since").unwrap();
+        fs::create_dir(dst.join("gone")).unwrap(); // it came back
+        transfer(&items, false, true, &p).unwrap();
+        assert_eq!(fs::read_to_string(dst.join("gone/b.txt")).unwrap(), "b");
+        assert_eq!(fs::read_to_string(dst.join("a.txt")).unwrap(), "edited since", "finished items aren't redone");
+    }
+
+    #[test]
+    fn discarding_removes_the_partly_copied_item() {
+        let tmp = tempfile::tempdir().unwrap();
+        let partial = tmp.path().join("half");
+        fs::create_dir_all(partial.join("sub")).unwrap();
+        fs::write(partial.join("sub/x"), "x").unwrap();
+        let p = Progress::default();
+        *p.partial.lock().unwrap() = Some(partial.clone());
+        p.discard_partial();
+        assert!(!partial.exists());
+    }
+
+    #[test]
+    fn a_move_keeps_originals_it_could_not_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("ok.txt"), "fine").unwrap();
+        fs::write(src.join("secret.txt"), "no").unwrap();
+        fs::set_permissions(src.join("secret.txt"), fs::Permissions::from_mode(0o000)).unwrap();
+        let dst = tmp.path().join("dst");
+        fs::create_dir(&dst).unwrap();
+        // `resume` takes the copy-then-remove path a move to another volume uses.
+        let p = Progress::default();
+        transfer(&[(src.clone(), dst.join("src"))], true, true, &p).unwrap();
+        assert!(dst.join("src/ok.txt").exists());
+        assert!(src.join("secret.txt").exists(), "the unreadable original isn't deleted");
+        fs::set_permissions(src.join("secret.txt"), fs::Permissions::from_mode(0o644)).unwrap();
+
+        // Without skips, the original goes once copied.
+        let other = tmp.path().join("other");
+        fs::create_dir(&other).unwrap();
+        fs::write(other.join("a"), "a").unwrap();
+        transfer(&[(other.clone(), dst.join("other"))], true, true, &Progress::default()).unwrap();
+        assert!(!other.exists() && dst.join("other/a").exists());
+    }
+
+    #[test]
+    fn cancelling_a_chunked_copy_removes_the_partial_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dst) = (tmp.path().join("big.bin"), tmp.path().join("dst"));
+        big_file(&src);
+        fs::create_dir(&dst).unwrap();
+        let p = std::sync::Arc::new(Progress::default());
+        p.set_paused(true); // hold it mid-way, then cancel
+        let worker = {
+            let (p, src, dst) = (p.clone(), src.clone(), dst.clone());
+            std::thread::spawn(move || transfer(&[(src, dst.join("big.bin"))], false, false, &p))
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        p.cancel();
+        assert!(worker.join().unwrap().is_err());
+        assert!(!dst.join("big.bin").exists());
+    }
+
     #[test]
     fn same_volume_for_siblings() {
         let tmp = tempfile::tempdir().unwrap();
@@ -535,8 +843,8 @@ mod tests {
 
         let cancelled = Progress::default();
         cancelled.cancel();
-        assert!(copy_into(std::slice::from_ref(&src), &dst, OnConflict::Fail, &cancelled).is_err());
-        assert!(!dst.join("src copy").exists(), "partial copy is removed");
+        assert!(copy_into(std::slice::from_ref(&src), &dst, OnConflict::KeepBoth, &cancelled).is_err());
+        assert!(!dst.join("src 2").exists(), "partial copy is removed");
     }
 
     #[test]

@@ -1440,6 +1440,7 @@ impl Browser {
         let capacity = self.volume.map(|(available, total)| {
             format!("{} available of {}", format_size(available), format_size(total))
         });
+        let has_details = self.status.as_ref().is_some_and(|s| !s.details.is_empty());
         let (message, color): (String, Hsla) = match &self.status {
             Some(status) => (status.message.clone(), if status.is_error { theme.danger } else { theme.text_muted }),
             None => (String::new(), theme.text_muted),
@@ -1457,7 +1458,26 @@ impl Browser {
             .text_size(px(theme.font_size - 1.))
             .text_color(theme.text_muted)
             .child(div().flex_none().whitespace_nowrap().child(summary))
-            .child(div().flex_1().min_w_0().flex().justify_end().text_color(color).truncate().child(message))
+            .child(
+                div()
+                    .id("status-message")
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .justify_end()
+                    .text_color(color)
+                    .truncate()
+                    .when(has_details, |d| {
+                        d.cursor_pointer().on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.open_status_details(Point { x: e.position.x - px(200.), y: e.position.y - px(200.) }, cx);
+                            }),
+                        )
+                    })
+                    .child(message),
+            )
             .children(self.render_type_ahead())
             .children(self.render_index_activity(cx))
             .children(self.render_transfers(cx))
@@ -1499,27 +1519,59 @@ impl Browser {
         )
     }
 
-    /// Progress of running copies/moves, with a cancel button. Quick ones
+    /// Progress of running copies/moves: counts, bytes, speed and time
+    /// left, with pause and cancel. A transfer that stopped (e.g. a network
+    /// volume went away) shows why, with Retry and discard. Quick ones
     /// finish before it would appear, so they don't flash.
-    fn render_transfers(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn render_transfers(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         use std::sync::atomic::Ordering::Relaxed;
+        let theme = &self.theme;
+        let button = |id: &'static str, label: &'static str, hint: &'static str| {
+            div()
+                .id(id)
+                .px_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.hover).text_color(theme.text))
+                .tooltip(tooltip(hint))
+                .child(label)
+        };
+        if let Some(stopped) = self.transfers.iter().find(|t| t.failed.is_some()) {
+            let what = if stopped.verb == "Moving" { "Move" } else { "Copy" };
+            let why = stopped.failed.clone().unwrap_or_default();
+            return Some(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .child(div().max_w(px(420.)).truncate().text_color(theme.danger).child(format!("{what} stopped: {why}")))
+                    .child(
+                        button("retry-transfer", "Retry", "Continue where it stopped")
+                            .text_color(theme.accent)
+                            .on_click(cx.listener(|this, _, _, cx| this.retry_transfer(cx))),
+                    )
+                    .child(
+                        button("discard-transfer", "✕", "Give up (removes the partly copied item)")
+                            .on_click(cx.listener(|this, _, _, cx| this.discard_failed_transfer(cx))),
+                    )
+                    .into_any_element(),
+            );
+        }
+
         let shown: Vec<_> = self.transfers.iter().filter(|t| t.started.elapsed().as_millis() > 400).collect();
         if shown.is_empty() {
             return None;
         }
-        let theme = &self.theme;
         let sum = |f: fn(&findest_core::ops::Progress) -> u64| shown.iter().map(|t| f(&t.progress)).sum::<u64>();
         let (total_files, done_files) = (sum(|p| p.total_files.load(Relaxed)), sum(|p| p.done_files.load(Relaxed)));
         let (total_bytes, done_bytes) = (sum(|p| p.total_bytes.load(Relaxed)), sum(|p| p.done_bytes.load(Relaxed)));
         let counted = shown.iter().all(|t| t.progress.counted.load(Relaxed));
+        let paused = shown.iter().any(|t| t.progress.is_paused());
+        let speed: Option<f64> = shown.iter().filter_map(|t| t.speed()).reduce(|a, b| a + b);
         let verb = if shown.iter().all(|t| t.verb == shown[0].verb) { shown[0].verb } else { "Transferring" };
-        let label = if !counted {
-            format!("{verb}… counting items")
-        } else if total_bytes > 0 {
-            format!("{verb} {done_files} of {} · {} of {}", count_label(total_files as usize), format_size(done_bytes), format_size(total_bytes))
-        } else {
-            format!("{verb} {done_files} of {}", count_label(total_files as usize))
-        };
+        let label = transfer_label(verb, counted, paused, (done_files, total_files), (done_bytes, total_bytes), speed);
         let fraction = if !counted {
             0.0
         } else if total_bytes > 0 {
@@ -1543,19 +1595,20 @@ impl Browser {
                         .h(px(5.))
                         .rounded_full()
                         .bg(theme.border)
-                        .child(div().h_full().w(px(120. * fraction.clamp(0., 1.))).rounded_full().bg(theme.accent)),
+                        .child(
+                            div()
+                                .h_full()
+                                .w(px(120. * fraction.clamp(0., 1.)))
+                                .rounded_full()
+                                .bg(if paused { theme.text_muted } else { theme.accent }),
+                        ),
                 )
                 .child(
-                    div()
-                        .id("cancel-transfer")
-                        .px_1()
-                        .rounded_sm()
-                        .cursor_pointer()
-                        .hover(|s| s.bg(theme.hover).text_color(theme.text))
-                        .tooltip(tooltip("Cancel"))
-                        .on_click(cx.listener(|this, _, _, cx| this.cancel_transfers(cx)))
-                        .child("✕"),
-                ),
+                    button("pause-transfer", if paused { "▶" } else { "⏸" }, if paused { "Resume" } else { "Pause" })
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_pause_transfers(cx))),
+                )
+                .child(button("cancel-transfer", "✕", "Cancel").on_click(cx.listener(|this, _, _, cx| this.cancel_transfers(cx))))
+                .into_any_element(),
         )
     }
 
@@ -1771,6 +1824,35 @@ impl Browser {
     }
 }
 
+/// "Copying 120 of 3,400 items · 1.2 GB of 8.4 GB · 45 MB/s · about 3 min left".
+fn transfer_label(verb: &str, counted: bool, paused: bool, files: (u64, u64), bytes: (u64, u64), speed: Option<f64>) -> String {
+    let ((done_files, total_files), (done_bytes, total_bytes)) = (files, bytes);
+    if !counted {
+        return format!("{verb}… counting items");
+    }
+    let mut label = format!("{verb} {done_files} of {}", count_label(total_files as usize));
+    if total_bytes > 0 {
+        label.push_str(&format!(" · {} of {}", format_size(done_bytes), format_size(total_bytes)));
+    }
+    if paused {
+        label.push_str(" · Paused");
+    } else if let Some(speed) = speed.filter(|&s| s > 0.0 && total_bytes > 0) {
+        let left = total_bytes.saturating_sub(done_bytes) as f64 / speed;
+        label.push_str(&format!(" · {}/s · {}", format_size(speed as u64), time_left(left)));
+    }
+    label
+}
+
+fn time_left(secs: f64) -> String {
+    let secs = secs.ceil() as u64;
+    match secs {
+        0..10 => "a few seconds left".into(),
+        10..60 => format!("about {secs} s left"),
+        60..3600 => format!("about {} min left", secs.div_ceil(60)),
+        _ => format!("about {} h {} min left", secs / 3600, (secs % 3600) / 60),
+    }
+}
+
 /// Hover hint for toolbar buttons.
 struct Tooltip(SharedString);
 
@@ -1879,5 +1961,31 @@ fn format_time(time: SystemTime) -> String {
         format!("Yesterday, {}", time.format("%H:%M"))
     } else {
         time.format("%-d %b %Y, %H:%M").to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transfer_label_shows_counts_speed_and_time_left() {
+        assert_eq!(transfer_label("Copying", false, false, (0, 0), (0, 0), None), "Copying… counting items");
+        let gb = 1_000_000_000;
+        let label = transfer_label("Copying", true, false, (120, 3400), (gb, 9 * gb), Some(40_000_000.0));
+        assert!(label.starts_with("Copying 120 of 3400 items · 1.0 GB of 9.0 GB"), "{label}");
+        assert!(label.contains("/s · about 4 min left"), "8 GB left at 40 MB/s: {label}");
+        let paused = transfer_label("Moving", true, true, (1, 2), (5, 10), Some(1.0));
+        assert!(paused.ends_with(" · Paused") && !paused.contains("/s"), "no speed while paused: {paused}");
+        let no_speed_yet = transfer_label("Copying", true, false, (0, 5), (0, 100), None);
+        assert!(!no_speed_yet.contains("left"), "{no_speed_yet}");
+    }
+
+    #[test]
+    fn time_left_reads_naturally() {
+        assert_eq!(time_left(3.2), "a few seconds left");
+        assert_eq!(time_left(42.0), "about 42 s left");
+        assert_eq!(time_left(61.0), "about 2 min left");
+        assert_eq!(time_left(2.0 * 3600.0 + 5.0 * 60.0), "about 2 h 5 min left");
     }
 }

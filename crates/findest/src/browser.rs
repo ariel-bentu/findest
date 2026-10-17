@@ -161,17 +161,36 @@ fn type_ahead_match(query: &str, names: &[(String, usize)], cursor: Option<usize
     best(&|name| name.contains(query))
 }
 
+/// Continues a transfer that stopped.
+type Retry = Box<dyn FnOnce(&mut Browser, &mut Context<Browser>)>;
+
 /// A copy or move running in the background, shown in the status bar.
 pub struct Transfer {
     /// "Copying" or "Moving".
     pub verb: &'static str,
     pub progress: Arc<ops::Progress>,
     pub started: Instant,
+    /// Why it stopped; it waits for Retry or discarding.
+    pub failed: Option<String>,
+    retry: Option<Retry>,
+    /// Recent (time, bytes done) readings, for the speed.
+    pub samples: std::collections::VecDeque<(Instant, u64)>,
+}
+
+impl Transfer {
+    /// Bytes per second over the last few seconds, once there's enough to tell.
+    pub fn speed(&self) -> Option<f64> {
+        let (first, last) = (self.samples.front()?, self.samples.back()?);
+        let secs = last.0.duration_since(first.0).as_secs_f64();
+        (secs >= 1.0 && last.1 > first.1).then(|| (last.1 - first.1) as f64 / secs)
+    }
 }
 
 pub struct Status {
     pub message: String,
     pub is_error: bool,
+    /// More to see on click (e.g. files that couldn't be copied).
+    pub details: Vec<String>,
 }
 
 pub struct ContextMenu {
@@ -835,12 +854,12 @@ impl Browser {
     // ---- Status -------------------------------------------------------
 
     pub fn set_error(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
-        self.status = Some(Status { message: message.into(), is_error: true });
+        self.status = Some(Status { message: message.into(), is_error: true, details: Vec::new() });
         cx.notify();
     }
 
     pub fn set_info(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
-        self.status = Some(Status { message: message.into(), is_error: false });
+        self.status = Some(Status { message: message.into(), is_error: false, details: Vec::new() });
         cx.notify();
     }
 
@@ -1159,16 +1178,24 @@ impl Browser {
         &mut self,
         verb: &'static str,
         cx: &mut Context<Self>,
-        op: impl FnOnce(&ops::Progress) -> Result<T> + Send + 'static,
+        op: impl Fn(&ops::Progress, bool) -> Result<T> + Send + Sync + 'static,
         done: impl FnOnce(&mut Self, T, &mut Context<Self>) + 'static,
     ) {
         let progress = Arc::new(ops::Progress::default());
-        self.transfers.push(Transfer { verb, progress: progress.clone(), started: Instant::now() });
+        self.transfers.push(Transfer {
+            verb,
+            progress: progress.clone(),
+            started: Instant::now(),
+            failed: None,
+            retry: None,
+            samples: Default::default(),
+        });
         if self.transfer_ticker.is_none() {
             self.transfer_ticker = Some(cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor().timer(Duration::from_millis(100)).await;
                     let running = this.update(cx, |this, cx| {
+                        this.sample_transfers();
                         cx.notify();
                         !this.transfers.is_empty()
                     });
@@ -1179,22 +1206,49 @@ impl Browser {
                 this.update(cx, |this, _| this.transfer_ticker = None).ok();
             }));
         }
+        self.start_transfer(verb, Arc::new(op), progress, false, Box::new(done), cx);
+    }
+
+    /// Runs (or, with `resume`, continues) a transfer. If it fails for a
+    /// reason other than cancelling, it stays in the status bar with Retry.
+    #[allow(clippy::type_complexity)]
+    fn start_transfer<T: Send + 'static>(
+        &mut self,
+        verb: &'static str,
+        op: Arc<dyn Fn(&ops::Progress, bool) -> Result<T> + Send + Sync>,
+        progress: Arc<ops::Progress>,
+        resume: bool,
+        done: Box<dyn FnOnce(&mut Self, T, &mut Context<Self>)>,
+        cx: &mut Context<Self>,
+    ) {
         let task = cx.background_executor().spawn({
-            let progress = progress.clone();
-            async move { op(&progress) }
+            let (op, progress) = (op.clone(), progress.clone());
+            async move { op(&progress, resume) }
         });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
-                this.transfers.retain(|t| !Arc::ptr_eq(&t.progress, &progress));
                 match result {
-                    Ok(value) => done(this, value, cx),
+                    Ok(value) => {
+                        this.transfers.retain(|t| !Arc::ptr_eq(&t.progress, &progress));
+                        done(this, value, cx);
+                        this.report_skipped(&progress, cx);
+                    }
                     Err(_) if progress.is_cancelled() => {
+                        this.transfers.retain(|t| !Arc::ptr_eq(&t.progress, &progress));
                         this.set_info(if verb == "Moving" { "Move cancelled" } else { "Copy cancelled" }, cx);
                         this.reload(cx);
                     }
                     Err(e) => {
-                        this.set_error(format!("{e:#}"), cx);
+                        let retry_progress = progress.clone();
+                        let retry: Retry = Box::new(move |this, cx| {
+                            this.start_transfer(verb, op, retry_progress, true, done, cx);
+                        });
+                        if let Some(t) = this.transfers.iter_mut().find(|t| Arc::ptr_eq(&t.progress, &progress)) {
+                            t.failed = Some(format!("{e:#}"));
+                            t.retry = Some(retry);
+                            t.samples.clear();
+                        }
                         this.reload(cx);
                     }
                 }
@@ -1202,6 +1256,67 @@ impl Browser {
             .ok();
         })
         .detach();
+    }
+
+    /// Notes bytes done for each running transfer (keeps the last 5 s).
+    fn sample_transfers(&mut self) {
+        let now = Instant::now();
+        for t in &mut self.transfers {
+            if t.failed.is_some() || t.progress.is_paused() {
+                t.samples.clear();
+                continue;
+            }
+            t.samples.push_back((now, t.progress.done_bytes.load(std::sync::atomic::Ordering::Relaxed)));
+            while t.samples.front().is_some_and(|(at, _)| now.duration_since(*at) > Duration::from_secs(5)) {
+                t.samples.pop_front();
+            }
+        }
+    }
+
+    /// Adds files that couldn't be read to the finished transfer's message;
+    /// clicking it lists them.
+    fn report_skipped(&mut self, progress: &ops::Progress, cx: &mut Context<Self>) {
+        let skipped = std::mem::take(&mut *progress.skipped.lock().unwrap());
+        if skipped.is_empty() {
+            return;
+        }
+        let message = self.status.take().map(|s| s.message).unwrap_or_default();
+        let n = skipped.len();
+        self.status = Some(Status {
+            message: format!("{message} · {n} couldn't be read (click for details)"),
+            is_error: true,
+            details: skipped.iter().map(|(path, why)| format!("{}: {why}", contract_tilde(path))).collect(),
+        });
+        cx.notify();
+    }
+
+    pub fn toggle_pause_transfers(&mut self, cx: &mut Context<Self>) {
+        let pause = !self.transfers.iter().any(|t| t.progress.is_paused());
+        for t in &self.transfers {
+            t.progress.set_paused(pause);
+        }
+        cx.notify();
+    }
+
+    /// Continues the transfer that stopped.
+    pub fn retry_transfer(&mut self, cx: &mut Context<Self>) {
+        let Some(t) = self.transfers.iter_mut().find(|t| t.failed.is_some()) else { return };
+        t.failed = None;
+        if let Some(retry) = t.retry.take() {
+            retry(self, cx);
+        }
+        cx.notify();
+    }
+
+    /// Gives up on the transfer that stopped, removing its partly copied item.
+    pub fn discard_failed_transfer(&mut self, cx: &mut Context<Self>) {
+        let Some(ix) = self.transfers.iter().position(|t| t.failed.is_some()) else { return };
+        let t = self.transfers.remove(ix);
+        let progress = t.progress.clone();
+        let verb = if t.verb == "Moving" { "Move" } else { "Copy" };
+        cx.background_executor().spawn(async move { progress.discard_partial() }).detach();
+        self.set_info(format!("{verb} abandoned"), cx);
+        self.reload(cx);
     }
 
     fn push_undo(&mut self, op: UndoOp) {
@@ -1266,8 +1381,11 @@ impl Browser {
                 self.run_transfer(
                     "Moving",
                     cx,
-                    move |progress| {
+                    move |progress, _resume| {
                         for (original, current) in &pairs {
+                            if !std::fs::symlink_metadata(current).is_ok() && std::fs::symlink_metadata(original).is_ok() {
+                                continue; // put back before a retry
+                            }
                             let dir = original.parent().context("no parent folder")?;
                             ops::move_into(std::slice::from_ref(current), dir, ops::OnConflict::Fail, progress)?;
                         }
@@ -1724,6 +1842,18 @@ impl Browser {
 
     /// Context menu for the file list. With `on_item`, the clicked row is
     /// already part of the selection.
+    /// Lists the status message's details (e.g. files that couldn't be copied).
+    pub fn open_status_details(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(status) = &self.status else { return };
+        const SHOWN: usize = 30;
+        let mut entries: Vec<MenuEntry> = status.details.iter().take(SHOWN).map(|d| MenuEntry::Header(d.clone())).collect();
+        if status.details.len() > SHOWN {
+            entries.push(MenuEntry::Header(format!("and {} more", status.details.len() - SHOWN)));
+        }
+        self.menu = Some(ContextMenu { position, entries });
+        cx.notify();
+    }
+
     /// Pause / resume / rebuild / turn off the search index.
     pub fn open_index_menu(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         use Command::*;
@@ -2217,16 +2347,20 @@ impl Browser {
         let total = sources.len();
         let dest_name = display_name(&dest);
         let start = move |this: &mut Self, on_conflict: ops::OnConflict, cx: &mut Context<Self>| {
+            // Planned once; a retry continues the same plan.
+            let planned: std::sync::Mutex<Option<Vec<ops::Planned>>> = Default::default();
             this.run_transfer(
                 if moving { "Moving" } else { "Copying" },
                 cx,
-                move |progress| {
-                    if moving {
-                        ops::move_into(&sources, &dest, on_conflict, progress)
-                    } else {
-                        // Copies have no "from" to undo back to.
-                        Ok(ops::copy_into(&sources, &dest, on_conflict, progress)?.into_iter().map(|to| (PathBuf::new(), to)).collect())
+                move |progress, resume| {
+                    let mut planned = planned.lock().unwrap();
+                    if planned.is_none() {
+                        *planned = Some(ops::plan(&sources, &dest, !moving, on_conflict)?);
                     }
+                    let items = planned.as_ref().expect("just planned");
+                    ops::transfer(items, moving, resume, progress)?;
+                    // Copies have no "from" to undo back to.
+                    Ok(items.iter().map(|(from, to)| (if moving { from.clone() } else { PathBuf::new() }, to.clone())).collect())
                 },
                 move |this, moved: Vec<(PathBuf, PathBuf)>, cx| {
                     let created: Vec<PathBuf> = moved.iter().map(|(_, to)| to.clone()).collect();
@@ -2577,6 +2711,25 @@ mod tests {
             size: 0,
             modified: None,
         }
+    }
+
+    #[test]
+    fn transfer_speed_uses_recent_samples() {
+        let start = Instant::now();
+        let mut t = Transfer {
+            verb: "Copying",
+            progress: Arc::default(),
+            started: start,
+            failed: None,
+            retry: None,
+            samples: Default::default(),
+        };
+        assert_eq!(t.speed(), None);
+        t.samples.push_back((start, 0));
+        t.samples.push_back((start + Duration::from_millis(500), 50));
+        assert_eq!(t.speed(), None, "under a second: too early to tell");
+        t.samples.push_back((start + Duration::from_secs(2), 2_000_000));
+        assert_eq!(t.speed(), Some(1_000_000.0));
     }
 
     #[test]
