@@ -103,6 +103,9 @@ impl Default for Config {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SearchConfig {
+    /// Keep the search index. Off: nothing is scanned or watched, and
+    /// search has nothing to search.
+    pub indexing: bool,
     /// Folders to index for search ("Everywhere").
     pub roots: Vec<String>,
     /// Paths to skip, or "**/name" to skip a folder name anywhere.
@@ -117,6 +120,7 @@ impl Default for SearchConfig {
     fn default() -> Self {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect();
         Self {
+            indexing: true,
             roots: s(&["~", "/Applications", "~/Library/Mobile Documents/com~apple~CloudDocs", "~/Library/CloudStorage"]),
             exclude: s(&["~/Library", "~/.Trash", "**/node_modules", "**/.git"]),
             max_results: 10_000,
@@ -302,6 +306,15 @@ impl Config {
         expand_tilde(&self.general.start_path)
     }
 
+    /// Sets `indexing` under `[search]` in the file at `path`, preserving
+    /// the user's comments and formatting elsewhere.
+    pub fn save_search_indexing(path: &Path, on: bool) -> Result<()> {
+        let text = fs::read_to_string(path).unwrap_or_default();
+        let mut doc: toml_edit::DocumentMut = text.parse().with_context(|| format!("parsing {}", path.display()))?;
+        doc["search"]["indexing"] = toml_edit::value(on);
+        fs::write(path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
+    }
+
     /// Rewrites only the `[[favorites]]` section of the file at `path`,
     /// preserving the user's comments and formatting elsewhere.
     pub fn save_favorites(path: &Path, favorites: &[Favorite]) -> Result<()> {
@@ -329,6 +342,22 @@ mod tests {
     fn default_template_matches_default() {
         let cfg: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
         assert_eq!(cfg, Config::default());
+    }
+
+    #[test]
+    fn save_search_indexing_keeps_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, DEFAULT_CONFIG).unwrap();
+        Config::save_search_indexing(&path, false).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert!(!cfg.search.indexing);
+        assert_eq!(cfg.search.roots, SearchConfig::default().roots);
+        assert!(fs::read_to_string(&path).unwrap().contains("# Folders searched by"), "comments kept");
+
+        let bare = dir.path().join("bare.toml");
+        Config::save_search_indexing(&bare, false).unwrap();
+        assert!(!Config::load(&bare).unwrap().search.indexing, "creates the section");
     }
 
     #[test]

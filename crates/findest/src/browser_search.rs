@@ -173,7 +173,12 @@ impl Browser {
         };
         search.error = None;
         let Some(index) = index else {
-            search.note = Some("Building the search index… results will appear when it's ready".into());
+            let enabled = cx.try_global::<IndexService>().is_some_and(|s| s.enabled());
+            search.note = Some(if enabled {
+                "Building the search index… results will appear when it's ready".into()
+            } else {
+                "Search indexing is off. Turn it on from “Search index off” at the right".into()
+            });
             return cx.notify();
         };
         let under = if search.everywhere { None } else { current_dir.as_deref().and_then(|d| index.find(d)) };

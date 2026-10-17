@@ -476,8 +476,7 @@ impl Browser {
         // reload shouldn't flip it.
         config.general.info_panel = self.config.general.info_panel;
         if config.search != self.config.search {
-            gpui::BorrowAppContext::update_global::<crate::search_service::IndexService, _>(cx, |s, _| s.config = config.search.clone());
-            crate::search_service::rebuild_now(cx);
+            crate::search_service::set_config(config.search.clone(), cx);
         }
         let listing_changed = config.general != self.config.general;
         self.theme = theme;
@@ -891,6 +890,26 @@ impl Browser {
             RebuildIndex => {
                 crate::search_service::rebuild_now(cx);
                 self.set_info("Rebuilding the search index…", cx);
+            }
+            PauseIndexing => {
+                crate::search_service::pause(None, cx);
+                self.set_info("Indexing paused until you resume it or quit Findest", cx);
+            }
+            PauseIndexingHour => {
+                crate::search_service::pause(Some(std::time::Duration::from_secs(60 * 60)), cx);
+                self.set_info("Indexing paused for an hour", cx);
+            }
+            ResumeIndexing => {
+                crate::search_service::resume(cx);
+                self.set_info("Indexing resumed", cx);
+            }
+            ToggleIndexing => {
+                let on = !cx.try_global::<crate::search_service::IndexService>().is_some_and(|s| s.enabled());
+                match crate::search_service::set_enabled(on, cx) {
+                    Ok(()) if on => self.set_info("Search indexing is on. Building the index…", cx),
+                    Ok(()) => self.set_info("Search indexing is off. Turn it back on from the Findest menu", cx),
+                    Err(e) => self.set_error(format!("Couldn't save the setting: {e:#}"), cx),
+                }
             }
             Expand => self.expand_selection(cx),
             Collapse => self.collapse_selection(cx),
@@ -1698,6 +1717,36 @@ impl Browser {
 
     /// Context menu for the file list. With `on_item`, the clicked row is
     /// already part of the selection.
+    /// Pause / resume / rebuild / turn off the search index.
+    pub fn open_index_menu(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        use Command::*;
+        let Some(service) = cx.try_global::<crate::search_service::IndexService>() else { return };
+        let mut entries = Vec::new();
+        if !service.enabled() {
+            entries.push(self.item("Turn On Search Indexing", ToggleIndexing, "toggle_indexing"));
+        } else {
+            entries.push(MenuEntry::Header(crate::search_service::status_text(service)));
+            if service.is_paused() {
+                entries.push(self.item("Resume Indexing", ResumeIndexing, "resume_indexing"));
+            } else {
+                entries.push(self.item("Pause Indexing for an Hour", PauseIndexingHour, "pause_indexing_hour"));
+                entries.push(self.item("Pause Indexing", PauseIndexing, "pause_indexing"));
+            }
+            if !service.building {
+                entries.push(self.item("Rebuild Index Now", RebuildIndex, "rebuild_index"));
+            }
+            entries.push(MenuEntry::Separator);
+            entries.push(MenuEntry::Item {
+                label: "Turn Off Search Indexing".into(),
+                detail: None,
+                action: MenuAction::Command(ToggleIndexing),
+                danger: true,
+            });
+        }
+        self.menu = Some(ContextMenu { position, entries });
+        cx.notify();
+    }
+
     pub fn open_list_menu(&mut self, position: Point<Pixels>, on_item: bool, cx: &mut Context<Self>) {
         use Command::*;
         let mut entries = Vec::new();

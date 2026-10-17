@@ -78,6 +78,12 @@ pub enum Command {
     ZoomOut,
     Find,
     RebuildIndex,
+    /// Hold off indexing until resumed (or quit) / for an hour.
+    PauseIndexing,
+    PauseIndexingHour,
+    ResumeIndexing,
+    /// Turn search indexing on or off for good (saved in the config).
+    ToggleIndexing,
     Refresh,
     AddFavorite,
     ShowRecents,
@@ -139,6 +145,10 @@ impl FromStr for Command {
             "zoom_out" => ZoomOut,
             "find" => Find,
             "rebuild_index" => RebuildIndex,
+            "pause_indexing" => PauseIndexing,
+            "pause_indexing_hour" => PauseIndexingHour,
+            "resume_indexing" => ResumeIndexing,
+            "toggle_indexing" => ToggleIndexing,
             "refresh" => Refresh,
             "add_favorite" => AddFavorite,
             "show_recents" => ShowRecents,

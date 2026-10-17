@@ -76,7 +76,7 @@ Typing letters jumps to the first matching name.
 
 ## Search (⌘F)
 
-Findest keeps an in-memory index of file names, a design inspired by FSearch and Everything: flat name-sorted arrays searched on all cores. It indexes about 1.2M files in ~7 s, and most queries finish in a few milliseconds. The index is saved to disk, so search works right away at launch. After that, file changes are applied as they happen by re-reading only the folders involved, and a full rescan runs once a day at background priority, so indexing stays out of the way of everything else. You choose what's indexed in `[search]` in the config.
+Findest keeps an in-memory index of file names, a design inspired by FSearch and Everything: flat name-sorted arrays searched on all cores. It indexes about 1.2M files in ~7 s, and most queries finish in a few milliseconds. The index is saved to disk, so search works right away at launch. After that, file changes are applied as they happen by re-reading only the folders involved, and a full rescan runs once a day at background priority, so indexing stays out of the way of everything else. While a scan runs the status bar shows its progress; click it to pause indexing (for an hour, or until you resume) or turn it off for good (`indexing = false` under `[search]`). You choose what's indexed in `[search]` in the config.
 
 | Query | Matches |
 |---|---|

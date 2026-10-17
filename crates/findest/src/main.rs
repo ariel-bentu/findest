@@ -37,6 +37,11 @@ fn menus() -> Vec<Menu> {
             items: vec![
                 item("Settings…", "open_config"),
                 MenuItem::separator(),
+                item("Pause Search Indexing", "pause_indexing"),
+                item("Resume Search Indexing", "resume_indexing"),
+                item("Rebuild Search Index", "rebuild_index"),
+                item("Turn Search Indexing On/Off", "toggle_indexing"),
+                MenuItem::separator(),
                 MenuItem::os_submenu("Services", SystemMenuType::Services),
                 MenuItem::separator(),
                 MenuItem::action("Quit Findest", Quit),

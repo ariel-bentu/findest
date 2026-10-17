@@ -6,17 +6,21 @@
 //! involved are re-read. A full rescan runs once a day (or when FSEvents
 //! drops events, or many changes have piled up), on few threads at
 //! background priority.
+//!
+//! Indexing can be paused for a while (not remembered across launches) or
+//! turned off in the config (`search.indexing`).
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use anyhow::Result;
 use findest_core::config::{Config, SearchConfig};
 use findest_core::search::index::in_background;
 use findest_core::search::{Excludes, Index};
-use gpui::{App, AsyncApp, Global};
+use gpui::{App, AsyncApp, BorrowAppContext, Global};
 use notify::{RecursiveMode, Watcher};
 
 /// Rescan from scratch this often (Unix seconds).
@@ -25,6 +29,8 @@ const FULL_SCAN_INTERVAL: i64 = 24 * 60 * 60;
 const UPDATE_INTERVAL: Duration = Duration::from_secs(3);
 /// Entries added or removed since the last full scan before one runs early.
 const MAX_CHANGED: usize = 200_000;
+/// Changed paths kept while paused before settling for a full rescan.
+const MAX_PENDING: usize = 100_000;
 
 pub struct IndexService {
     pub index: Option<Arc<Index>>,
@@ -34,11 +40,40 @@ pub struct IndexService {
     /// Bumped whenever `index` is replaced, so searches can re-run.
     pub generation: u64,
     pub config: SearchConfig,
+    pub pause: Option<Pause>,
+    /// A full scan should run as soon as indexing may (at launch, or after
+    /// one was interrupted).
+    scan_needed: bool,
+    /// Stops the scan in progress.
+    cancel: Arc<AtomicBool>,
+    /// Set while indexing is off, so a save finishing late removes its file.
+    off: Arc<AtomicBool>,
     pending: Arc<Mutex<Pending>>,
     _watcher: Option<notify::RecommendedWatcher>,
 }
 
 impl Global for IndexService {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pause {
+    /// Until resumed (or findest quits).
+    UntilResumed,
+    Until(Instant),
+}
+
+impl IndexService {
+    pub fn enabled(&self) -> bool {
+        self.config.indexing
+    }
+
+    pub fn is_paused(&self) -> bool {
+        match self.pause {
+            None => false,
+            Some(Pause::UntilResumed) => true,
+            Some(Pause::Until(t)) => Instant::now() < t,
+        }
+    }
+}
 
 /// Changes reported by FSEvents, waiting to be applied.
 #[derive(Default)]
@@ -48,60 +83,134 @@ struct Pending {
     rescan: bool,
 }
 
+enum Work {
+    Scan,
+    Apply(HashSet<PathBuf>),
+}
+
 pub fn init(cx: &mut App) {
     let config = Config::load(&Config::path()).unwrap_or_default().search;
     let pending = Arc::new(Mutex::new(Pending::default()));
-    let watcher = watch_roots(&config, pending.clone());
+    let enabled = config.indexing;
+    let watcher = enabled.then(|| watch_roots(&config, pending.clone())).flatten();
     cx.set_global(IndexService {
         index: None,
         building: false,
         progress: Arc::new(AtomicUsize::new(0)),
         generation: 0,
         config,
+        pause: None,
+        scan_needed: enabled,
+        cancel: Arc::default(),
+        off: Arc::new(AtomicBool::new(!enabled)),
         pending,
         _watcher: watcher,
     });
 
-    let cached = cx.background_executor().spawn(async { Index::load(&Index::default_path()).ok() });
+    let cached = cx.background_executor().spawn(async move { enabled.then(|| Index::load(&Index::default_path()).ok()).flatten() });
     cx.spawn(async move |cx| {
         if let Some(index) = cached.await {
             publish(cx, index);
         }
-        rebuild(cx).await;
         loop {
-            cx.background_executor().timer(UPDATE_INTERVAL).await;
-            let Ok(Some((full_scan_due, paths))) = cx.read_global::<IndexService, _>(|s, _| {
-                if s.building {
-                    return None;
-                }
-                let mut pending = s.pending.lock().unwrap();
-                let stale = s.index.as_ref().is_none_or(|i| {
-                    chrono::Utc::now().timestamp() - i.built_at >= FULL_SCAN_INTERVAL || i.changed_count() > MAX_CHANGED
-                });
-                Some((pending.rescan || stale, std::mem::take(&mut pending.paths)))
-            }) else {
-                continue;
-            };
-            if full_scan_due {
-                rebuild(cx).await;
-            } else if !paths.is_empty() {
-                apply_changes(cx, paths).await;
+            match next_work(cx) {
+                Some(Work::Scan) => rebuild(cx).await,
+                Some(Work::Apply(paths)) => apply_changes(cx, paths).await,
+                None => {}
             }
+            cx.background_executor().timer(UPDATE_INTERVAL).await;
         }
     })
     .detach();
 }
 
-/// Rebuilds now (e.g. after the search config changed).
+/// What the index needs now, if indexing is on and not paused.
+fn next_work(cx: &mut AsyncApp) -> Option<Work> {
+    let expired = cx.read_global::<IndexService, _>(|s, _| s.pause.is_some() && !s.is_paused()).ok()?;
+    if expired {
+        // Notifies windows, so they stop showing the pause.
+        cx.update_global::<IndexService, _>(|s, _| s.pause = None).ok()?;
+    }
+    cx.read_global::<IndexService, _>(|s, _| {
+        if s.building || !s.enabled() || s.is_paused() {
+            return None;
+        }
+        let mut pending = s.pending.lock().unwrap();
+        let stale = s.scan_needed
+            || pending.rescan
+            || s.index.as_ref().is_none_or(|i| {
+                chrono::Utc::now().timestamp() - i.built_at >= FULL_SCAN_INTERVAL || i.changed_count() > MAX_CHANGED
+            });
+        if stale {
+            Some(Work::Scan)
+        } else {
+            Some(Work::Apply(std::mem::take(&mut pending.paths))).filter(|w| matches!(w, Work::Apply(p) if !p.is_empty()))
+        }
+    })
+    .ok()
+    .flatten()
+}
+
+/// Rebuilds now (the user asked for it). Lifts a pause.
 pub fn rebuild_now(cx: &mut App) {
     let Some(service) = cx.try_global::<IndexService>() else { return };
-    if service.building {
+    if service.building || !service.enabled() {
         return;
     }
-    // The roots or excludes may have changed.
-    let watcher = watch_roots(&service.config, service.pending.clone());
-    cx.global_mut::<IndexService>()._watcher = watcher;
+    cx.update_global::<IndexService, _>(|s, _| s.pause = None);
     cx.spawn(async move |cx| rebuild(cx).await).detach();
+}
+
+/// Holds off scans and updates for `duration`, or until resumed. A scan in
+/// progress stops and runs again afterwards; changes keep being noted.
+pub fn pause(duration: Option<Duration>, cx: &mut App) {
+    cx.update_global::<IndexService, _>(|s, _| {
+        s.pause = Some(duration.map_or(Pause::UntilResumed, |d| Pause::Until(Instant::now() + d)));
+        s.cancel.store(true, Ordering::Relaxed);
+    });
+}
+
+pub fn resume(cx: &mut App) {
+    cx.update_global::<IndexService, _>(|s, _| s.pause = None);
+}
+
+/// Turns indexing on or off for good, by saving it in the config file.
+pub fn set_enabled(on: bool, cx: &mut App) -> Result<()> {
+    Config::save_search_indexing(&Config::path(), on)?;
+    let mut config = cx.global::<IndexService>().config.clone();
+    config.indexing = on;
+    set_config(config, cx);
+    Ok(())
+}
+
+/// Takes in a changed `[search]` config (every window reports the same
+/// change, so repeats are ignored).
+pub fn set_config(config: SearchConfig, cx: &mut App) {
+    let Some(service) = cx.try_global::<IndexService>() else { return };
+    if service.config == config {
+        return;
+    }
+    let was_enabled = service.enabled();
+    let scope_changed = service.config.roots != config.roots || service.config.exclude != config.exclude;
+    cx.update_global::<IndexService, _>(|s, cx| {
+        s.config = config;
+        if !s.enabled() {
+            // Off: stop everything and drop the index, saved copy included.
+            s.cancel.store(true, Ordering::Relaxed);
+            s.off.store(true, Ordering::Relaxed);
+            s._watcher = None;
+            s.index = None;
+            s.pause = None;
+            s.generation += 1;
+            *s.pending.lock().unwrap() = Pending::default();
+            cx.background_executor().spawn(async { std::fs::remove_file(Index::default_path()) }).detach();
+        } else if !was_enabled || scope_changed {
+            s.off.store(false, Ordering::Relaxed);
+            s._watcher = watch_roots(&s.config, s.pending.clone());
+            s.scan_needed = true;
+            s.cancel.store(true, Ordering::Relaxed); // a scan in progress has the old scope
+        }
+    });
 }
 
 fn publish(cx: &mut AsyncApp, index: Index) {
@@ -113,21 +222,24 @@ fn publish(cx: &mut AsyncApp, index: Index) {
 }
 
 async fn rebuild(cx: &mut AsyncApp) {
-    let Ok((config, progress)) = cx.update_global::<IndexService, _>(|s, _| {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let Ok((config, progress, off)) = cx.update_global::<IndexService, _>(|s, _| {
         s.building = true;
+        s.scan_needed = false;
+        s.cancel = cancel.clone();
         s.progress.store(0, Ordering::Relaxed);
         // The scan sees everything up to now; changes during it stay queued.
         *s.pending.lock().unwrap() = Pending::default();
-        (s.config.clone(), s.progress.clone())
+        (s.config.clone(), s.progress.clone(), s.off.clone())
     }) else {
         return;
     };
 
     let scan = cx.background_executor().spawn({
-        let progress = progress.clone();
+        let (progress, cancel) = (progress.clone(), cancel.clone());
         async move {
             let excludes = Excludes::new(&config.exclude);
-            in_background(|| Index::build(&config.root_paths(), &excludes, &progress, &Default::default()))
+            in_background(|| Index::build(&config.root_paths(), &excludes, &progress, &cancel))
         }
     });
     // Tick while scanning so windows can show progress.
@@ -142,8 +254,29 @@ async fn rebuild(cx: &mut AsyncApp) {
     let index = Arc::new(scan.await);
     drop(ticker);
 
+    if cancel.load(Ordering::Relaxed) {
+        // Paused, turned off or rescoped: keep the previous index; scan again when allowed.
+        cx.update_global::<IndexService, _>(|s, _| {
+            s.building = false;
+            s.scan_needed = s.enabled();
+        })
+        .ok();
+        return;
+    }
     let saved = index.clone();
-    cx.background_executor().spawn(async move { in_background(|| saved.save(&Index::default_path())) }).detach();
+    cx.background_executor()
+        .spawn(async move {
+            in_background(|| {
+                let path = Index::default_path();
+                let result = saved.save(&path);
+                // Turned off while saving: don't leave it behind.
+                if off.load(Ordering::Relaxed) {
+                    let _ = std::fs::remove_file(&path);
+                }
+                result
+            })
+        })
+        .detach();
     cx.update_global::<IndexService, _>(|s, _| {
         s.index = Some(index);
         s.building = false;
@@ -199,7 +332,13 @@ fn watch_roots(config: &SearchConfig, pending: Arc<Mutex<Pending>>) -> Option<no
         let mut pending = pending.lock().unwrap();
         // FSEvents lost track of changes (under these paths): rescan everything.
         pending.rescan |= rescan && (unscoped || !relevant.is_empty());
-        pending.paths.extend(relevant);
+        if pending.rescan || pending.paths.len() > MAX_PENDING {
+            // A full rescan is coming anyway (e.g. after a long pause).
+            pending.rescan = true;
+            pending.paths.clear();
+        } else {
+            pending.paths.extend(relevant);
+        }
     })
     .ok()?;
     for root in config.root_paths() {
@@ -208,8 +347,21 @@ fn watch_roots(config: &SearchConfig, pending: Arc<Mutex<Pending>>) -> Option<no
     Some(watcher)
 }
 
-/// "1.2M items · updated 3 min ago" / "Indexing… 340,000 items".
+/// "1.2M items · updated 3 min ago" / "Indexing… 340,000 items" /
+/// "Indexing paused" / "Search index off".
 pub fn status_text(service: &IndexService) -> String {
+    if !service.enabled() {
+        return "Search index off".into();
+    }
+    if service.is_paused() {
+        return match service.pause {
+            Some(Pause::Until(t)) => {
+                let mins = t.saturating_duration_since(Instant::now()).as_secs().div_ceil(60);
+                format!("Indexing paused · resumes in {mins} min")
+            }
+            _ => "Indexing paused".into(),
+        };
+    }
     if service.building {
         let n = service.progress.load(Ordering::Relaxed) as u64;
         return format!("Indexing… {} items", findest_core::info::group_digits(n));

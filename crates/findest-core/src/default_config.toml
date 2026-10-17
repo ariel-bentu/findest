@@ -72,6 +72,9 @@ for = "files"
 
 # Search (⌘F). Findest keeps an index of file names for instant results.
 [search]
+# Keep a search index. Set to false to turn search indexing off (search then
+# has nothing to search).
+indexing = true
 # Folders searched by "Everywhere". Cloud drives are listed explicitly because
 # ~/Library is excluded below.
 roots = ["~", "/Applications", "~/Library/Mobile Documents/com~apple~CloudDocs", "~/Library/CloudStorage"]

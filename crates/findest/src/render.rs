@@ -369,8 +369,14 @@ impl Browser {
                         .text_color(theme.text_muted)
                         .cursor_pointer()
                         .hover(|s| s.text_color(theme.text))
-                        .tooltip(tooltip("Rebuild the search index"))
-                        .on_click(cx.listener(|this, _, window, cx| this.run(crate::command::Command::RebuildIndex, window, cx)))
+                        .tooltip(tooltip("Search index options"))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.open_index_menu(Point { x: e.position.x - px(120.), y: e.position.y + px(14.) }, cx);
+                            }),
+                        )
                         .child(status)
                 })),
         )
@@ -1439,10 +1445,40 @@ impl Browser {
             .child(div().flex_none().whitespace_nowrap().child(summary))
             .child(div().flex_1().min_w_0().flex().justify_end().text_color(color).truncate().child(message))
             .children(self.render_type_ahead())
+            .children(self.render_index_activity(cx))
             .children(self.render_transfers(cx))
             .children(self.render_clipboard(cx))
             .children(capacity.map(|c| div().flex_none().whitespace_nowrap().child(c)))
             .when(self.view == ViewMode::Tiles, |d| d.child(self.render_tile_slider(cx)))
+    }
+
+    /// "Indexing… 340,000 items" while a full scan runs, or the pause; click
+    /// for the index menu. Nothing when idle or turned off.
+    fn render_index_activity(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let service = cx.try_global::<crate::search_service::IndexService>()?;
+        if !service.enabled() || !(service.building || service.is_paused()) {
+            return None;
+        }
+        let theme = &self.theme;
+        Some(
+            div()
+                .id("index-activity")
+                .flex_none()
+                .whitespace_nowrap()
+                .px_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.hover).text_color(theme.text))
+                .tooltip(tooltip("Pause, resume or turn off search indexing"))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.open_index_menu(Point { x: e.position.x - px(120.), y: e.position.y - px(150.) }, cx);
+                    }),
+                )
+                .child(crate::search_service::status_text(service)),
+        )
     }
 
     /// Progress of running copies/moves, with a cancel button. Quick ones
