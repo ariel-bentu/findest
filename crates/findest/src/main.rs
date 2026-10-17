@@ -153,6 +153,7 @@ fn initial_windows(start: Option<PathBuf>) -> Vec<BrowserInit> {
                 info_panel: session.info_panel,
                 view: w.view,
                 tile_size: w.tile_size,
+                columns: w.columns,
             })
             .collect()
     } else {

@@ -11,12 +11,12 @@ use findest_core::paths::contract_tilde;
 use findest_core::config::ViewMode;
 use gpui::{
     AnyElement, Bounds, Context, DispatchPhase, ExternalPaths, FontWeight, Hsla, Image, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Point, SharedString, Window, anchored, canvas, deferred, div, img,
+    CursorStyle, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Point, SharedString, Window, anchored, canvas, deferred, div, img,
     prelude::*, px, uniform_list,
 };
 
 use crate::browser::{
-    Browser, EditKind, GoToTarget, Location, MAX_TILE, MIN_TILE, MenuAction, MenuEntry, count_label, go_to_target,
+    Browser, Column, EditKind, GoToTarget, Location, MAX_TILE, MIN_TILE, MenuAction, MenuEntry, count_label, go_to_target,
 };
 use crate::command::BROWSER_CONTEXT;
 
@@ -25,9 +25,10 @@ const INFO_PANEL_WIDTH: f32 = 270.0;
 /// Images up to this size are previewed in the info panel.
 const MAX_PREVIEW_BYTES: u64 = 64 * 1024 * 1024;
 const TOP_BAR_HEIGHT: f32 = 44.0;
-const COL_MODIFIED: f32 = 170.0;
-const COL_SIZE: f32 = 90.0;
-const COL_KIND: f32 = 130.0;
+/// Header padding right of the last column (rows line up with it).
+const HEADER_PAD_RIGHT: f32 = 8.0;
+/// Grab width of a column edge in the header.
+const COLUMN_HANDLE: f32 = 8.0;
 /// Width of the disclosure-triangle column, and the indent per tree level.
 const TREE_GUTTER: f32 = 14.0;
 const TREE_INDENT: f32 = 16.0;
@@ -873,19 +874,81 @@ impl Browser {
             .items_center()
             .h(px(theme.row_height))
             .pl(px(TREE_GUTTER + 34.))
-            .pr_2()
+            .pr(px(HEADER_PAD_RIGHT))
             .border_b_1()
             .border_color(theme.border)
             .text_size(px(theme.font_size - 1.))
             .text_color(theme.text_muted)
+            .relative()
             .child(column("h-name", "Name", Some(SortKey::Name), None, false))
-            .child(column("h-modified", "Date Modified", Some(SortKey::Modified), Some(COL_MODIFIED), false))
-            .child(column("h-size", "Size", Some(SortKey::Size), Some(COL_SIZE), true))
+            .child(column("h-modified", "Date Modified", Some(SortKey::Modified), Some(self.columns.modified), false))
+            .child(column("h-size", "Size", Some(SortKey::Size), Some(self.columns.size), true))
             .child(if recents {
-                column("h-where", "Where", None, Some(COL_KIND), false)
+                column("h-where", "Where", None, Some(self.columns.kind), false)
             } else {
-                column("h-kind", "Kind", Some(SortKey::Kind), Some(COL_KIND), false)
+                column("h-kind", "Kind", Some(SortKey::Kind), Some(self.columns.kind), false)
             })
+            .children(self.column_handles(cx))
+    }
+
+    /// Draggable left edges of the fixed-width columns (double-click resets).
+    fn column_handles(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let theme = &self.theme;
+        let mut right = HEADER_PAD_RIGHT;
+        let mut handles = Vec::new();
+        for (id, column) in [("edge-kind", Column::Kind), ("edge-size", Column::Size), ("edge-modified", Column::Modified)] {
+            right += self.column_width(column);
+            let dragging = self.column_drag.is_some();
+            handles.push(
+                div()
+                    .id(id)
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right(px(right - COLUMN_HANDLE / 2.))
+                    .w(px(COLUMN_HANDLE))
+                    .flex()
+                    .justify_center()
+                    .cursor(CursorStyle::ResizeLeftRight)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            if e.click_count == 2 {
+                                this.reset_column(column, cx);
+                            } else {
+                                this.start_column_drag(column, e.position.x);
+                            }
+                        }),
+                    )
+                    .child(div().w(px(1.)).my_1().bg(theme.border).when(dragging, |d| d.bg(theme.text_muted)))
+                    .into_any_element(),
+            );
+        }
+        // Track the drag anywhere in the window, not just over the header.
+        let this = cx.entity().downgrade();
+        handles.push(
+            canvas(
+                |_, _, _| (),
+                move |_, (), window, _| {
+                    let moved = this.clone();
+                    window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+                        if phase == DispatchPhase::Bubble && e.pressed_button == Some(MouseButton::Left) {
+                            moved.update(cx, |b, cx| b.drag_column(e.position.x, cx)).ok();
+                        }
+                    });
+                    window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                        if phase == DispatchPhase::Bubble {
+                            this.update(cx, |b, cx| b.end_column_drag(cx)).ok();
+                        }
+                    });
+                },
+            )
+            .absolute()
+            .size_full()
+            .into_any_element(),
+        );
+        handles
     }
 
     fn tile_cell_width(&self) -> f32 {
@@ -1101,7 +1164,7 @@ impl Browser {
             .child(name)
             .child(
                 div()
-                    .w(px(COL_MODIFIED))
+                    .w(px(self.columns.modified))
                     .flex_none()
                     .px_2()
                     .truncate()
@@ -1110,7 +1173,7 @@ impl Browser {
             )
             .child(
                 div()
-                    .w(px(COL_SIZE))
+                    .w(px(self.columns.size))
                     .flex_none()
                     .px_2()
                     .flex()
@@ -1119,7 +1182,7 @@ impl Browser {
                     .text_color(muted)
                     .child(if entry.is_dir || entry.is_package { "--".into() } else { format_size(entry.size) }),
             )
-            .child(div().w(px(COL_KIND)).flex_none().px_2().truncate().text_color(muted).child(last_column))
+            .child(div().w(px(self.columns.kind)).flex_none().px_2().truncate().text_color(muted).child(last_column))
             .into_any_element()
     }
 

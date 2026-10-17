@@ -20,6 +20,28 @@ pub struct WindowSession {
     /// List or tiles; `None` defers to the config.
     pub view: Option<ViewMode>,
     pub tile_size: Option<f32>,
+    pub columns: Option<ColumnWidths>,
+}
+
+/// List view column widths in points; Name takes the rest.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ColumnWidths {
+    pub modified: f32,
+    pub size: f32,
+    /// Kind, or Where in Recents and search results.
+    pub kind: f32,
+}
+
+impl ColumnWidths {
+    pub const MIN: f32 = 40.0;
+    pub const MAX: f32 = 800.0;
+}
+
+impl Default for ColumnWidths {
+    fn default() -> Self {
+        ColumnWidths { modified: 170.0, size: 90.0, kind: 130.0 }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

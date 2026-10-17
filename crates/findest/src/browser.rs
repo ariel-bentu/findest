@@ -12,7 +12,7 @@ use findest_core::listing::{self, Entry};
 use findest_core::locations::{self, Place};
 use findest_core::paths::{contract_tilde, display_name, home_dir};
 use findest_core::recents::Recents;
-use findest_core::session::{Session, WindowSession};
+use findest_core::session::{ColumnWidths, Session, WindowSession};
 use findest_core::{launch, ops};
 use futures::StreamExt;
 use gpui::{
@@ -35,6 +35,22 @@ pub struct BrowserInit {
     pub info_panel: Option<bool>,
     pub view: Option<ViewMode>,
     pub tile_size: Option<f32>,
+    pub columns: Option<ColumnWidths>,
+}
+
+/// A resizable list column (Name takes whatever is left).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Column {
+    Modified,
+    Size,
+    Kind,
+}
+
+/// Dragging a column's left edge: moving right narrows it.
+pub struct ColumnDrag {
+    column: Column,
+    start_x: Pixels,
+    start_width: f32,
 }
 
 /// Tile size range (points), and the step for ⌘= / ⌘-.
@@ -240,6 +256,9 @@ pub struct Browser {
     pub(crate) expanded: HashSet<PathBuf>,
     pub(crate) view: ViewMode,
     pub(crate) tile_size: f32,
+    pub(crate) columns: ColumnWidths,
+    /// A list column's edge is being dragged.
+    pub(crate) column_drag: Option<ColumnDrag>,
     /// Tiles per row, as last laid out; arrow keys move by this much vertically.
     pub(crate) tile_columns: usize,
     /// The tile size slider is being dragged.
@@ -379,6 +398,8 @@ impl Browser {
             expanded: init.expanded.into_iter().collect(),
             view,
             tile_size,
+            columns: init.columns.unwrap_or_default(),
+            column_drag: None,
             tile_columns: 1,
             tile_slider_drag: false,
             loading: false,
@@ -556,6 +577,7 @@ impl Browser {
             expanded: self.expanded.iter().cloned().collect(),
             view: Some(self.view),
             tile_size: Some(self.tile_size),
+            columns: Some(self.columns),
         }
     }
 
@@ -991,6 +1013,7 @@ impl Browser {
                     info_panel: Some(self.config.general.info_panel),
                     view: Some(self.view),
                     tile_size: Some(self.tile_size),
+                    columns: Some(self.columns),
                     ..Default::default()
                 };
                 cx.defer(move |cx| {
@@ -1060,6 +1083,7 @@ impl Browser {
                     info_panel: Some(self.config.general.info_panel),
                     view: Some(self.view),
                     tile_size: Some(self.tile_size),
+                    columns: Some(self.columns),
                     ..Default::default()
                 };
                 cx.defer(move |cx| {
@@ -1967,6 +1991,56 @@ impl Browser {
     }
 
     pub fn tile_size_committed(&mut self, cx: &mut Context<Self>) {
+        self.save_session(cx);
+    }
+
+    pub fn column_width(&self, column: Column) -> f32 {
+        match column {
+            Column::Modified => self.columns.modified,
+            Column::Size => self.columns.size,
+            Column::Kind => self.columns.kind,
+        }
+    }
+
+    fn set_column_width(&mut self, column: Column, width: f32, cx: &mut Context<Self>) {
+        let width = width.clamp(ColumnWidths::MIN, ColumnWidths::MAX).round();
+        let slot = match column {
+            Column::Modified => &mut self.columns.modified,
+            Column::Size => &mut self.columns.size,
+            Column::Kind => &mut self.columns.kind,
+        };
+        if *slot != width {
+            *slot = width;
+            cx.notify();
+        }
+    }
+
+    pub fn start_column_drag(&mut self, column: Column, x: Pixels) {
+        self.column_drag = Some(ColumnDrag { column, start_x: x, start_width: self.column_width(column) });
+    }
+
+    /// Follows the mouse while a column edge is dragged (the session is saved on release).
+    pub fn drag_column(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let Some(drag) = &self.column_drag else { return };
+        let (column, width) = (drag.column, drag.start_width - f32::from(x - drag.start_x));
+        self.set_column_width(column, width, cx);
+    }
+
+    pub fn end_column_drag(&mut self, cx: &mut Context<Self>) {
+        if self.column_drag.take().is_some() {
+            self.save_session(cx);
+        }
+    }
+
+    /// Double-clicking a column edge restores its default width.
+    pub fn reset_column(&mut self, column: Column, cx: &mut Context<Self>) {
+        let defaults = ColumnWidths::default();
+        let width = match column {
+            Column::Modified => defaults.modified,
+            Column::Size => defaults.size,
+            Column::Kind => defaults.kind,
+        };
+        self.set_column_width(column, width, cx);
         self.save_session(cx);
     }
 
