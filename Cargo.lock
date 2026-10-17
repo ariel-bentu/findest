@@ -1718,6 +1718,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "dirs 6.0.0",
+ "libc",
  "memchr",
  "rayon",
  "regex",

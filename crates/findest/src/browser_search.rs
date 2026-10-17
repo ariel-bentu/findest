@@ -26,6 +26,8 @@ pub struct SearchUi {
     /// Files read so far for `content:`.
     pub scanned: Arc<AtomicUsize>,
     pub has_content: bool,
+    /// The results shown are for the current query.
+    has_results: bool,
     cancel: Arc<AtomicBool>,
     _task: Option<Task<()>>,
     _ticker: Option<Task<()>>,
@@ -93,6 +95,7 @@ impl Browser {
             total: 0,
             scanned: Arc::new(AtomicUsize::new(0)),
             has_content: false,
+            has_results: false,
             cancel: Arc::new(AtomicBool::new(false)),
             _task: None,
             _ticker: None,
@@ -135,6 +138,12 @@ impl Browser {
 
     /// (Re)runs the current query in the background; results replace `entries`.
     pub fn run_search(&mut self, cx: &mut Context<Self>) {
+        self.start_search(false, cx);
+    }
+
+    /// `refresh`: the index changed under an unchanged query, so keep the
+    /// selection and scroll position.
+    fn start_search(&mut self, refresh: bool, cx: &mut Context<Self>) {
         let current_dir = self.current_dir();
         let include_hidden = self.config.general.show_hidden;
         let max_results = self.config.search.max_results.max(1);
@@ -144,6 +153,9 @@ impl Browser {
         search.cancel.store(true, Ordering::Relaxed);
         search.cancel = Arc::new(AtomicBool::new(false));
         let text = search.input.read(cx).text().trim().to_string();
+        if !refresh {
+            search.has_results = false;
+        }
 
         if text.is_empty() {
             search.error = None;
@@ -180,7 +192,7 @@ impl Browser {
         });
         search._task = Some(cx.spawn(async move |this, cx| {
             let Some((entries, total)) = work.await else { return };
-            this.update(cx, |this, cx| this.show_results(entries, total, cx)).ok();
+            this.update(cx, |this, cx| this.show_results(entries, total, refresh, cx)).ok();
         }));
         // Content searches can take a while: refresh the progress line.
         search._ticker = query_is_slow(search).then(|| {
@@ -202,27 +214,37 @@ impl Browser {
         cx.notify();
     }
 
-    fn show_results(&mut self, entries: Vec<Entry>, total: usize, cx: &mut Context<Self>) {
+    fn show_results(&mut self, entries: Vec<Entry>, total: usize, refresh: bool, cx: &mut Context<Self>) {
         let Some(search) = &mut self.search else { return };
         search.running = false;
+        search.has_results = true;
         search.total = total;
         self.depths = vec![0; entries.len()];
         self.expandable = vec![false; entries.len()];
         self.entries = entries;
-        self.selected.clear();
-        self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+        if refresh {
+            let shown: std::collections::HashSet<&std::path::Path> = self.entries.iter().map(|e| e.path.as_path()).collect();
+            self.selected.retain(|p| shown.contains(p.as_path()));
+        } else {
+            self.selected.clear();
+            self.scroll.scroll_to_item(0, ScrollStrategy::Top);
+        }
         self.loading = false;
         self.load_error = None;
         cx.notify();
     }
 
-    /// The index was rebuilt: refresh results so they reflect the disk.
+    /// The index changed: refresh results so they reflect the disk. Content
+    /// searches read files, so they aren't repeated on every change (only
+    /// when they never got to run).
     pub fn on_index_updated(&mut self, cx: &mut Context<Self>) {
         let generation = cx.try_global::<IndexService>().map(|s| s.generation).unwrap_or(0);
         if generation != self.index_generation {
             self.index_generation = generation;
-            if self.search_active(cx) {
-                self.run_search(cx);
+            let Some(search) = &self.search else { return cx.notify() };
+            let (rerun, refresh) = (!search.has_content || (!search.running && !search.has_results), search.has_results);
+            if rerun && self.search_active(cx) {
+                self.start_search(refresh, cx);
             }
         }
         cx.notify();

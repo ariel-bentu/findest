@@ -13,6 +13,7 @@ toml_edit.workspace = true
 dirs.workspace = true
 trash.workspace = true
 rayon.workspace = true
+libc.workspace = true
 regex.workspace = true
 memchr.workspace = true
 chrono.workspace = true

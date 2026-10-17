@@ -153,20 +153,23 @@ pub fn search(
     cancel: &AtomicBool,
 ) -> Option<SearchResult> {
     let include_hidden = opts.include_hidden || query.wants_hidden;
-    let pass1: Vec<(u32, Tri)> = (0..index.len() as u32)
-        .into_par_iter()
-        .with_min_len(4096)
-        .map_init(Scratch::default, |scratch, id| {
-            if cancel.load(Ordering::Relaxed) || (!include_hidden && index.in_hidden_tree(id)) {
-                return None;
-            }
-            let ctx = Ctx { index, id, content: None };
-            let verdict = ctx.eval(&query.root, scratch);
-            // Scope check last: it walks parents, the query is usually cheaper.
-            (verdict != Tri::No && opts.under.is_none_or(|dir| id != dir && index.is_under(id, dir))).then_some((id, verdict))
-        })
-        .flatten()
-        .collect();
+    let check = |scratch: &mut Scratch, id: u32| {
+        if cancel.load(Ordering::Relaxed) || index.is_removed(id) || (!include_hidden && index.in_hidden_tree(id)) {
+            return None;
+        }
+        let ctx = Ctx { index, id, content: None };
+        let verdict = ctx.eval(&query.root, scratch);
+        // Scope check last: it walks parents, the query is usually cheaper.
+        (verdict != Tri::No && opts.under.is_none_or(|dir| id != dir && index.is_under(id, dir))).then_some((id, verdict))
+    };
+    let mut pass1: Vec<(u32, Tri)> =
+        index.scanned_ids().into_par_iter().with_min_len(4096).map_init(Scratch::default, check).flatten().collect();
+    // Entries added since the full scan aren't in name order: sort and merge them in.
+    let mut added: Vec<(u32, Tri)> = index.added_ids().into_par_iter().map_init(Scratch::default, check).flatten().collect();
+    if !added.is_empty() {
+        added.sort_by(|a, b| index.cmp_ids(a.0, b.0));
+        pass1 = index.merge_sorted(pass1, added, |&(id, _)| id);
+    }
     if cancel.load(Ordering::Relaxed) {
         return None;
     }
