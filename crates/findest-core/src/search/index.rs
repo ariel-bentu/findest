@@ -36,7 +36,7 @@ pub const FLAG_PACKAGE: u8 = 8;
 pub const FLAG_HIDDEN_TREE: u8 = 16;
 
 const UF_HIDDEN: u32 = 0x8000;
-const PACKAGE_EXTENSIONS: &[&str] = &["app", "bundle", "framework", "plugin", "kext", "xcarchive", "photoslibrary"];
+pub(crate) const PACKAGE_EXTENSIONS: &[&str] = &["app", "bundle", "framework", "plugin", "kext", "xcarchive", "photoslibrary"];
 
 /// Paths and folder names left out of the index.
 #[derive(Clone, Debug, Default)]
@@ -59,7 +59,7 @@ impl Excludes {
         ex
     }
 
-    fn excludes(&self, path: &Path, name: &str) -> bool {
+    pub(crate) fn excludes(&self, path: &Path, name: &str) -> bool {
         self.names.iter().any(|n| n == name) || self.paths.iter().any(|p| p == path)
     }
 

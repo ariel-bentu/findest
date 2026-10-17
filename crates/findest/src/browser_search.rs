@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use findest_core::listing::Entry;
-use findest_core::search::{self, SearchOptions};
+use findest_core::search::{self, Excludes, LiveProgress, SearchOptions};
 use gpui::{AppContext, Context, Entity, Focusable, ScrollStrategy, Subscription, Task, Window};
 
 use crate::browser::{Browser, Location};
@@ -28,6 +28,10 @@ pub struct SearchUi {
     pub has_content: bool,
     /// The results shown are for the current query.
     has_results: bool,
+    /// Always search the disk directly instead of the index.
+    pub live: bool,
+    /// The running (or last) search walks the disk; its progress.
+    pub live_progress: Option<Arc<LiveProgress>>,
     cancel: Arc<AtomicBool>,
     _task: Option<Task<()>>,
     _ticker: Option<Task<()>>,
@@ -96,6 +100,8 @@ impl Browser {
             scanned: Arc::new(AtomicUsize::new(0)),
             has_content: false,
             has_results: false,
+            live: false,
+            live_progress: None,
             cancel: Arc::new(AtomicBool::new(false)),
             _task: None,
             _ticker: None,
@@ -136,6 +142,14 @@ impl Browser {
         self.run_search(cx);
     }
 
+    /// Searches the disk directly (no index) when on.
+    pub fn toggle_live_search(&mut self, cx: &mut Context<Self>) {
+        if let Some(search) = &mut self.search {
+            search.live = !search.live;
+        }
+        self.run_search(cx);
+    }
+
     /// (Re)runs the current query in the background; results replace `entries`.
     pub fn run_search(&mut self, cx: &mut Context<Self>) {
         self.start_search(false, cx);
@@ -172,40 +186,68 @@ impl Browser {
             }
         };
         search.error = None;
-        let Some(index) = index else {
-            let enabled = cx.try_global::<IndexService>().is_some_and(|s| s.enabled());
-            search.note = Some(if enabled {
-                "Building the search index… results will appear when it's ready".into()
-            } else {
-                "Search indexing is off. Turn it on from “Search index off” at the right".into()
-            });
-            return cx.notify();
+        // Search the disk directly when asked to, when there's no index (off,
+        // or not built yet), or when "This folder" isn't in it.
+        let under = match (&index, search.everywhere, current_dir.as_deref()) {
+            (Some(index), false, Some(dir)) => index.find(dir).map(Some),
+            (Some(_), _, _) => Some(None),
+            (None, _, _) => None,
         };
-        let under = if search.everywhere { None } else { current_dir.as_deref().and_then(|d| index.find(d)) };
-        search.note = (!search.everywhere && under.is_none() && current_dir.is_some())
-            .then(|| "This folder isn't indexed, so results are from everywhere".into());
-
-        search.running = true;
         search.has_content = query.has_content;
         search.scanned.store(0, Ordering::Relaxed);
-        let (cancel, scanned) = (search.cancel.clone(), search.scanned.clone());
-        let opts = SearchOptions { under, include_hidden, max_content_bytes };
-        let work = cx.background_executor().spawn(async move {
-            let result = search::search(&index, &query, &opts, &scanned, &cancel)?;
-            let entries: Vec<Entry> = result.ids.iter().take(max_results).map(|&id| index.entry(id)).collect();
-            Some((entries, result.ids.len()))
-        });
-        search._task = Some(cx.spawn(async move |this, cx| {
-            let Some((entries, total)) = work.await else { return };
-            this.update(cx, |this, cx| this.show_results(entries, total, refresh, cx)).ok();
-        }));
-        // Content searches can take a while: refresh the progress line.
+        search.running = true;
+        let cancel = search.cancel.clone();
+        match (index, under) {
+            (Some(index), Some(under)) if !search.live => {
+                search.note = None;
+                search.live_progress = None;
+                let scanned = search.scanned.clone();
+                let opts = SearchOptions { under, include_hidden, max_content_bytes };
+                let work = cx.background_executor().spawn(async move {
+                    let result = search::search(&index, &query, &opts, &scanned, &cancel)?;
+                    let entries: Vec<Entry> = result.ids.iter().take(max_results).map(|&id| index.entry(id)).collect();
+                    Some((entries, result.ids.len()))
+                });
+                search._task = Some(cx.spawn(async move |this, cx| {
+                    let Some((entries, total)) = work.await else { return };
+                    this.update(cx, |this, cx| this.show_results(entries, total, refresh, cx)).ok();
+                }));
+            }
+            (index, _) => {
+                let roots = match current_dir.filter(|_| !search.everywhere) {
+                    Some(dir) => vec![dir],
+                    None => self.config.search.root_paths(),
+                };
+                search.note = Some(match (&index, search.live) {
+                    (_, true) => "Searching the disk directly".into(),
+                    (None, _) => "Searching the disk directly (no search index yet)".into(),
+                    (Some(_), _) => "This folder isn't indexed, so it's searched directly".into(),
+                });
+                let progress = Arc::new(LiveProgress::default());
+                search.live_progress = Some(progress.clone());
+                let excludes = Excludes::new(&self.config.search.exclude);
+                let opts = SearchOptions { under: None, include_hidden, max_content_bytes };
+                let work = cx.background_executor().spawn(async move {
+                    let mut found = search::live_search(&roots, &query, &opts, &excludes, &progress, &cancel)?;
+                    let total = found.len();
+                    found.truncate(max_results);
+                    Some((found, total))
+                });
+                search._task = Some(cx.spawn(async move |this, cx| {
+                    let Some((entries, total)) = work.await else { return };
+                    this.update(cx, |this, cx| this.show_results(entries, total, refresh, cx)).ok();
+                }));
+            }
+        }
+        // Slow searches: refresh the progress line, and show live matches
+        // as they're found.
         search._ticker = query_is_slow(search).then(|| {
             cx.spawn(async move |this, cx| {
                 loop {
                     cx.background_executor().timer(Duration::from_millis(250)).await;
                     let running = this
                         .update(cx, |this, cx| {
+                            this.show_live_matches_so_far(max_results, cx);
                             cx.notify();
                             this.search.as_ref().is_some_and(|s| s.running)
                         })
@@ -217,6 +259,24 @@ impl Browser {
             })
         });
         cx.notify();
+    }
+
+    /// While a live search runs, shows what it found so far (sorted),
+    /// keeping the selection and scroll position.
+    fn show_live_matches_so_far(&mut self, max_results: usize, cx: &mut Context<Self>) {
+        let Some(search) = &self.search else { return };
+        let Some(progress) = search.live_progress.clone().filter(|_| search.running) else { return };
+        let mut entries = progress.found.lock().unwrap().clone();
+        if entries.len() == self.entries.len() {
+            return;
+        }
+        search::live::sort_like_index(&mut entries);
+        let total = entries.len();
+        entries.truncate(max_results);
+        self.show_results(entries, total, true, cx);
+        if let Some(search) = &mut self.search {
+            search.running = true; // not done yet
+        }
     }
 
     fn show_results(&mut self, entries: Vec<Entry>, total: usize, refresh: bool, cx: &mut Context<Self>) {
@@ -247,7 +307,10 @@ impl Browser {
         if generation != self.index_generation {
             self.index_generation = generation;
             let Some(search) = &self.search else { return cx.notify() };
-            let (rerun, refresh) = (!search.has_content || (!search.running && !search.has_results), search.has_results);
+            // Live searches don't use the index; others refresh unless they read files.
+            let live = search.live_progress.is_some();
+            let (rerun, refresh) =
+                (!live && (!search.has_content || (!search.running && !search.has_results)), search.has_results);
             if rerun && self.search_active(cx) {
                 self.start_search(refresh, cx);
             }
@@ -263,6 +326,18 @@ impl Browser {
         }
         if search.running {
             let scanned = search.scanned.load(Ordering::Relaxed);
+            if let Some(progress) = &search.live_progress {
+                let checked = progress.checked.load(Ordering::Relaxed) as u64;
+                let found = progress.found.lock().unwrap().len();
+                return Some((
+                    format!(
+                        "Searching the disk… {} checked · {} found",
+                        findest_core::info::group_digits(checked),
+                        findest_core::info::group_digits(found as u64)
+                    ),
+                    false,
+                ));
+            }
             return Some((
                 if search.has_content && scanned > 0 {
                     format!("Searching contents… {} files read", findest_core::info::group_digits(scanned as u64))
@@ -272,7 +347,7 @@ impl Browser {
                 false,
             ));
         }
-        if let Some(note) = &search.note {
+        if let Some(note) = search.note.as_ref().filter(|_| search.live_progress.is_none()) {
             return Some((note.clone(), false));
         }
         let shown = self.entries.len();
@@ -287,6 +362,11 @@ impl Browser {
             ),
             n => format!("{} results", findest_core::info::group_digits(n as u64)),
         };
+        // Say why results came from the disk rather than the index.
+        let text = match &search.note {
+            Some(note) if search.live_progress.is_some() => format!("{text} · {note}"),
+            _ => text,
+        };
         Some((text, false))
     }
 
@@ -299,7 +379,7 @@ impl Browser {
 }
 
 fn query_is_slow(search: &SearchUi) -> bool {
-    search.has_content
+    search.has_content || search.live_progress.is_some()
 }
 
 /// Examples shown in the "?" popover: (query, what it finds). Grouped by blank entries.

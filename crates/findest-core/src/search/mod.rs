@@ -3,9 +3,11 @@
 //! small query language. Original implementation (no FSearch code is used).
 
 pub mod index;
+pub mod live;
 pub mod query;
 pub mod run;
 
 pub use index::{Excludes, Index};
+pub use live::{LiveProgress, live_search};
 pub use query::{Query, parse};
 pub use run::{SearchOptions, SearchResult, search};

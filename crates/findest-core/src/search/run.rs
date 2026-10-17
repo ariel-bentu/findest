@@ -37,7 +37,7 @@ pub struct SearchResult {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Tri {
+pub(crate) enum Tri {
     No,
     Maybe,
     Yes,
@@ -61,21 +61,68 @@ impl From<bool> for Tri {
 
 /// Per-thread scratch space for building paths on demand.
 #[derive(Default)]
-struct Scratch {
+pub(crate) struct Scratch {
     chain: Vec<u32>,
     path: String,
     lower: String,
-    built_for: Option<u32>,
+    /// `path` and `lower` hold the current subject's path.
+    built: bool,
 }
 
-struct Ctx<'a> {
+/// What a query is tested against: an index entry, or an item found on
+/// disk by a live search.
+pub(crate) trait Subject {
+    fn name(&self) -> &str;
+    fn lower_name(&self) -> &str;
+    /// Appends the full path to `out` (`chain` is reusable scratch).
+    fn write_path(&self, chain: &mut Vec<u32>, out: &mut String);
+    /// A real folder (not a package or symlink).
+    fn is_dir(&self) -> bool;
+    fn size(&self) -> u64;
+    /// Modification time in Unix seconds.
+    fn mtime(&self) -> i64;
+}
+
+/// An entry of the index.
+struct Indexed<'a> {
     index: &'a Index,
     id: u32,
-    /// File contents for pass 2; `None` in pass 1.
-    content: Option<&'a [u8]>,
 }
 
-impl Ctx<'_> {
+impl Subject for Indexed<'_> {
+    fn name(&self) -> &str {
+        self.index.name(self.id)
+    }
+    fn lower_name(&self) -> &str {
+        self.index.lower_name(self.id)
+    }
+    fn write_path(&self, chain: &mut Vec<u32>, out: &mut String) {
+        self.index.write_path(self.id, chain, out);
+    }
+    fn is_dir(&self) -> bool {
+        self.index.is_dir(self.id)
+    }
+    fn size(&self) -> u64 {
+        self.index.size(self.id)
+    }
+    fn mtime(&self) -> i64 {
+        self.index.mtime(self.id)
+    }
+}
+
+pub(crate) struct Ctx<'a, S: Subject> {
+    pub(crate) subject: &'a S,
+    /// File contents for pass 2; `None` in pass 1.
+    pub(crate) content: Option<&'a [u8]>,
+}
+
+impl<S: Subject> Ctx<'_, S> {
+    /// Tests the query against the subject (resets `scratch` for it).
+    pub(crate) fn test(&self, node: &Node, scratch: &mut Scratch) -> Tri {
+        scratch.built = false;
+        self.eval(node, scratch)
+    }
+
     fn eval(&self, node: &Node, scratch: &mut Scratch) -> Tri {
         match node {
             Node::All => Tri::Yes,
@@ -107,31 +154,31 @@ impl Ctx<'_> {
     }
 
     fn pred(&self, pred: &Pred, scratch: &mut Scratch) -> Tri {
-        let (index, id) = (self.index, self.id);
+        let subject = self.subject;
         match pred {
-            Pred::Name(text) => text.matches(index.name(id), index.lower_name(id)).into(),
+            Pred::Name(text) => text.matches(subject.name(), subject.lower_name()).into(),
             Pred::Path(text) => {
-                if scratch.built_for != Some(id) {
+                if !scratch.built {
                     scratch.path.clear();
-                    index.write_path(id, &mut scratch.chain, &mut scratch.path);
+                    subject.write_path(&mut scratch.chain, &mut scratch.path);
                     scratch.lower.clear();
                     scratch.lower.push_str(&scratch.path.to_lowercase());
-                    scratch.built_for = Some(id);
+                    scratch.built = true;
                 }
                 text.matches(&scratch.path, &scratch.lower).into()
             }
             Pred::Ext(exts) => {
-                let name = index.lower_name(id);
-                (!index.is_dir(id)
+                let name = subject.lower_name();
+                (!subject.is_dir()
                     && name.rsplit_once('.').is_some_and(|(stem, ext)| !stem.is_empty() && exts.iter().any(|e| e == ext)))
                 .into()
             }
-            Pred::IsDir(dir) => (index.is_dir(id) == *dir).into(),
-            Pred::Size(range) => (!index.is_dir(id) && range.contains(index.size(id) as i64)).into(),
-            Pred::Modified(range) => range.contains(index.mtime(id)).into(),
+            Pred::IsDir(dir) => (subject.is_dir() == *dir).into(),
+            Pred::Size(range) => (!subject.is_dir() && range.contains(subject.size() as i64)).into(),
+            Pred::Modified(range) => range.contains(subject.mtime()).into(),
             Pred::Hidden => Tri::Yes,
             Pred::Content(re) => {
-                if index.is_dir(id) {
+                if subject.is_dir() {
                     return Tri::No;
                 }
                 match self.content {
@@ -157,8 +204,8 @@ pub fn search(
         if cancel.load(Ordering::Relaxed) || index.is_removed(id) || (!include_hidden && index.in_hidden_tree(id)) {
             return None;
         }
-        let ctx = Ctx { index, id, content: None };
-        let verdict = ctx.eval(&query.root, scratch);
+        let ctx = Ctx { subject: &Indexed { index, id }, content: None };
+        let verdict = ctx.test(&query.root, scratch);
         // Scope check last: it walks parents, the query is usually cheaper.
         (verdict != Tri::No && opts.under.is_none_or(|dir| id != dir && index.is_under(id, dir))).then_some((id, verdict))
     };
@@ -189,8 +236,8 @@ pub fn search(
             }
             let bytes = read_text_file(&index.path(id), opts.max_content_bytes)?;
             scanned.fetch_add(1, Ordering::Relaxed);
-            let ctx = Ctx { index, id, content: Some(&bytes) };
-            (ctx.eval(&query.root, scratch) == Tri::Yes).then_some(id)
+            let ctx = Ctx { subject: &Indexed { index, id }, content: Some(&bytes) };
+            (ctx.test(&query.root, scratch) == Tri::Yes).then_some(id)
         })
         .flatten()
         .collect();
@@ -198,7 +245,7 @@ pub fn search(
 }
 
 /// The file's bytes, or `None` for unreadable or binary files (NUL in the first 8 KB).
-fn read_text_file(path: &std::path::Path, max: u64) -> Option<Vec<u8>> {
+pub(crate) fn read_text_file(path: &std::path::Path, max: u64) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     fs::File::open(path).ok()?.take(max).read_to_end(&mut bytes).ok()?;
     let head = &bytes[..bytes.len().min(8192)];

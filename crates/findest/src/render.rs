@@ -411,6 +411,22 @@ impl Browser {
                 .child(scope_button("scope-all", "Everywhere".into(), search.everywhere, true))
                 .child(
                     div()
+                        .id("scope-live")
+                        .px_2()
+                        .py(px(2.))
+                        .rounded_md()
+                        .whitespace_nowrap()
+                        .cursor_pointer()
+                        .border_1()
+                        .border_color(if search.live { theme.accent } else { theme.border })
+                        .when(search.live, |d| d.text_color(theme.accent))
+                        .when(!search.live, |d| d.text_color(theme.text_muted).hover(|s| s.bg(theme.hover)))
+                        .tooltip(tooltip("Search the disk directly instead of the index: sees every change at once and works anywhere, but is slower for big folders"))
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_live_search(cx)))
+                        .child("Live"),
+                )
+                .child(
+                    div()
                         .flex_1()
                         .min_w_0()
                         .truncate()

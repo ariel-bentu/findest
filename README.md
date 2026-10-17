@@ -98,6 +98,8 @@ Findest keeps an in-memory index of file names, a design inspired by FSearch and
 
 Search **This folder** or **Everywhere**. Press ↓ or Enter to move to the results and Esc to close search. Run `cargo run --release -p findest-core --example search_bench` to benchmark indexing and search on your machine.
 
+**Live** searches the disk directly instead of the index, with the same query language: it sees every change at once and works anywhere (other drives, network shares, folders the index leaves out), at about the speed of [fd](https://github.com/sharkdp/fd) — fine for a project folder, seconds for a whole home folder. Findest switches to it by itself when "This folder" isn't indexed or there's no index (indexing is off or still building). Compare it with fd on your machine: `cargo run --release -p findest-core --example search_bench -- live ~/dev main.rs`.
+
 ## Mouse
 
 - **▾** next to back/forward: recently visited folders.
