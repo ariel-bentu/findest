@@ -6,6 +6,7 @@ mod fsevents;
 mod icons;
 mod install;
 mod native_drag;
+mod quick_look;
 mod render;
 mod search_service;
 mod system;
@@ -97,6 +98,7 @@ fn menus() -> Vec<Menu> {
                 item("Bigger Tiles", "zoom_in"),
                 item("Smaller Tiles", "zoom_out"),
                 MenuItem::separator(),
+                item("Quick Look", "quick_look"),
                 item("Show/Hide Info Panel", "toggle_info"),
                 item("Show/Hide Hidden Files", "toggle_hidden"),
                 item("Refresh", "refresh"),

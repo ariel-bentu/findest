@@ -71,6 +71,8 @@ pub enum Command {
     CopyPath,
     ToggleHidden,
     ToggleInfo,
+    /// Preview the selection in the Quick Look panel, or close it.
+    QuickLook,
     ViewList,
     ViewTiles,
     /// Bigger / smaller tiles (tiles view).
@@ -142,6 +144,7 @@ impl FromStr for Command {
             "copy_path" => CopyPath,
             "toggle_hidden" => ToggleHidden,
             "toggle_info" => ToggleInfo,
+            "quick_look" => QuickLook,
             "view_list" => ViewList,
             "view_tiles" => ViewTiles,
             "zoom_in" => ZoomIn,

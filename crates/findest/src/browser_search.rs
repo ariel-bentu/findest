@@ -120,6 +120,15 @@ impl Browser {
         }
     }
 
+    /// Empties the search box (the folder's contents come back) and keeps typing in it.
+    pub fn clear_search_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(search) = &self.search {
+            let input = search.input.clone();
+            input.update(cx, |input, cx| input.set_text("", 0..0, cx));
+            window.focus(&input.focus_handle(cx));
+        }
+    }
+
     pub fn close_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.search.take().is_some() {
             window.focus(&self.focus);

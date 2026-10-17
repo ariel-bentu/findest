@@ -893,6 +893,8 @@ impl Browser {
                     self.type_ahead_find(cx);
                     return;
                 }
+                // Space continues the name being typed instead of previewing.
+                QuickLook => return self.type_ahead(" ", cx),
                 ClearSelection => return self.clear_type_ahead(cx),
                 _ => self.clear_type_ahead(cx),
             }
@@ -964,6 +966,7 @@ impl Browser {
                     Err(e) => self.set_error(format!("Couldn't save the setting: {e:#}"), cx),
                 }
             }
+            QuickLook => crate::quick_look::toggle(window, self.selection(), cx),
             Expand => self.expand_selection(cx),
             Collapse => self.collapse_selection(cx),
             Open => self.open_selection(cx),

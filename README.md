@@ -73,6 +73,7 @@ Changes apply as soon as you save the file. Open it with **⌘,**.
 | ⇧⌘. | toggle hidden files | ⌘R | refresh |
 | ⌃⌘T | add to Favorites | ⇧⌘R | Recents |
 | ⌥⌘R | reveal in Finder | ⌘, | open config |
+| Space, ⌘Y | Quick Look (Esc closes) | | |
 
 Typing letters jumps to the first matching name.
 
@@ -96,7 +97,7 @@ Findest keeps an in-memory index of file names, a design inspired by FSearch and
 | `content:"TODO"` | text inside files (pair it with other terms to stay fast) |
 | `hidden:` | include hidden files |
 
-Search **This folder** or **Everywhere**. Press ↓ or Enter to move to the results and Esc to close search. Run `cargo run --release -p findest-core --example search_bench` to benchmark indexing and search on your machine.
+Search **This folder** or **Everywhere**. Press ↓ or Enter to move to the results. Esc or the ✕ in the box clears the query; Esc again closes search. Run `cargo run --release -p findest-core --example search_bench` to benchmark indexing and search on your machine.
 
 **Live** searches the disk directly instead of the index, with the same query language: it sees every change at once and works anywhere (other drives, network shares, folders the index leaves out), at about the speed of [fd](https://github.com/sharkdp/fd) — fine for a project folder, seconds for a whole home folder. Findest switches to it by itself when "This folder" isn't indexed or there's no index (indexing is off or still building). Compare it with fd on your machine: `cargo run --release -p findest-core --example search_bench -- live ~/dev main.rs`.
 

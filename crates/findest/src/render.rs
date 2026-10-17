@@ -38,6 +38,9 @@ impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.load_sidebar_icons(cx);
         self.sync_info(cx);
+        if crate::quick_look::is_open_for(window) {
+            crate::quick_look::follow(self.selection(), cx);
+        }
         if std::mem::take(&mut self.refocus_list) {
             window.focus(&self.focus);
         }
@@ -284,6 +287,31 @@ impl Browser {
             .child(match &self.search {
                 Some(search) => div().flex_1().min_w_0().child(search.input.clone()).into_any_element(),
                 None => div().flex_1().text_color(theme.text_muted).child("Search  ⌘F").into_any_element(),
+            })
+            .children(self.search.as_ref().filter(|s| !s.input.read(cx).text().is_empty()).map(|_| self.search_clear_button(cx)))
+    }
+
+    /// ✕ at the end of the search box: clears the query.
+    fn search_clear_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = &self.theme;
+        let icon = self.icons.peek(&self.symbol_key_colored("xmark.circle.fill", theme.text_muted));
+        div()
+            .id("search-clear")
+            .flex_none()
+            .size(px(18.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .cursor_pointer()
+            .text_color(theme.text_muted)
+            .hover(|s| s.bg(theme.hover))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .tooltip(tooltip("Clear search"))
+            .on_click(cx.listener(|this, _, window, cx| this.clear_search_text(window, cx)))
+            .child(match icon {
+                Some(image) => img(image).size(px(13.)).object_fit(ObjectFit::Contain).into_any_element(),
+                None => div().text_size(px(11.)).child("✕").into_any_element(),
             })
     }
 
@@ -669,6 +697,7 @@ impl Browser {
             "chevron.up",
             "sidebar.right",
             "xmark",
+            "xmark.circle.fill",
             "magnifyingglass",
             "questionmark.circle",
             "ellipsis.circle",
