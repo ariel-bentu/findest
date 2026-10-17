@@ -38,6 +38,16 @@ pub struct BrowserInit {
     pub columns: Option<ColumnWidths>,
 }
 
+/// Paste's destination given the single selected item (if exactly one),
+/// what's on the clipboard, and the folder being shown.
+fn paste_destination(selected: Option<&Entry>, clipboard: &[PathBuf], current: Option<PathBuf>) -> Option<PathBuf> {
+    match selected {
+        Some(entry) if entry.is_dir && !clipboard.iter().any(|src| entry.path.starts_with(src)) => Some(entry.path.clone()),
+        Some(entry) => entry.path.parent().map(Path::to_path_buf),
+        None => current,
+    }
+}
+
 /// A resizable list column.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Column {
@@ -756,6 +766,13 @@ impl Browser {
         self.entries.iter().filter(|e| self.selected.contains(&e.path)).map(|e| e.path.clone()).collect()
     }
 
+    /// Where Paste puts things: into the selected folder, next to the
+    /// selected file, else the current folder. A selected folder that is
+    /// being pasted (copied, still selected) gets its copy next to it.
+    fn paste_destination(&self) -> Option<PathBuf> {
+        paste_destination(self.single_selected_entry(), &self.file_clipboard, self.current_dir())
+    }
+
     fn single_selected_entry(&self) -> Option<&Entry> {
         if self.selected.len() != 1 {
             return None;
@@ -987,7 +1004,7 @@ impl Browser {
                 cx.notify();
             }
             Paste | MoveHere => {
-                let Some(dir) = self.current_dir() else {
+                let Some(dir) = self.paste_destination() else {
                     return self.set_error("Open a folder to paste into", cx);
                 };
                 if self.file_clipboard.is_empty() {
@@ -995,6 +1012,7 @@ impl Browser {
                 }
                 let sources = self.file_clipboard.clone();
                 let originals = sources.clone();
+                let target = dir.clone();
                 let moving = command == MoveHere || self.clipboard_cut;
                 if moving {
                     // Moved items aren't where they were any more.
@@ -1005,18 +1023,22 @@ impl Browser {
                     if moving { "Moving" } else { "Copying" },
                     cx,
                     move |progress| {
-                        if moving { ops::move_into(&sources, &dir, progress) } else { ops::copy_into(&sources, &dir, progress) }
+                        if moving { ops::move_into(&sources, &target, progress) } else { ops::copy_into(&sources, &target, progress) }
                     },
                     move |this, created, cx| {
                         let n = count_label(created.len());
+                        let here = this.current_dir().as_deref() == Some(dir.as_path());
+                        let place = if here { "here".to_string() } else { format!("into “{}”", display_name(&dir)) };
                         if moving {
-                            this.set_info(format!("Moved {n} here"), cx);
+                            this.set_info(format!("Moved {n} {place}"), cx);
                             this.record_move(originals, &created);
                         } else {
-                            this.set_info(format!("Pasted {n}"), cx);
+                            this.set_info(format!("Pasted {n} {place}"), cx);
                             this.record_copy(&created);
                         }
-                        this.reload_and_select(created, false, cx);
+                        // Pasted into a collapsed folder: keep that folder selected.
+                        let visible = here || this.expanded.contains(&dir);
+                        this.reload_and_select(if visible { created } else { vec![dir] }, false, cx);
                     },
                 );
             }
@@ -1774,6 +1796,12 @@ impl Browser {
             }
             entries.push(self.item("Cut", Cut, "cut"));
             entries.push(self.item("Copy", Copy, "copy"));
+            if let Some(folder) = self.paste_destination().filter(|_| single && all_dirs && !self.file_clipboard.is_empty()) {
+                let (n, verb) = (count_label(self.file_clipboard.len()), if self.clipboard_cut { "Move" } else { "Paste" });
+                if self.single_selected_entry().is_some_and(|e| e.path == folder) {
+                    entries.push(self.item(format!("{verb} {n} Into “{}”", display_name(&folder)), Paste, "paste"));
+                }
+            }
             entries.push(self.item(if single { "Copy Path" } else { "Copy Paths" }, CopyPath, "copy_path"));
             if single && all_dirs {
                 entries.push(self.item("Add to Favorites", AddFavorite, "add_favorite"));
@@ -2485,6 +2513,38 @@ mod tests {
 
     fn names(list: &[(&str, usize)]) -> Vec<(String, usize)> {
         list.iter().map(|(n, d)| (n.to_string(), *d)).collect()
+    }
+
+    fn entry(path: &str, is_dir: bool) -> Entry {
+        Entry {
+            name: display_name(Path::new(path)),
+            path: PathBuf::from(path),
+            is_dir,
+            is_package: false,
+            is_symlink: false,
+            is_hidden: false,
+            size: 0,
+            modified: None,
+        }
+    }
+
+    #[test]
+    fn paste_goes_into_a_selected_folder_and_next_to_a_selected_file() {
+        let here = Some(PathBuf::from("/w"));
+        let clip = [PathBuf::from("/elsewhere/a.txt")];
+        let dest = |selected: Option<&Entry>, clip: &[PathBuf]| paste_destination(selected, clip, here.clone());
+        assert_eq!(dest(None, &clip), here, "nothing selected: the current folder");
+        assert_eq!(dest(Some(&entry("/w/Docs", true)), &clip), Some(PathBuf::from("/w/Docs")), "into the folder");
+        assert_eq!(dest(Some(&entry("/w/notes.txt", false)), &clip), here, "next to the file");
+        assert_eq!(
+            dest(Some(&entry("/w/Docs/inner.txt", false)), &clip),
+            Some(PathBuf::from("/w/Docs")),
+            "next to a file inside an expanded folder"
+        );
+        assert_eq!(dest(Some(&entry("/w/Tool.app", false)), &clip), here, "packages count as files");
+        let copied_folder = [PathBuf::from("/w/Docs")];
+        assert_eq!(dest(Some(&entry("/w/Docs", true)), &copied_folder), here, "a copied folder still selected: next to it");
+        assert_eq!(paste_destination(None, &clip, None), None, "search results with nothing selected");
     }
 
     #[test]
