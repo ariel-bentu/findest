@@ -11,7 +11,7 @@ use findest_core::paths::contract_tilde;
 use findest_core::config::ViewMode;
 use gpui::{
     AnyElement, Bounds, Context, DispatchPhase, ExternalPaths, FontWeight, Hsla, Image, MouseButton, MouseDownEvent,
-    CursorStyle, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Point, SharedString, Window, anchored, canvas, deferred, div, img,
+    CursorStyle, ListHorizontalSizingBehavior, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Point, SharedString, Window, anchored, canvas, deferred, div, img,
     prelude::*, px, uniform_list,
 };
 
@@ -25,8 +25,9 @@ const INFO_PANEL_WIDTH: f32 = 270.0;
 /// Images up to this size are previewed in the info panel.
 const MAX_PREVIEW_BYTES: u64 = 64 * 1024 * 1024;
 const TOP_BAR_HEIGHT: f32 = 44.0;
-/// Header padding right of the last column (rows line up with it).
-const HEADER_PAD_RIGHT: f32 = 8.0;
+/// Where the Name column starts in a row: list padding, row padding,
+/// disclosure triangle and icon (the header starts its Name label there too).
+const NAME_START: f32 = 4.0 + 8.0 + TREE_GUTTER + 22.0;
 /// Grab width of a column edge in the header.
 const COLUMN_HANDLE: f32 = 8.0;
 /// Width of the disclosure-triangle column, and the indent per tree level.
@@ -785,8 +786,8 @@ impl Browser {
                             }),
                         )
                         .track_scroll(self.scroll.clone())
+                        .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
                         .size_full()
-                        .px_1()
                         .into_any_element(),
                         ViewMode::Tiles => self.render_tiles(cx).into_any_element(),
                     })
@@ -874,36 +875,46 @@ impl Browser {
                 })
                 .child(format!("{label}{arrow}"))
         };
+        // Follow the list when it's scrolled sideways.
+        let scroll_x = self.scroll.0.borrow().base_handle.offset().x;
         div()
-            .flex()
-            .flex_row()
-            .items_center()
             .h(px(theme.row_height))
-            .pl(px(TREE_GUTTER + 34.))
-            .pr(px(HEADER_PAD_RIGHT))
+            .flex_none()
+            .overflow_hidden()
             .border_b_1()
             .border_color(theme.border)
             .text_size(px(theme.font_size - 1.))
             .text_color(theme.text_muted)
-            .relative()
-            .child(column("h-name", "Name", Some(SortKey::Name), None, false))
-            .child(column("h-modified", "Date Modified", Some(SortKey::Modified), Some(self.columns.modified), false))
-            .child(column("h-size", "Size", Some(SortKey::Size), Some(self.columns.size), true))
-            .child(if recents {
-                column("h-where", "Where", None, Some(self.columns.kind), false)
-            } else {
-                column("h-kind", "Kind", Some(SortKey::Kind), Some(self.columns.kind), false)
-            })
-            .children(self.column_handles(cx))
+            .child(
+                div()
+                    .relative()
+                    .left(scroll_x)
+                    .h_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .pl(px(NAME_START))
+                    .child(column("h-name", "Name", Some(SortKey::Name), Some(self.columns.name), false))
+                    .child(column("h-modified", "Date Modified", Some(SortKey::Modified), Some(self.columns.modified), false))
+                    .child(column("h-size", "Size", Some(SortKey::Size), Some(self.columns.size), true))
+                    .child(if recents {
+                        column("h-where", "Where", None, Some(self.columns.kind), false)
+                    } else {
+                        column("h-kind", "Kind", Some(SortKey::Kind), Some(self.columns.kind), false)
+                    })
+                    .children(self.column_handles(cx)),
+            )
     }
 
-    /// Draggable left edges of the fixed-width columns (double-click resets).
+    /// Draggable right edges of the columns (double-click resets).
     fn column_handles(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let theme = &self.theme;
-        let mut right = HEADER_PAD_RIGHT;
+        let mut edge = NAME_START;
         let mut handles = Vec::new();
-        for (id, column) in [("edge-kind", Column::Kind), ("edge-size", Column::Size), ("edge-modified", Column::Modified)] {
-            right += self.column_width(column);
+        let columns =
+            [("edge-name", Column::Name), ("edge-modified", Column::Modified), ("edge-size", Column::Size), ("edge-kind", Column::Kind)];
+        for (id, column) in columns {
+            edge += self.column_width(column);
             let dragging = self.column_drag.is_some();
             handles.push(
                 div()
@@ -911,7 +922,7 @@ impl Browser {
                     .absolute()
                     .top_0()
                     .bottom_0()
-                    .right(px(right - COLUMN_HANDLE / 2.))
+                    .left(px(edge - COLUMN_HANDLE / 2.))
                     .w(px(COLUMN_HANDLE))
                     .flex()
                     .justify_center()
@@ -1115,10 +1126,12 @@ impl Browser {
         let (fg, muted) = if selected { (theme.selection_text, theme.selection_text.opacity(0.8)) } else { (theme.text, theme.text_muted) };
         let dim = (entry.is_hidden || self.is_cut(&entry.path)) && !selected;
 
+        // Indentation comes out of the Name column, so the others line up.
+        let name_width = px((self.columns.name - self.depth(ix) as f32 * TREE_INDENT).max(0.));
         let name: AnyElement = match renaming {
             Some(input) => div()
-                .flex_1()
-                .min_w_0()
+                .w(name_width)
+                .flex_none()
                 .px_1()
                 .rounded_sm()
                 .bg(theme.background)
@@ -1128,8 +1141,8 @@ impl Browser {
                 .child(input)
                 .into_any_element(),
             None => div()
-                .flex_1()
-                .min_w_0()
+                .w(name_width)
+                .flex_none()
                 .px_2()
                 .truncate()
                 .child(entry.display_name().to_string())
@@ -1142,11 +1155,9 @@ impl Browser {
             entry.kind()
         };
 
-        div()
+        let row = div()
             .id(ix)
-            // uniform_list lays rows out as roots, so they must claim the full width
-            // explicitly; otherwise they shrink to content and the name column collapses.
-            .w_full()
+            .flex_1()
             .h(px(theme.row_height))
             .pl_2()
             .pr_1()
@@ -1188,8 +1199,11 @@ impl Browser {
                     .text_color(muted)
                     .child(if entry.is_dir || entry.is_package { "--".into() } else { format_size(entry.size) }),
             )
-            .child(div().w(px(self.columns.kind)).flex_none().px_2().truncate().text_color(muted).child(last_column))
-            .into_any_element()
+            .child(div().w(px(self.columns.kind)).flex_none().px_2().truncate().text_color(muted).child(last_column));
+        // uniform_list lays rows out as roots: claim at least the visible width so
+        // the hover and selection backgrounds span it; wider columns scroll sideways.
+        // The inset is here rather than list padding, which sideways scrolling doubles.
+        div().min_w_full().px_1().flex().child(row).into_any_element()
     }
 
     fn render_info_panel(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
