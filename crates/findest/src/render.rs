@@ -1452,13 +1452,17 @@ impl Browser {
             .when(self.view == ViewMode::Tiles, |d| d.child(self.render_tile_slider(cx)))
     }
 
-    /// "Indexing… 340,000 items" while a full scan runs, or the pause; click
-    /// for the index menu. Nothing when idle or turned off.
+    /// What the search index is doing: "Indexing… 340,000 items", paused,
+    /// off, or "Index up to date". Click for the index menu.
     fn render_index_activity(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let service = cx.try_global::<crate::search_service::IndexService>()?;
-        if !service.enabled() || !(service.building || service.is_paused()) {
-            return None;
-        }
+        let status = crate::search_service::status_text(service);
+        let idle = service.enabled() && !service.building && !service.is_paused() && service.index.is_some();
+        let (label, hint) = if idle {
+            ("Index up to date".to_string(), format!("{status}. Click to pause, rebuild or turn off indexing"))
+        } else {
+            (status, "Click to pause, resume or turn off search indexing".to_string())
+        };
         let theme = &self.theme;
         Some(
             div()
@@ -1469,7 +1473,7 @@ impl Browser {
                 .rounded_sm()
                 .cursor_pointer()
                 .hover(|s| s.bg(theme.hover).text_color(theme.text))
-                .tooltip(tooltip("Pause, resume or turn off search indexing"))
+                .tooltip(tooltip(hint))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, e: &MouseDownEvent, _, cx| {
@@ -1477,7 +1481,7 @@ impl Browser {
                         this.open_index_menu(Point { x: e.position.x - px(120.), y: e.position.y - px(150.) }, cx);
                     }),
                 )
-                .child(crate::search_service::status_text(service)),
+                .child(label),
         )
     }
 
@@ -1754,7 +1758,7 @@ impl Browser {
 }
 
 /// Hover hint for toolbar buttons.
-struct Tooltip(&'static str);
+struct Tooltip(SharedString);
 
 impl Render for Tooltip {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -1768,12 +1772,13 @@ impl Render for Tooltip {
             .text_color(gpui::rgb(0xf0f0f0))
             .text_sm()
             .shadow_md()
-            .child(self.0)
+            .child(self.0.clone())
     }
 }
 
-fn tooltip(text: &'static str) -> impl Fn(&mut Window, &mut gpui::App) -> gpui::AnyView {
-    move |_, cx| cx.new(|_| Tooltip(text)).into()
+fn tooltip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut gpui::App) -> gpui::AnyView {
+    let text = text.into();
+    move |_, cx| cx.new(|_| Tooltip(text.clone())).into()
 }
 
 /// macOS grants privacy permissions to the app that *launched* a process.
