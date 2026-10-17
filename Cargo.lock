@@ -1700,6 +1700,7 @@ dependencies = [
  "findest-core",
  "futures",
  "gpui",
+ "libc",
  "notify",
  "objc2",
  "objc2-app-kit",
@@ -1708,6 +1709,8 @@ dependencies = [
  "raw-window-handle",
  "schemars",
  "serde",
+ "serde_json",
+ "tempfile",
  "unicode-segmentation",
 ]
 

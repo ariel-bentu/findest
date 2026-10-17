@@ -1,9 +1,11 @@
 //! The app-wide filename index behind search, shared by all windows.
 //!
-//! At launch the saved index is loaded (instant results), then rescanned in
-//! the background, since changes made while findest was closed are unknown.
-//! After that FSEvents reports changes as they happen and only the folders
-//! involved are re-read. A full rescan runs once a day (or when FSEvents
+//! At launch the saved index is loaded (instant results) and FSEvents
+//! replays every change since its scan started, even those made while
+//! findest wasn't running; only the folders involved are re-read. After that
+//! changes are applied the same way as they happen. When the history can't
+//! be replayed (it was reset, or the scan settings changed) the index is
+//! rescanned instead. A full rescan runs once a day (or when FSEvents
 //! drops events, or many changes have piled up), on few threads at
 //! background priority.
 //!
@@ -21,7 +23,9 @@ use findest_core::config::{Config, SearchConfig};
 use findest_core::search::index::in_background;
 use findest_core::search::{Excludes, Index};
 use gpui::{App, AsyncApp, BorrowAppContext, Global};
-use notify::{RecursiveMode, Watcher};
+use serde::{Deserialize, Serialize};
+
+use crate::fsevents::{self, EventStream};
 
 /// Rescan from scratch this often (Unix seconds).
 const FULL_SCAN_INTERVAL: i64 = 24 * 60 * 60;
@@ -49,7 +53,7 @@ pub struct IndexService {
     /// Set while indexing is off, so a save finishing late removes its file.
     off: Arc<AtomicBool>,
     pending: Arc<Mutex<Pending>>,
-    _watcher: Option<notify::RecommendedWatcher>,
+    _watcher: Option<EventStream>,
 }
 
 impl Global for IndexService {}
@@ -83,6 +87,48 @@ struct Pending {
     rescan: bool,
 }
 
+/// Saved next to the index: where its scan stood in the FSEvents history,
+/// so the next launch can replay what changed since instead of rescanning.
+#[derive(PartialEq, Serialize, Deserialize)]
+struct ScanMark {
+    /// Every change after this event id happened after the scan started.
+    event_id: u64,
+    /// Each root's volume history (event ids only make sense within it).
+    histories: Vec<Option<String>>,
+    roots: Vec<String>,
+    exclude: Vec<String>,
+}
+
+impl ScanMark {
+    fn now(config: &SearchConfig) -> ScanMark {
+        ScanMark {
+            event_id: fsevents::current_event_id(),
+            histories: config.root_paths().iter().map(|r| fsevents::history_id(r)).collect(),
+            roots: config.roots.clone(),
+            exclude: config.exclude.clone(),
+        }
+    }
+
+    fn path() -> PathBuf {
+        Index::default_path().with_file_name("index-mark.json")
+    }
+
+    /// The event id to replay from, if a saved scan of the same roots can
+    /// be caught up that way.
+    fn replay_from(config: &SearchConfig) -> Option<u64> {
+        let saved: ScanMark = serde_json::from_slice(&std::fs::read(Self::path()).ok()?).ok()?;
+        let current = ScanMark::now(config);
+        (saved.roots == current.roots && saved.exclude == current.exclude && saved.histories == current.histories)
+            .then_some(saved.event_id)
+    }
+}
+
+/// Removes the saved index and its mark.
+fn remove_saved() {
+    let _ = std::fs::remove_file(ScanMark::path());
+    let _ = std::fs::remove_file(Index::default_path());
+}
+
 enum Work {
     Scan,
     Apply(HashSet<PathBuf>),
@@ -92,7 +138,8 @@ pub fn init(cx: &mut App) {
     let config = Config::load(&Config::path()).unwrap_or_default().search;
     let pending = Arc::new(Mutex::new(Pending::default()));
     let enabled = config.indexing;
-    let watcher = enabled.then(|| watch_roots(&config, pending.clone())).flatten();
+    let replay_from = enabled.then(|| ScanMark::replay_from(&config)).flatten();
+    let watcher = enabled.then(|| watch_roots(&config, pending.clone(), replay_from)).flatten();
     cx.set_global(IndexService {
         index: None,
         building: false,
@@ -100,7 +147,7 @@ pub fn init(cx: &mut App) {
         generation: 0,
         config,
         pause: None,
-        scan_needed: enabled,
+        scan_needed: enabled && replay_from.is_none(),
         cancel: Arc::default(),
         off: Arc::new(AtomicBool::new(!enabled)),
         pending,
@@ -109,8 +156,12 @@ pub fn init(cx: &mut App) {
 
     let cached = cx.background_executor().spawn(async move { enabled.then(|| Index::load(&Index::default_path()).ok()).flatten() });
     cx.spawn(async move |cx| {
-        if let Some(index) = cached.await {
-            publish(cx, index);
+        match cached.await {
+            Some(index) => publish(cx, index),
+            None => {
+                // Nothing to replay changes onto.
+                cx.update_global::<IndexService, _>(|s, _| s.scan_needed = s.enabled()).ok();
+            }
         }
         loop {
             match next_work(cx) {
@@ -203,10 +254,10 @@ pub fn set_config(config: SearchConfig, cx: &mut App) {
             s.pause = None;
             s.generation += 1;
             *s.pending.lock().unwrap() = Pending::default();
-            cx.background_executor().spawn(async { std::fs::remove_file(Index::default_path()) }).detach();
+            cx.background_executor().spawn(async { remove_saved() }).detach();
         } else if !was_enabled || scope_changed {
             s.off.store(false, Ordering::Relaxed);
-            s._watcher = watch_roots(&s.config, s.pending.clone());
+            s._watcher = watch_roots(&s.config, s.pending.clone(), None);
             s.scan_needed = true;
             s.cancel.store(true, Ordering::Relaxed); // a scan in progress has the old scope
         }
@@ -223,14 +274,16 @@ fn publish(cx: &mut AsyncApp, index: Index) {
 
 async fn rebuild(cx: &mut AsyncApp) {
     let cancel = Arc::new(AtomicBool::new(false));
-    let Ok((config, progress, off)) = cx.update_global::<IndexService, _>(|s, _| {
+    let Ok((config, progress, off, mark)) = cx.update_global::<IndexService, _>(|s, _| {
+        // Taken before scanning: changes during the scan get replayed later.
+        let mark = ScanMark::now(&s.config);
         s.building = true;
         s.scan_needed = false;
         s.cancel = cancel.clone();
         s.progress.store(0, Ordering::Relaxed);
         // The scan sees everything up to now; changes during it stay queued.
         *s.pending.lock().unwrap() = Pending::default();
-        (s.config.clone(), s.progress.clone(), s.off.clone())
+        (s.config.clone(), s.progress.clone(), s.off.clone(), mark)
     }) else {
         return;
     };
@@ -267,11 +320,16 @@ async fn rebuild(cx: &mut AsyncApp) {
     cx.background_executor()
         .spawn(async move {
             in_background(|| {
-                let path = Index::default_path();
-                let result = saved.save(&path);
+                // The mark goes first and comes back last, so a mark never
+                // claims an index newer than the one saved.
+                let _ = std::fs::remove_file(ScanMark::path());
+                let result = saved.save(&Index::default_path());
+                if result.is_ok() {
+                    let _ = serde_json::to_vec(&mark).map(|json| std::fs::write(ScanMark::path(), json));
+                }
                 // Turned off while saving: don't leave it behind.
                 if off.load(Ordering::Relaxed) {
-                    let _ = std::fs::remove_file(&path);
+                    remove_saved();
                 }
                 result
             })
@@ -310,41 +368,33 @@ async fn apply_changes(cx: &mut AsyncApp, paths: HashSet<PathBuf>) {
 }
 
 /// Queues changes under the roots that a scan would pick up (FSEvents is
-/// recursive and cheap, so this watches whole trees). Excluded paths and
-/// findest's own data folder are ignored: busy folders like ~/Library, and
-/// saving the index itself, would otherwise keep it updating.
-fn watch_roots(config: &SearchConfig, pending: Arc<Mutex<Pending>>) -> Option<notify::RecommendedWatcher> {
+/// recursive and cheap, so this watches whole trees), first replaying those
+/// since `replay_from`. Excluded paths and findest's own data folder are
+/// ignored: busy folders like ~/Library, and saving the index itself, would
+/// otherwise keep it updating.
+fn watch_roots(config: &SearchConfig, pending: Arc<Mutex<Pending>>, replay_from: Option<u64>) -> Option<EventStream> {
     let roots = config.root_paths();
     let excludes = Excludes::new(&config.exclude);
     let own_dir = Index::default_path().parent().map(|p| p.to_path_buf());
-    let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-        let Ok(event) = event else { return };
-        if matches!(event.kind, notify::EventKind::Access(_)) {
-            return;
-        }
-        let rescan = event.attrs.flag() == Some(notify::event::Flag::Rescan);
-        let unscoped = event.paths.is_empty();
-        let relevant: Vec<PathBuf> = event
-            .paths
-            .into_iter()
-            .filter(|p| !own_dir.as_ref().is_some_and(|d| p.starts_with(d)) && !excludes.skips(p, &roots))
-            .collect();
+    let watched = roots.clone();
+    EventStream::start(&watched, replay_from, 0.5, move |events| {
+        let relevant = |p: &PathBuf| !own_dir.as_ref().is_some_and(|d| p.starts_with(d)) && !excludes.skips(p, &roots);
         let mut pending = pending.lock().unwrap();
-        // FSEvents lost track of changes (under these paths): rescan everything.
-        pending.rescan |= rescan && (unscoped || !relevant.is_empty());
+        for event in events {
+            match event {
+                fsevents::Event::Changed(path) if relevant(&path) => {
+                    pending.paths.insert(path);
+                }
+                fsevents::Event::Changed(_) => {}
+                fsevents::Event::Rescan(path) => pending.rescan |= path.is_none_or(|p| relevant(&p)),
+            }
+        }
         if pending.rescan || pending.paths.len() > MAX_PENDING {
             // A full rescan is coming anyway (e.g. after a long pause).
             pending.rescan = true;
             pending.paths.clear();
-        } else {
-            pending.paths.extend(relevant);
         }
     })
-    .ok()?;
-    for root in config.root_paths() {
-        let _ = watcher.watch(&root, RecursiveMode::Recursive);
-    }
-    Some(watcher)
 }
 
 /// "1.2M items · updated 3 min ago" / "Indexing… 340,000 items" /

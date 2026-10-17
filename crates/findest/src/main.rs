@@ -1,6 +1,7 @@
 mod browser;
 mod browser_search;
 mod command;
+mod fsevents;
 mod icons;
 mod install;
 mod native_drag;

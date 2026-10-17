@@ -4,6 +4,9 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [dependencies]
 findest-core.workspace = true
 anyhow.workspace = true
@@ -11,6 +14,8 @@ serde.workspace = true
 schemars.workspace = true
 gpui.workspace = true
 notify.workspace = true
+libc.workspace = true
+serde_json.workspace = true
 chrono.workspace = true
 unicode-segmentation.workspace = true
 futures.workspace = true
