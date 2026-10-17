@@ -180,6 +180,7 @@ fn info_plist() -> String {
     <key>LSMinimumSystemVersion</key><string>13.0</string>
     <key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
     <key>NSHighResolutionCapable</key><true/>
+    <key>NSAppleEventsUsageDescription</key><string>While Findest is your default file viewer, Reveal in Finder asks Finder to show the item.</string>
     <key>CFBundleDocumentTypes</key>
     <array>
         <dict>

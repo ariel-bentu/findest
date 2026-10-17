@@ -84,6 +84,9 @@ pub enum Command {
     ResumeIndexing,
     /// Turn search indexing on or off for good (saved in the config).
     ToggleIndexing,
+    /// Open folders and "Show in Finder" in Findest, or put Finder back.
+    UseFindestAsDefault,
+    UseFinderAsDefault,
     Refresh,
     AddFavorite,
     ShowRecents,
@@ -149,6 +152,8 @@ impl FromStr for Command {
             "pause_indexing_hour" => PauseIndexingHour,
             "resume_indexing" => ResumeIndexing,
             "toggle_indexing" => ToggleIndexing,
+            "use_findest_as_default" => UseFindestAsDefault,
+            "use_finder_as_default" => UseFinderAsDefault,
             "refresh" => Refresh,
             "add_favorite" => AddFavorite,
             "show_recents" => ShowRecents,

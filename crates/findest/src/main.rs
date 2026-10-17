@@ -1,6 +1,7 @@
 mod browser;
 mod browser_search;
 mod command;
+mod default_viewer;
 mod fsevents;
 mod icons;
 mod install;
@@ -42,6 +43,9 @@ fn menus() -> Vec<Menu> {
                 item("Resume Search Indexing", "resume_indexing"),
                 item("Rebuild Search Index", "rebuild_index"),
                 item("Turn Search Indexing On/Off", "toggle_indexing"),
+                MenuItem::separator(),
+                item("Use Findest as Default File Viewer", "use_findest_as_default"),
+                item("Use Finder as Default File Viewer", "use_finder_as_default"),
                 MenuItem::separator(),
                 MenuItem::os_submenu("Services", SystemMenuType::Services),
                 MenuItem::separator(),

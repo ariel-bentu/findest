@@ -33,6 +33,8 @@ Run from a terminal, a release build of `findest` installs or updates `Findest.a
 
 Findest also appears in Finder's "Open With" menu for folders.
 
+To have "Show in Finder" / "Reveal in Finder" in other apps (browser downloads, editors) open Findest instead, choose **Findest › Use Findest as Default File Viewer**; **Use Finder as Default File Viewer** switches back. macOS doesn't let apps replace Finder for folders themselves, the Desktop, or the Dock. If you delete Findest without switching back, reveals fall back to Finder; `defaults delete -g NSFileViewer` removes the leftover setting.
+
 ## Develop
 
 ```sh

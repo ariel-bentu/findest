@@ -940,6 +940,18 @@ impl Browser {
                 crate::search_service::resume(cx);
                 self.set_info("Indexing resumed", cx);
             }
+            UseFindestAsDefault => match crate::default_viewer::use_findest() {
+                Ok(()) => self.set_info("“Show in Finder” in other apps now opens Findest. Undo: Findest menu › Use Finder as Default File Viewer", cx),
+                Err(e) => self.set_error(format!("{e:#}"), cx),
+            },
+            UseFinderAsDefault => {
+                let was = crate::default_viewer::is_default();
+                match crate::default_viewer::use_finder() {
+                    Ok(()) if was => self.set_info("Finder is the default file viewer again", cx),
+                    Ok(()) => self.set_info("Finder is already the default file viewer", cx),
+                    Err(e) => self.set_error(format!("{e:#}"), cx),
+                }
+            }
             ToggleIndexing => {
                 let on = !cx.try_global::<crate::search_service::IndexService>().is_some_and(|s| s.enabled());
                 match crate::search_service::set_enabled(on, cx) {
@@ -1086,7 +1098,7 @@ impl Browser {
             ShowRecents => self.navigate(Location::Recents, true, cx),
             RevealInFinder => {
                 for path in self.selection_or_current() {
-                    self.report(launch::reveal_in_finder(&path), cx);
+                    self.report(crate::default_viewer::reveal_in_finder(&path), cx);
                 }
             }
             OpenConfig => {
@@ -1138,7 +1150,7 @@ impl Browser {
             }
             MenuAction::History { back, steps } => self.go_history(back, steps, cx),
             MenuAction::RevealPath(path) => {
-                let result = launch::reveal_in_finder(&path);
+                let result = crate::default_viewer::reveal_in_finder(&path);
                 self.report(result, cx);
             }
         }
@@ -1548,8 +1560,11 @@ impl Browser {
         }
     }
 
+    /// Shows a folder, or a file (or app bundle) selected in its folder, as
+    /// for "Show in Finder" from other apps.
     pub fn navigate_to_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if path.is_dir() {
+        let package = Entry::from_path(&path).is_ok_and(|e| e.is_package);
+        if path.is_dir() && !package {
             self.navigate(Location::Dir(path), true, cx);
         } else if let Some(parent) = path.parent().filter(|_| path.exists()) {
             self.navigate(Location::Dir(parent.to_path_buf()), true, cx);
