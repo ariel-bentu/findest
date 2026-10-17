@@ -197,7 +197,7 @@ pub fn keybindings(map: &std::collections::BTreeMap<String, String>) -> (Vec<Key
     (bindings, errors)
 }
 
-/// The first key bound to `command`, formatted for display in menus (e.g. "⌘⇧N").
+/// The first key bound to `command`, formatted for display in menus (e.g. "⌘⇧N" or "Ctrl+Shift+N").
 pub fn shortcut_label(map: &std::collections::BTreeMap<String, String>, command: &str) -> Option<String> {
     let keys = map.iter().filter(|(_, c)| *c == command).map(|(k, _)| k).min_by_key(|k| k.len())?;
     let mut out = String::new();
@@ -208,27 +208,63 @@ pub fn shortcut_label(map: &std::collections::BTreeMap<String, String>, command:
         Some((last, rest)) => (rest, *last),
         None => return None,
     };
-    for m in ["ctrl", "alt", "shift", "cmd"] {
-        if mods.contains(&m) {
-            out.push_str(match m {
-                "ctrl" => "⌃",
-                "alt" => "⌥",
-                "shift" => "⇧",
-                _ => "⌘",
-            });
+
+    #[cfg(target_os = "macos")]
+    {
+        for m in ["ctrl", "alt", "shift", "cmd", "secondary"] {
+            if mods.contains(&m) {
+                out.push_str(match m {
+                    "ctrl" => "⌃",
+                    "alt" => "⌥",
+                    "shift" => "⇧",
+                    _ => "⌘",
+                });
+            }
         }
+        out.push_str(&match key {
+            "backspace" => "⌫".to_string(),
+            "enter" => "↩".to_string(),
+            "up" => "↑".to_string(),
+            "down" => "↓".to_string(),
+            "left" => "←".to_string(),
+            "right" => "→".to_string(),
+            "escape" => "⎋".to_string(),
+            "space" => "Space".to_string(),
+            k => k.to_uppercase(),
+        });
     }
-    out.push_str(&match key {
-        "backspace" => "⌫".to_string(),
-        "enter" => "↩".to_string(),
-        "up" => "↑".to_string(),
-        "down" => "↓".to_string(),
-        "left" => "←".to_string(),
-        "right" => "→".to_string(),
-        "escape" => "⎋".to_string(),
-        "space" => "Space".to_string(),
-        k => k.to_uppercase(),
-    });
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        for m in ["ctrl", "secondary", "alt", "shift", "cmd"] {
+            if mods.contains(&m) {
+                out.push_str(match m {
+                    "ctrl" | "secondary" => "Ctrl+",
+                    "alt" => "Alt+",
+                    "shift" => "Shift+",
+                    _ => "Super+",
+                });
+            }
+        }
+        out.push_str(&match key {
+            "backspace" => "Backspace".to_string(),
+            "enter" => "Enter".to_string(),
+            "up" => "Up".to_string(),
+            "down" => "Down".to_string(),
+            "left" => "Left".to_string(),
+            "right" => "Right".to_string(),
+            "escape" => "Esc".to_string(),
+            "space" => "Space".to_string(),
+            k => {
+                let mut chars = k.chars();
+                match chars.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                    None => String::new(),
+                }
+            }
+        });
+    }
+
     Some(out)
 }
 
@@ -255,9 +291,19 @@ mod tests {
     #[test]
     fn labels() {
         let map = findest_core::config::Config::default().keybindings();
-        assert_eq!(shortcut_label(&map, "new_folder").unwrap(), "⇧⌘N");
-        assert_eq!(shortcut_label(&map, "trash").unwrap(), "⌘⌫");
-        assert_eq!(shortcut_label(&map, "open").unwrap(), "⌘O");
-        assert_eq!(shortcut_label(&map, "zoom_out").unwrap(), "⌘-");
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(shortcut_label(&map, "new_folder").unwrap(), "⇧⌘N");
+            assert_eq!(shortcut_label(&map, "trash").unwrap(), "⌘⌫");
+            assert_eq!(shortcut_label(&map, "open").unwrap(), "⌘O");
+            assert_eq!(shortcut_label(&map, "zoom_out").unwrap(), "⌘-");
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(shortcut_label(&map, "new_folder").unwrap(), "Ctrl+Shift+N");
+            assert_eq!(shortcut_label(&map, "trash").unwrap(), "Ctrl+Backspace");
+            assert_eq!(shortcut_label(&map, "open").unwrap(), "Ctrl+O");
+            assert_eq!(shortcut_label(&map, "zoom_out").unwrap(), "Ctrl+-");
+        }
     }
 }

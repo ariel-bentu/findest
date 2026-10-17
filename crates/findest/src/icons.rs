@@ -1,5 +1,8 @@
-//! Native Finder icons via `NSWorkspace`, rendered to PNG off the UI thread
-//! and cached by [`IconKey`] so a folder of 10k `.txt` files costs one lookup.
+//! File icons. macOS renders Finder/AppKit icons; other platforms fall back to
+//! the Unicode icons in `render.rs`.
+//!
+//! The cache is shared by every icon source so a folder of 10k `.txt` files
+//! costs one lookup.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -8,13 +11,19 @@ use std::time::SystemTime;
 
 use findest_core::listing::{Entry, TagColor};
 use gpui::{Image, ImageFormat};
+
+#[cfg(target_os = "macos")]
 use objc2::{AllocAnyThread, Message};
+#[cfg(target_os = "macos")]
 use objc2::rc::autoreleasepool;
+#[cfg(target_os = "macos")]
 use objc2_app_kit::{
     NSBitmapImageFileType, NSBitmapImageRep, NSColor, NSFontWeightMedium, NSImage, NSImageSymbolConfiguration,
     NSWorkspace,
 };
+#[cfg(target_os = "macos")]
 use objc2_foundation::{NSDictionary, NSPoint, NSRect, NSSize, NSString};
+#[cfg(target_os = "macos")]
 use objc2_uniform_type_identifiers::{UTType, UTTypeData, UTTypeFolder};
 
 /// Rendered icon edge in pixels: sharp on Retina both in rows (~18pt) and
@@ -73,39 +82,50 @@ impl IconKey {
 
     fn load_at(&self, pixels: f64) -> Option<Vec<u8>> {
         match self {
+            #[cfg(target_os = "macos")]
             IconKey::Symbol { name, rgb } => return render_symbol(name, *rgb),
+            #[cfg(not(target_os = "macos"))]
+            IconKey::Symbol { .. } => return None,
             IconKey::Large(inner) => return inner.load_at(LARGE_ICON_PIXELS),
             IconKey::Tinted(inner, color) => return tint_png(&inner.load_at(pixels)?, color.rgb()),
             IconKey::Thumbnail { path, pixels, .. } => return crate::system::image_preview_png(path, *pixels as f64),
             _ => {}
         }
-        autoreleasepool(|_| {
-            let workspace = NSWorkspace::sharedWorkspace();
-            let image = match self {
-                IconKey::Path(path) => workspace.iconForFile(&NSString::from_str(path.to_str()?)),
-                IconKey::Extension(ext) => {
-                    let ty = UTType::typeWithFilenameExtension(&NSString::from_str(ext));
-                    // SAFETY: UTTypeData is an immutable framework constant.
-                    let ty = ty.unwrap_or_else(|| unsafe { UTTypeData }.retain());
-                    workspace.iconForContentType(&ty)
-                }
-                // SAFETY: immutable framework constants.
-                IconKey::Folder => workspace.iconForContentType(unsafe { UTTypeFolder }),
-                IconKey::File => workspace.iconForContentType(unsafe { UTTypeData }),
-                IconKey::Symbol { .. } | IconKey::Large(_) | IconKey::Tinted(..) | IconKey::Thumbnail { .. } => {
-                    unreachable!("handled above")
-                }
-            };
-            let size = NSSize::new(pixels, pixels);
-            image.setSize(size);
-            let mut rect = NSRect::new(NSPoint::new(0.0, 0.0), size);
-            // SAFETY: `rect` is a valid pointer for the duration of the call.
-            let cg_image = unsafe { image.CGImageForProposedRect_context_hints(&mut rect, None, None) }?;
-            let rep = NSBitmapImageRep::initWithCGImage(NSBitmapImageRep::alloc(), &cg_image);
-            // SAFETY: an empty properties dictionary is valid.
-            let png = unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new()) }?;
-            Some(png.to_vec())
-        })
+        #[cfg(target_os = "macos")]
+        {
+            autoreleasepool(|_| {
+                let workspace = NSWorkspace::sharedWorkspace();
+                let image = match self {
+                    IconKey::Path(path) => workspace.iconForFile(&NSString::from_str(path.to_str()?)),
+                    IconKey::Extension(ext) => {
+                        let ty = UTType::typeWithFilenameExtension(&NSString::from_str(ext));
+                        // SAFETY: UTTypeData is an immutable framework constant.
+                        let ty = ty.unwrap_or_else(|| unsafe { UTTypeData }.retain());
+                        workspace.iconForContentType(&ty)
+                    }
+                    // SAFETY: immutable framework constants.
+                    IconKey::Folder => workspace.iconForContentType(unsafe { UTTypeFolder }),
+                    IconKey::File => workspace.iconForContentType(unsafe { UTTypeData }),
+                    IconKey::Symbol { .. } | IconKey::Large(_) | IconKey::Tinted(..) | IconKey::Thumbnail { .. } => {
+                        unreachable!("handled above")
+                    }
+                };
+                let size = NSSize::new(pixels, pixels);
+                image.setSize(size);
+                let mut rect = NSRect::new(NSPoint::new(0.0, 0.0), size);
+                // SAFETY: `rect` is a valid pointer for the duration of the call.
+                let cg_image = unsafe { image.CGImageForProposedRect_context_hints(&mut rect, None, None) }?;
+                let rep = NSBitmapImageRep::initWithCGImage(NSBitmapImageRep::alloc(), &cg_image);
+                // SAFETY: an empty properties dictionary is valid.
+                let png = unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new()) }?;
+                Some(png.to_vec())
+            })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = pixels;
+            None
+        }
     }
 }
 
@@ -139,6 +159,7 @@ fn tint_pixel([r, g, b, a]: [u8; 4], rgb: [u8; 3]) -> [u8; 4] {
 }
 
 /// Renders an SF Symbol at Retina resolution, keeping its aspect ratio.
+#[cfg(target_os = "macos")]
 fn render_symbol(name: &str, rgb: u32) -> Option<Vec<u8>> {
     autoreleasepool(|_| {
         let c = |shift: u32| ((rgb >> shift) & 0xff) as f64 / 255.0;
@@ -210,10 +231,12 @@ pub fn load_icon(key: &IconKey) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
     fn is_png(bytes: &[u8]) -> bool {
         bytes.starts_with(b"\x89PNG")
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn tinting_keeps_shading_and_transparency() {
         let red = TagColor::Red.rgb();
@@ -228,6 +251,7 @@ mod tests {
         assert!(light[1] > tinted[1] && light[2] > tinted[2], "highlights get lighter");
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn tinted_folder_icons_render() {
         let folder = IconKey::Folder.load().unwrap();
@@ -274,6 +298,7 @@ mod tests {
         assert!(load_icon(&IconKey::Symbol { name: "no.such.symbol.xyz", rgb: 0 }).is_none());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn renders_icons_off_main_thread() {
         let keys = [
@@ -292,5 +317,12 @@ mod tests {
         ];
         let handle = std::thread::spawn(move || keys.iter().map(|k| load_icon(k).map(|b| is_png(&b))).collect::<Vec<_>>());
         assert!(handle.join().unwrap().iter().all(|r| *r == Some(true)));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn uses_text_fallbacks_without_native_icons() {
+        assert!(load_icon(&IconKey::Folder).is_none());
+        assert!(load_icon(&IconKey::Symbol { name: "folder", rgb: 0 }).is_none());
     }
 }

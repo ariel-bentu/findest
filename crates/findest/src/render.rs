@@ -32,6 +32,7 @@ const NAME_START: f32 = 4.0 + 8.0 + TREE_GUTTER + 22.0;
 const COLUMN_HANDLE: f32 = 8.0;
 /// How to write a source adapter.
 const SOURCES_DOCS_URL: &str = "https://github.com/ariel-bentu/findest/blob/main/docs/sources.md";
+const TITLEBAR_HEIGHT: f32 = 32.0;
 /// Width of the disclosure-triangle column, and the indent per tree level.
 const TREE_GUTTER: f32 = 14.0;
 const TREE_INDENT: f32 = 16.0;
@@ -86,19 +87,11 @@ impl Render for Browser {
         }
 
         let theme = &self.theme;
-        let mut root = div()
-            .id("browser")
-            .key_context(BROWSER_CONTEXT)
-            .track_focus(&self.focus)
-            .on_action(cx.listener(Self::on_run))
-            .on_key_down(cx.listener(Self::on_key_down))
-            .size_full()
+        let main_area = div()
             .flex()
             .flex_row()
-            .bg(theme.background)
-            .text_color(theme.text)
-            .text_size(px(theme.font_size))
-            // The sidebar runs full height; toolbar and status bar belong to the file pane.
+            .flex_1()
+            .min_h_0()
             .child(self.render_sidebar(cx))
             .child(
                 div()
@@ -121,7 +114,22 @@ impl Render for Browser {
                     )
                     .child(self.render_path_bar(cx))
                     .child(self.render_status_bar(cx)),
-            )
+            );
+
+        let mut root = div()
+            .id("browser")
+            .key_context(BROWSER_CONTEXT)
+            .track_focus(&self.focus)
+            .on_action(cx.listener(Self::on_run))
+            .on_key_down(cx.listener(Self::on_key_down))
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme.background)
+            .text_color(theme.text)
+            .text_size(px(theme.font_size))
+            .children(self.render_window_titlebar(window, cx))
+            .child(main_area)
             .children(self.render_text_preview(cx))
             .children(self.render_menu(cx))
             .children(self.render_syntax_help(cx));
@@ -133,6 +141,114 @@ impl Render for Browser {
 }
 
 impl Browser {
+    /// Renders client-side titlebar when the window manager doesn't provide decorations
+    /// (e.g. Wayland on GNOME, or when Client decorations are active).
+    fn render_window_titlebar(&self, window: &Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if matches!(window.window_decorations(), gpui::Decorations::Server) {
+            return None;
+        }
+        let theme = &self.theme;
+        let title = format!("Findest — {}", self.location_label());
+        let maximized = window.is_maximized();
+
+        type Action = fn(&mut Window, &mut Context<Browser>);
+        let button = |id: &'static str, label: &'static str, hover_bg: Hsla, on_click: Action| {
+            div()
+                .id(id)
+                .w(px(38.))
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(11.))
+                .text_color(theme.text_muted)
+                .hover(move |s| s.bg(hover_bg).text_color(theme.text))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |_, _, window, cx| on_click(window, cx)))
+                .child(label)
+        };
+
+        let min_btn = button(
+            "win-min",
+            "─",
+            theme.hover,
+            |window, _| window.minimize_window(),
+        );
+        let max_btn = button(
+            "win-max",
+            if maximized { "❐" } else { "□" },
+            theme.hover,
+            |window, _| window.zoom_window(),
+        );
+        let close_btn = button(
+            "win-close",
+            "✕",
+            theme.danger,
+            |window, _| window.remove_window(),
+        );
+
+        Some(
+            div()
+                .id("window-titlebar")
+                .h(px(TITLEBAR_HEIGHT))
+                .w_full()
+                .flex_none()
+                .flex()
+                .flex_row()
+                .items_center()
+                .bg(theme.sidebar)
+                .border_b_1()
+                .border_color(theme.border)
+                // Right-click opens the window manager menu (Move, Resize, Close...).
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|_, event: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        window.show_window_menu(event.position);
+                    }),
+                )
+                .child(
+                    // Draggable area covering the full titlebar width except the controls.
+                    div()
+                        .id("titlebar-drag")
+                        .flex_1()
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .px_3()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, event: &MouseDownEvent, window, _| {
+                                if event.click_count >= 2 {
+                                    window.titlebar_double_click();
+                                } else {
+                                    window.start_window_move();
+                                }
+                            }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(theme.font_size - 1.))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme.text_muted)
+                                .truncate()
+                                .child(title),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .h_full()
+                        .flex_none()
+                        .child(min_btn)
+                        .child(max_btn)
+                        .child(close_btn),
+                ),
+        )
+    }
+
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = &self.theme;
         let hidden_label = if self.config.general.show_hidden { "Hidden: shown" } else { "Hidden: off" };
@@ -309,7 +425,7 @@ impl Browser {
             })
             .child(match &self.search {
                 Some(search) => div().flex_1().min_w_0().child(search.input.clone()).into_any_element(),
-                None => div().flex_1().text_color(theme.text_muted).child("Search  ⌘F").into_any_element(),
+                None => div().flex_1().text_color(theme.text_muted).child(search_placeholder()).into_any_element(),
             })
             .children(self.search.as_ref().filter(|s| !s.input.read(cx).text().is_empty()).map(|_| self.search_clear_button(cx)))
     }
@@ -529,8 +645,18 @@ impl Browser {
     /// List / tiles switch; the current view is highlighted.
     fn view_button(&self, view: ViewMode, cx: &mut Context<Self>) -> impl IntoElement {
         let (id, symbol, fallback, hint) = match view {
-            ViewMode::List => ("view-list", "list.bullet.indent", "☰", "View as list (⌘1)"),
-            ViewMode::Tiles => ("view-tiles", "square.grid.2x2", "▦", "View as tiles (⌘2)"),
+            ViewMode::List => (
+                "view-list",
+                "list.bullet.indent",
+                "☰",
+                if cfg!(target_os = "macos") { "View as list (⌘1)" } else { "View as list (Ctrl+1)" },
+            ),
+            ViewMode::Tiles => (
+                "view-tiles",
+                "square.grid.2x2",
+                "▦",
+                if cfg!(target_os = "macos") { "View as tiles (⌘2)" } else { "View as tiles (Ctrl+2)" },
+            ),
         };
         self.symbol_button(id, symbol, fallback, true)
             .w(px(30.))
@@ -542,9 +668,14 @@ impl Browser {
     /// Opens/closes the info panel; highlighted while it's open.
     fn info_toggle_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let open = self.config.general.info_panel;
+        let hint = if cfg!(target_os = "macos") {
+            if open { "Hide info panel (⌘I)" } else { "Show info panel (⌘I)" }
+        } else {
+            if open { "Hide info panel (Ctrl+I)" } else { "Show info panel (Ctrl+I)" }
+        };
         self.symbol_button("info-toggle", "sidebar.right", "▥", true)
             .when(open, |d| d.bg(self.theme.hover))
-            .tooltip(tooltip(if open { "Hide info panel (⌘I)" } else { "Show info panel (⌘I)" }))
+            .tooltip(tooltip(hint))
             .on_click(cx.listener(|this, _, window, cx| this.run(crate::command::Command::ToggleInfo, window, cx)))
     }
 
@@ -578,7 +709,11 @@ impl Browser {
         let below = |p: Point<Pixels>| Point { x: p.x - px(14.), y: p.y + px(18.) };
         let (id, symbol, fallback) =
             if back { ("back", "chevron.left", "‹") } else { ("forward", "chevron.right", "›") };
-        let hint = if back { "Back (⌘[) · hold for history" } else { "Forward (⌘]) · hold for history" };
+        let hint = if cfg!(target_os = "macos") {
+            if back { "Back (⌘[) · hold for history" } else { "Forward (⌘]) · hold for history" }
+        } else {
+            if back { "Back (Ctrl+[) · hold for history" } else { "Forward (Ctrl+]) · hold for history" }
+        };
         self.symbol_button(id, symbol, fallback, enabled)
             .tooltip(tooltip(hint))
             .on_mouse_down(
@@ -719,7 +854,7 @@ impl Browser {
         let mut push_location = |id: String, symbol, label: String, path: PathBuf| {
             places.push(SidebarPlace { section: "Locations", id, symbol, label, path, favorite: None, signed_out: None });
         };
-        push_location("loc-root".into(), "internaldrive", "Macintosh HD".into(), PathBuf::from("/"));
+        push_location("loc-root".into(), "internaldrive", root_volume_name().into(), PathBuf::from("/"));
         for (ix, v) in self.volumes.iter().enumerate() {
             push_location(format!("loc-{ix}"), "externaldrive", v.label.clone(), v.path.clone());
         }
@@ -1534,7 +1669,7 @@ impl Browser {
         };
         let entry = self.entries.iter().find(|e| e.path == info.path).cloned().or_else(|| Entry::from_path(&info.path).ok())?;
 
-        // Preview: the image itself, an AppKit rendering, or a large icon. Text
+        // Preview: the image itself, an AppKit/image rendering, or a large icon. Text
         // files additionally get their first lines below the details.
         let preview: AnyElement = if crate::browser::gpui_decodes(&entry.path) && entry.size.is_some_and(|s| s <= MAX_PREVIEW_BYTES) {
             img(entry.path.clone()).w_full().max_h(px(220.)).object_fit(ObjectFit::Contain).rounded_md().into_any_element()
@@ -1611,6 +1746,7 @@ impl Browser {
     fn info_close_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = &self.theme;
         let icon = self.icons.peek(&self.symbol_key_colored("xmark", theme.text_muted));
+        let hint = if cfg!(target_os = "macos") { "Close info panel (⌘I)" } else { "Close info panel (Ctrl+I)" };
         div()
             .id("info-close")
             .absolute()
@@ -1625,7 +1761,7 @@ impl Browser {
             .text_color(theme.text_muted)
             .hover(|s| s.bg(theme.hover))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .tooltip(tooltip("Close info panel (⌘I)"))
+            .tooltip(tooltip(hint))
             .on_click(cx.listener(|this, _, window, cx| this.run(crate::command::Command::ToggleInfo, window, cx)))
             .child(match icon {
                 Some(image) => img(image).size(px(11.)).object_fit(ObjectFit::Contain).into_any_element(),
@@ -1932,7 +2068,11 @@ impl Browser {
                 .pl_2()
                 .rounded_md()
                 .bg(theme.hover)
-                .tooltip(tooltip(if self.clipboard_cut { "⌘V moves these here" } else { "⌘V copies these here" }))
+                .tooltip(tooltip(if cfg!(target_os = "macos") {
+                    if self.clipboard_cut { "⌘V moves these here" } else { "⌘V copies these here" }
+                } else {
+                    if self.clipboard_cut { "Ctrl+V moves these here" } else { "Ctrl+V copies these here" }
+                }))
                 .children(icon.map(|i| img(i).size(px(12.)).flex_none()))
                 .child(div().min_w_0().truncate().child(format!("{what} {verb}")))
                 .child(
@@ -1968,7 +2108,7 @@ impl Browser {
             .h(px(16.))
             .relative()
             .cursor_pointer()
-            .tooltip(tooltip("Tile size (⌘= / ⌘-)"))
+            .tooltip(tooltip(if cfg!(target_os = "macos") { "Tile size (⌘= / ⌘-)" } else { "Tile size (Ctrl+= / Ctrl+-)" }))
             .child(div().absolute().left(px(KNOB / 2.)).right(px(KNOB / 2.)).top(px(6.5)).h(px(3.)).rounded_full().bg(theme.border))
             .child(
                 div()
@@ -2265,6 +2405,14 @@ fn icon_for(entry: &Entry) -> &'static str {
         ) => "📝",
         _ => "📄",
     }
+}
+
+fn search_placeholder() -> &'static str {
+    if cfg!(target_os = "macos") { "Search  ⌘F" } else { "Search  Ctrl+F" }
+}
+
+fn root_volume_name() -> &'static str {
+    if cfg!(target_os = "macos") { "Macintosh HD" } else { "Filesystem" }
 }
 
 /// "15 October 2026 at 14:03".

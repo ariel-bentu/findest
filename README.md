@@ -1,6 +1,6 @@
 # Findest
 
-A fast, keyboard-friendly file browser for macOS, written in Rust on [GPUI](https://gpui.rs) (Zed's GPU-accelerated UI framework).
+A fast, keyboard-friendly file browser for macOS and Linux, written in Rust on [GPUI](https://gpui.rs) (Zed's GPU-accelerated UI framework).
 
 ## Features
 
@@ -24,6 +24,18 @@ A fast, keyboard-friendly file browser for macOS, written in Rust on [GPUI](http
 - **Configurable:** theme, colors, fonts, favorites and every shortcut, in a commented TOML file that applies as soon as you save it.
 
 ## Install
+
+### Linux
+
+Build and install from a clone:
+
+```sh
+cargo install --path crates/findest
+findest            # opens your home folder
+findest ~/code     # open a folder (like `code .`)
+```
+
+### macOS
 
 With Homebrew. This builds from source on your Mac, so there are no Gatekeeper warnings and no Apple developer account is needed:
 

@@ -18,6 +18,10 @@ const ASSETS: &[u8] = include_bytes!("../../../assets/Assets.car");
 
 /// Returns true if this process handed off to Findest.app and should exit.
 pub fn handoff_if_needed() -> bool {
+    // The self-installer only makes sense on macOS; Linux runs the binary in place.
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
     if cfg!(debug_assertions) || running_in_bundle() || std::env::var_os("FINDEST_NO_BUNDLE").is_some() {
         return false;
     }
@@ -197,7 +201,7 @@ fn info_plist() -> String {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
 

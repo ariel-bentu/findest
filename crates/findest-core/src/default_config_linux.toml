@@ -1,0 +1,85 @@
+# Findest configuration.
+# Changes are picked up automatically when this file is saved.
+
+[general]
+# Folder shown when Findest starts. "~" is your home folder.
+start_path = "~"
+# Reopen the folder and expanded subfolders from last time instead of start_path.
+restore_session = true
+# Show the info panel (details of the selection) on the right. Toggle with Ctrl+I.
+info_panel = true
+show_hidden = false
+folders_first = true
+# name | size | modified | kind
+sort_by = "name"
+sort_ascending = true
+# Ask before moving items to the Trash.
+confirm_trash = false
+# How many recently opened files to remember.
+max_recents = 50
+
+[appearance]
+# dark | light | system
+theme = "system"
+font_size = 13.0
+row_height = 26.0
+# Leave empty for the system font.
+font_family = ""
+# Override any theme color with a hex value, e.g. accent = "#ff8800".
+# Keys: background, sidebar, surface, border, text, text_muted, accent,
+#       selection, selection_text, hover, danger
+[appearance.colors]
+
+# Sidebar favorites, in order. Add or remove them from the app too
+# (right-click a folder > "Add to Favorites").
+[[favorites]]
+path = "~"
+
+[[favorites]]
+path = "~/Desktop"
+
+[[favorites]]
+path = "~/Documents"
+
+[[favorites]]
+path = "~/Downloads"
+
+# "Open with" targets. Placeholders in `command`:
+#   {path} - the selected item (or the current folder if nothing is selected)
+#   {dir}  - the folder containing the selected item (or the item itself if it's a folder)
+# `for` limits where an opener shows up: "any", "files" or "folders".
+[[openers]]
+name = "VS Code"
+command = ["code", "{path}"]
+for = "any"
+
+[[openers]]
+name = "Terminal"
+command = ["x-terminal-emulator", "{dir}"]
+for = "any"
+
+[[openers]]
+name = "File Manager"
+command = ["xdg-open", "{dir}"]
+for = "any"
+
+# Search (Ctrl+F). Findest keeps an index of file names for instant results.
+[search]
+# Folders searched by "Everywhere".
+roots = ["~"]
+# Paths to skip, or "**/name" to skip a folder name anywhere.
+exclude = ["~/.cache", "~/.local/share/Trash", "**/node_modules", "**/.git", "**/target"]
+# Results shown at most (the count still includes every match).
+max_results = 10000
+# content: skips files larger than this many megabytes.
+content_max_mb = 20
+
+# Keyboard shortcuts, merged over the built-in defaults. Set a shortcut to
+# "none" to disable it. Openers are bound with "open_with:<name>".
+# "secondary" is Ctrl on Linux (Command on macOS).
+# Built-in defaults include: secondary-e = open_with:VS Code,
+# secondary-alt-t = open_with:Terminal, enter = rename, secondary-o = open.
+[keybindings]
+# "enter" = "open"
+# "f2" = "rename"
+# "secondary-p" = "open_with:VS Code"

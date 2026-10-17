@@ -10,16 +10,18 @@
 //! synchronously; callers inside a gpui update must go through
 //! [`toggle`] / [`follow`], which defer the AppKit work.
 
-use std::cell::RefCell;
-use std::path::PathBuf;
+#[cfg(target_os = "macos")]
+mod mac {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
 
-use objc2::rc::{Retained, Weak};
-use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{ClassType, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send};
-use objc2_app_kit::{NSEvent, NSEventType, NSResponder, NSView, NSWindowDelegate};
-use objc2_foundation::{NSInteger, NSNotification, NSObjectProtocol, NSString, NSURL};
-use objc2_quick_look_ui::{QLPreviewItem, QLPreviewPanel, QLPreviewPanelDataSource, QLPreviewPanelDelegate};
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use objc2::rc::{Retained, Weak};
+    use objc2::runtime::{AnyObject, ProtocolObject};
+    use objc2::{ClassType, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send};
+    use objc2_app_kit::{NSEvent, NSEventType, NSResponder, NSView, NSWindowDelegate};
+    use objc2_foundation::{NSInteger, NSNotification, NSObjectProtocol, NSString, NSURL};
+    use objc2_quick_look_ui::{QLPreviewItem, QLPreviewPanel, QLPreviewPanelDataSource, QLPreviewPanelDelegate};
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 #[derive(Default)]
 struct State {
@@ -240,4 +242,24 @@ fn show(view: &NSView, paths: Vec<PathBuf>, mtm: MainThreadMarker) {
         }
     }
 }
+}
+
+#[cfg(target_os = "macos")]
+pub use mac::*;
+
+#[cfg(not(target_os = "macos"))]
+mod imp {
+    use std::path::PathBuf;
+
+    pub fn is_open_for(_window: &gpui::Window) -> bool {
+        false
+    }
+
+    pub fn toggle(_window: &gpui::Window, _paths: Vec<PathBuf>, _cx: &gpui::App) {}
+
+    pub fn follow(_paths: Vec<PathBuf>, _cx: &gpui::App) {}
+}
+
+#[cfg(not(target_os = "macos"))]
+pub use imp::*;
 
