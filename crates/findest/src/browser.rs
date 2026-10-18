@@ -964,6 +964,9 @@ impl Browser {
         if writes_files(&command) && self.in_source() {
             return self.set_error("Sources are read-only", cx);
         }
+        if command == Copy && self.source_folder_selected() {
+            return self.set_error("Folders can't be copied out of a source yet; select its files instead", cx);
+        }
         if matches!(command, Open | QuickLook | OpenWith(_) | Copy) && !self.fetched(&self.selection(), cx) {
             self.after_fetch = Some(command);
             return self.set_info(format!("Fetching {}…", describe(&self.selection())), cx);
@@ -2282,9 +2285,17 @@ impl Browser {
         if paths.is_empty() {
             return;
         }
+        if self.source_folder_selected() {
+            return self.set_error("Folders can't be copied out of a source yet; select its files instead", cx);
+        }
+        // AppKit needs this mouse event to drag, so an unfetched file can't wait for its content.
+        if !self.fetched(&paths, cx) {
+            return self.set_info(format!("Fetching {}… drag again when it's done", describe(&paths)), cx);
+        }
+        let from_source = paths.iter().any(|p| sources::global().contains(p));
         let handle = self.scroll.0.borrow().base_handle.clone();
         let start_offset = handle.offset();
-        if let Some(ended) = crate::native_drag::start_file_drag(window, &paths) {
+        if let Some(ended) = crate::native_drag::start_file_drag(window, &paths, from_source) {
             // Cancelled (Esc) or dropped nowhere: scroll back to where the dragged items are.
             cx.spawn(async move |this, cx| {
                 if ended.await == Ok(false) {
@@ -2516,7 +2527,8 @@ impl Browser {
                 this.reload(cx);
             });
         }
-        let copy = force_copy || !ops::same_volume(&paths[0], &dest);
+        // Items from a source are cache copies: never move them out.
+        let copy = force_copy || !ops::same_volume(&paths[0], &dest) || paths.iter().any(|p| sources::global().contains(p));
         let n = paths.len();
         let dest_name = locations::friendly_name(&self.home, &dest);
         self.transfer_into(paths, dest, !copy, window, cx, move |this, created, cx| {
@@ -2804,6 +2816,11 @@ impl Browser {
     /// True when showing a folder in a source.
     pub(crate) fn in_source(&self) -> bool {
         self.current_dir().is_some_and(|d| sources::global().contains(&d))
+    }
+
+    /// A selected folder is in a source: its cache holds only the files fetched so far.
+    fn source_folder_selected(&self) -> bool {
+        self.entries.iter().any(|e| e.is_dir && self.selected.contains(&e.path) && sources::global().contains(&e.path))
     }
 
     /// True when every source file in `paths` is fetched to its cache path;

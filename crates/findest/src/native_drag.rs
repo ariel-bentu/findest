@@ -3,7 +3,7 @@
 //! another Findest window, Finder, Mail, or any other app. gpui's own drag
 //! state can't leave the window it started in.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 
 use futures::channel::oneshot;
@@ -31,7 +31,8 @@ define_class!(
         #[unsafe(method(draggingSession:sourceOperationMaskForDraggingContext:))]
         fn source_operation_mask(&self, _session: &NSDraggingSession, _context: NSDraggingContext) -> NSDragOperation {
             // Let the destination choose, as Finder does: move within a volume, copy across.
-            NSDragOperation::Copy | NSDragOperation::Move | NSDragOperation::Generic
+            // Source files are cache copies: moving one would take it out of the source.
+            if COPY_ONLY.get() { NSDragOperation::Copy } else { NSDragOperation::Copy | NSDragOperation::Move | NSDragOperation::Generic }
         }
 
         #[unsafe(method(draggingSession:endedAtPoint:operation:))]
@@ -56,14 +57,17 @@ thread_local! {
     static SOURCE: RefCell<Option<Retained<DragSource>>> = const { RefCell::new(None) };
     /// Told when the session ends: whether the items were dropped somewhere.
     static ENDED: RefCell<Option<oneshot::Sender<bool>>> = const { RefCell::new(None) };
+    /// The current drag may only copy.
+    static COPY_ONLY: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Starts a native drag of `paths` from `window`. Must be called while gpui
 /// is handling the mouse-drag event (AppKit needs that event). Returns `None`
 /// if the session couldn't be started, else a receiver that gets `true` if
 /// the items were dropped somewhere and `false` if the drag was cancelled
-/// (Esc) or released where nothing accepts files.
-pub fn start_file_drag(window: &gpui::Window, paths: &[PathBuf]) -> Option<oneshot::Receiver<bool>> {
+/// (Esc) or released where nothing accepts files. `copy_only` stops
+/// destinations from moving the items.
+pub fn start_file_drag(window: &gpui::Window, paths: &[PathBuf], copy_only: bool) -> Option<oneshot::Receiver<bool>> {
     let mtm = MainThreadMarker::new()?;
     let handle = HasWindowHandle::window_handle(window).ok()?;
     let RawWindowHandle::AppKit(handle) = handle.as_raw() else { return None };
@@ -94,6 +98,7 @@ pub fn start_file_drag(window: &gpui::Window, paths: &[PathBuf]) -> Option<onesh
         return None;
     }
 
+    COPY_ONLY.set(copy_only);
     let source = DragSource::new(mtm);
     view.beginDraggingSessionWithItems_event_source(
         &NSArray::from_retained_slice(&items),
