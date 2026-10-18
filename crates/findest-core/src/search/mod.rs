@@ -6,6 +6,7 @@ pub mod index;
 pub mod live;
 pub mod query;
 pub mod run;
+pub mod source;
 
 pub use index::{Excludes, Index};
 pub use live::{LiveProgress, live_search};

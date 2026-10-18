@@ -1295,7 +1295,11 @@ impl Browser {
         };
 
         let last_column = if recents {
-            entry.path.parent().map(contract_tilde).unwrap_or_default()
+            entry
+                .path
+                .parent()
+                .map(|p| findest_core::sources::global().describe(p).unwrap_or_else(|| contract_tilde(p)))
+                .unwrap_or_default()
         } else {
             entry.kind()
         };

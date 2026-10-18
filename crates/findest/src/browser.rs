@@ -658,7 +658,9 @@ impl Browser {
                             not_permitted: false,
                             sign_in: Some(id),
                         },
-                        SourceError::Failed(message) => LoadError { message, not_permitted: false, sign_in: None },
+                        SourceError::Failed(_) | SourceError::NotSupported { .. } => {
+                            LoadError { message: e.to_string(), not_permitted: false, sign_in: None }
+                        }
                     })
                 }
                 Location::Dir(dir) => listing::read_tree(dir, &expanded, show_hidden, order).map(|rows| (rows, Vec::new())).map_err(|e| LoadError {

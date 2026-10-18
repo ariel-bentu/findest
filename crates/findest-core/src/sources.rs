@@ -24,6 +24,8 @@ use crate::listing::{Entry, SortOrder, TreeRow};
 
 /// Exit code for "not signed in" (BSD `EX_NOPERM`).
 pub const NOT_SIGNED_IN: i32 = 77;
+/// Exit code for "this adapter has no such verb" (BSD `EX_USAGE`).
+pub const NOT_SUPPORTED: i32 = 64;
 
 /// Listings older than this are fetched again when a folder is shown.
 const LISTING_TTL: Duration = Duration::from_secs(60);
@@ -58,6 +60,8 @@ fn default_root() -> String {
 pub enum SourceError {
     /// The adapter asked to sign in (exit 77).
     NotSignedIn { id: String, name: String },
+    /// The adapter doesn't have this verb (exit 64).
+    NotSupported { verb: String, name: String },
     Failed(String),
 }
 
@@ -65,6 +69,7 @@ impl std::fmt::Display for SourceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SourceError::NotSignedIn { name, .. } => write!(f, "Not signed in to {name}"),
+            SourceError::NotSupported { verb, name } => write!(f, "{name} doesn't support `{verb}`"),
             SourceError::Failed(message) => f.write_str(message),
         }
     }
@@ -82,6 +87,8 @@ struct WireListing {
 
 #[derive(Deserialize)]
 struct WireEntry {
+    /// Search results only: the folder ref the entry is in.
+    folder: Option<String>,
     name: String,
     kind: String,
     #[serde(rename = "ref")]
@@ -94,14 +101,14 @@ struct WireEntry {
 
 /// A folder's listing as far as it's been fetched.
 #[derive(Clone)]
-struct Listing {
+pub(crate) struct Listing {
     at: Instant,
     /// Entries, and whether each folder has something inside.
-    rows: Vec<(Entry, bool)>,
+    pub(crate) rows: Vec<(Entry, bool)>,
     /// The adapter's token for the next page, if there's more.
-    next: Option<String>,
+    pub(crate) next: Option<String>,
     /// Problems with entries the adapter sent.
-    warnings: Vec<String>,
+    pub(crate) warnings: Vec<String>,
 }
 
 #[derive(Default)]
@@ -275,36 +282,54 @@ impl Sources {
         let mut args = vec![self.folder_ref(&source, dir)];
         args.extend(listing.next.take());
         let out = run(&source, "list", &args, REQUEST_TIMEOUT)?;
-        let page: WireListing = serde_json::from_slice(&out).map_err(|e| {
-            SourceError::Failed(format!("{}: `list` printed something that isn't a listing: {e}", source.name))
-        })?;
+        let page = parse_page(&source, "list", &out)?;
         listing.warnings.extend(page.warnings.iter().map(|w| format!("{}: {w}", source.name)));
-        let mut names: HashSet<String> = listing.rows.iter().map(|(e, _)| e.name.clone()).collect();
+        let mut seen: HashSet<PathBuf> = listing.rows.iter().map(|(e, _)| e.path.clone()).collect();
+        let rows = self.admit(&source, page.entries, &mut seen, &mut listing.warnings, |_| Ok(dir.to_path_buf()));
+        listing.rows.extend(rows);
+        listing.next = page.next.filter(|t| !t.is_empty());
+        Ok(())
+    }
+
+    /// Checks the adapter's entries, turns them into rows at the folder
+    /// `place` gives each, and remembers their refs. Bad ones become warnings.
+    fn admit(
+        &self,
+        source: &Source,
+        wires: Vec<WireEntry>,
+        seen: &mut HashSet<PathBuf>,
+        warnings: &mut Vec<String>,
+        place: impl Fn(&WireEntry) -> Result<PathBuf, String>,
+    ) -> Vec<(Entry, bool)> {
+        let mut rows = Vec::new();
         let mut refs = Vec::new();
         let mut files = Vec::new();
-        for wire in page.entries {
+        for wire in wires {
+            let dir = place(&wire);
             let problem = if wire.name.is_empty() || wire.name.contains('/') || wire.name == "." || wire.name == ".." || wire.name == MORE_NAME {
                 Some(format!("bad name {:?}", wire.name))
             } else if wire.kind != "folder" && wire.kind != "file" {
                 Some(format!("{:?}: kind must be \"folder\" or \"file\", not {:?}", wire.name, wire.kind))
-            } else if !names.insert(wire.name.clone()) {
+            } else if let Err(problem) = &dir {
+                Some(format!("{:?}: {problem}", wire.name))
+            } else if !seen.insert(dir.as_ref().unwrap().join(&wire.name)) {
                 Some(format!("{:?} is listed twice", wire.name))
             } else {
                 None
             };
             if let Some(problem) = problem {
-                listing.warnings.push(format!("{}: skipped an entry: {problem}", source.name));
+                warnings.push(format!("{}: skipped an entry: {problem}", source.name));
                 continue;
             }
             let modified = wire.modified.as_deref().and_then(|text| {
                 let time = parse_time(text);
                 if time.is_none() {
-                    listing.warnings.push(format!("{}: {:?}: modified isn't an RFC 3339 time: {text:?}", source.name, wire.name));
+                    warnings.push(format!("{}: {:?}: modified isn't an RFC 3339 time: {text:?}", source.name, wire.name));
                 }
                 time
             });
             let is_dir = wire.kind == "folder";
-            let path = dir.join(&wire.name);
+            let path = dir.unwrap().join(&wire.name);
             refs.push((path.clone(), wire.reference));
             if !is_dir {
                 files.push(path.clone());
@@ -321,13 +346,62 @@ impl Sources {
                 color: None,
                 label: wire.label,
             };
-            listing.rows.push((entry, is_dir && wire.has_children.unwrap_or(true)));
+            rows.push((entry, is_dir && wire.has_children.unwrap_or(true)));
         }
-        listing.next = page.next.filter(|t| !t.is_empty());
         let mut state = self.state.lock().unwrap();
         state.refs.extend(refs);
         state.files.extend(files);
-        Ok(())
+        rows
+    }
+
+    /// For search: a folder's listing as fetched so far.
+    pub(crate) fn listing_for_search(&self, dir: &Path) -> Result<Listing, SourceError> {
+        self.listing(dir)
+    }
+
+    /// Runs the adapter's `search` for one page of results under `dir`.
+    /// `SourceError::NotSupported` if the adapter has no `search`.
+    pub(crate) fn search_page(
+        &self,
+        dir: &Path,
+        hints: &str,
+        next: Option<String>,
+        seen: &mut HashSet<PathBuf>,
+    ) -> Result<SearchPage, SourceError> {
+        let source = self.source_for(dir)?;
+        let under = self.folder_ref(&source, dir);
+        let mut args = vec![under.clone(), hints.to_string()];
+        args.extend(next);
+        let out = run(&source, "search", &args, REQUEST_TIMEOUT)?;
+        let page = parse_page(&source, "search", &out)?;
+        let mut warnings: Vec<String> = page.warnings.iter().map(|w| format!("{}: {w}", source.name)).collect();
+        let mount = self.mount_path(&source);
+        let inside = |folder: &str| folder == under || under == "/" || folder.starts_with(&format!("{under}/"));
+        let rows = self.admit(&source, page.entries, seen, &mut warnings, |wire| match wire.folder.as_deref() {
+            None => Err("search results need \"folder\"".into()),
+            Some(folder) if !folder.starts_with('/') || folder.split('/').any(|p| p == ".." || p == ".") => {
+                Err(format!("bad folder {folder:?}"))
+            }
+            Some(folder) if !inside(folder) => Err(format!("folder {folder:?} isn't under {under:?}")),
+            Some(folder) => {
+                let mut path = mount.clone();
+                path.extend(folder.split('/').filter(|p| !p.is_empty()));
+                Ok(path)
+            }
+        });
+        Ok(SearchPage { rows, next: page.next.filter(|t| !t.is_empty()), warnings })
+    }
+
+    /// A folder in a source as people would say it: "URM canary /sap/x".
+    pub fn describe(&self, path: &Path) -> Option<String> {
+        let source = self.source_at(path)?;
+        Some(format!("{} {}", source.name, self.folder_ref(&source, path)))
+    }
+
+    /// The item's path inside its source (`/a/b/name`), for `path:` queries.
+    pub(crate) fn source_path(&self, path: &Path) -> Option<String> {
+        let source = self.source_at(path)?;
+        Some(self.folder_ref(&source, path))
     }
 
     /// Like [`crate::listing::read_tree`]: `root`, with every expanded folder's
@@ -497,6 +571,9 @@ fn run(source: &Source, verb: &str, args: &[String], timeout: Duration) -> Resul
     if status.code() == Some(NOT_SIGNED_IN) {
         return Err(SourceError::NotSignedIn { id: source.id.clone(), name: source.name.clone() });
     }
+    if status.code() == Some(NOT_SUPPORTED) {
+        return Err(SourceError::NotSupported { verb: verb.to_string(), name: source.name.clone() });
+    }
     let stderr = String::from_utf8_lossy(&stderr);
     let message = match stderr.lines().rev().map(str::trim).find(|l| !l.is_empty()) {
         Some(line) => line.to_string(),
@@ -506,6 +583,18 @@ fn run(source: &Source, verb: &str, args: &[String], timeout: Duration) -> Resul
         },
     };
     Err(SourceError::Failed(format!("{}: {message}", source.name)))
+}
+
+fn parse_page(source: &Source, verb: &str, out: &[u8]) -> Result<WireListing, SourceError> {
+    serde_json::from_slice(out)
+        .map_err(|e| SourceError::Failed(format!("{}: `{verb}` printed something that isn't a listing: {e}", source.name)))
+}
+
+/// One page of an adapter's `search` results.
+pub(crate) struct SearchPage {
+    pub(crate) rows: Vec<(Entry, bool)>,
+    pub(crate) next: Option<String>,
+    pub(crate) warnings: Vec<String>,
 }
 
 fn parse_time(text: &str) -> Option<SystemTime> {

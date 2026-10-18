@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""Findest source adapter for a Kubernetes cluster, via kubectl.
+Protocol: docs/sources.md. Configure it in ~/.config/findest/config.toml:
+
+    [[sources]]
+    id = "k3d-dev"
+    name = "k3d dev"
+    command = ["/path/to/k8s-source", "--context", "k3d-dev"]
+
+
+    k8s-source [--context NAME] list <folder> [<continue>]
+    k8s-source ... read <ref> <dest>
+    k8s-source ... search <folder> <hints-json>
+    k8s-source ... login
+
+Tree:
+    /                       namespaces, plus "(cluster)" for cluster-scoped kinds
+    /<ns>/                  kinds with something in them, e.g. "deployments.apps"
+    /<ns>/<kind>/           resources as <name>.yaml, labeled with their status
+    /(cluster)/<kind>/      the same for cluster-scoped kinds (nodes, CRDs...)
+"""
+import argparse
+import json
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+
+NOT_SIGNED_IN = 77
+NOT_SUPPORTED = 64
+CLUSTER = "(cluster)"  # namespaces can't contain parentheses, so no clash
+AUTH_ERRORS = ("must be logged in", "unauthorized", "provide credentials", "token has expired")
+
+
+class NotSignedIn(Exception):
+    pass
+
+
+def kubectl(args, opts, check=True):
+    cmd = ["kubectl", "--request-timeout=20s", *args]
+    if opts.context:
+        cmd[1:1] = ["--context", opts.context]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0 and check:
+        lines = [l for l in proc.stderr.splitlines() if l.strip() and not l.startswith("Warning:")]
+        message = lines[-1] if lines else f"kubectl exited {proc.returncode}"
+        if any(s in message.lower() for s in AUTH_ERRORS):
+            raise NotSignedIn(message)
+        if "connection refused" in message.lower() or "unable to connect" in message.lower():
+            message += " (is the cluster running? e.g. `k3d cluster start`)"
+        raise RuntimeError(message)
+    return proc
+
+
+def kinds(namespaced, opts):
+    out = kubectl(["api-resources", "--verbs=list", f"--namespaced={'true' if namespaced else 'false'}", "-o", "name"], opts).stdout
+    return [k for k in out.split() if k]
+
+
+def count(kind, namespace, opts):
+    args = ["get", kind, "-o", "name"] + (["-n", namespace] if namespace else [])
+    # One kind failing (e.g. a metrics API that's down) mustn't hide the others.
+    proc = kubectl(args, opts, check=False)
+    return kind, len(proc.stdout.split()) if proc.returncode == 0 else None
+
+
+def list_kinds(namespace, opts, warnings):
+    """The kinds that have resources, as folders, with how many."""
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        counts = list(pool.map(lambda k: count(k, namespace, opts), kinds(namespace is not None, opts)))
+    entries = []
+    failed = [k for k, n in counts if n is None]
+    for kind, n in counts:
+        if n:
+            entries.append({"name": kind, "kind": "folder", "ref": "", "label": f"{n} item{'s' if n != 1 else ''}"})
+    if failed and not entries:
+        raise RuntimeError(f"Can't list any kind here (failed: {', '.join(failed[:3])}…)")
+    if failed:
+        warnings.append(f"couldn't list {', '.join(failed)}")
+    return entries
+
+
+def status(item):
+    """A short status for the Kind column: pod phase, ready replicas, Ready condition."""
+    kind = item.get("kind", "")
+    st = item.get("status") or {}
+    spec = item.get("spec") or {}
+    if item.get("metadata", {}).get("deletionTimestamp"):
+        return "Terminating"
+    if kind == "Pod":
+        waiting = [c.get("state", {}).get("waiting", {}).get("reason") for c in st.get("containerStatuses") or []]
+        waiting = [w for w in waiting if w]
+        return waiting[0] if waiting else st.get("phase")
+    if "replicas" in spec and kind in ("Deployment", "StatefulSet", "ReplicaSet"):
+        return f"{st.get('readyReplicas', 0)}/{spec['replicas']} ready"
+    if kind == "DaemonSet":
+        return f"{st.get('numberReady', 0)}/{st.get('desiredNumberScheduled', 0)} ready"
+    for c in st.get("conditions") or []:
+        if c.get("type") == "Ready":
+            return "Ready" if c.get("status") == "True" else (c.get("reason") or "Not ready")
+    if kind == "Namespace":
+        return st.get("phase")
+    return None
+
+
+def resource_entry(item, namespace, kind):
+    meta = item.get("metadata") or {}
+    name = meta.get("name")
+    state = status(item)
+    label = item.get("kind") or kind
+    return {
+        "name": f"{name}.yaml",
+        "kind": "file",
+        "ref": json.dumps([namespace or "", kind, name]),
+        "label": f"{label} · {state}" if state else label,
+        "modified": meta.get("creationTimestamp"),
+    }
+
+
+def list_resources(namespace, kind, opts):
+    args = ["get", kind, "-o", "json"] + (["-n", namespace] if namespace else [])
+    items = json.loads(kubectl(args, opts).stdout).get("items", [])
+    return [resource_entry(item, namespace, kind) for item in items]
+
+
+def get_all(kind, namespace, cluster_scoped, opts):
+    """Every `kind` in `namespace`, or in all namespaces when it's None."""
+    scope = [] if cluster_scoped else (["-n", namespace] if namespace else ["-A"])
+    proc = kubectl(["get", kind, "-o", "json", *scope], opts, check=False)
+    if proc.returncode != 0:
+        return kind, cluster_scoped, None
+    return kind, cluster_scoped, json.loads(proc.stdout).get("items", [])
+
+
+def cmd_search(folder, hints, opts):
+    """Everything under `folder` whose name contains all the hint's names,
+    each with the folder it's in. Kinds are fetched in parallel; kubectl
+    can't filter names, so that's done here."""
+    names = json.loads(hints).get("names") or []
+    wanted = lambda name: all(n in name.lower() for n in names)
+    parts = [p for p in folder.split("/") if p]
+    if len(parts) > 2:
+        raise RuntimeError(f"no folder {folder}")
+    top = parts[0] if parts else None
+    namespace = None if top in (None, CLUSTER) else top
+    if namespace:
+        kubectl(["get", "namespace", namespace, "-o", "name"], opts)  # fails if it doesn't exist
+    jobs = []
+    if top != CLUSTER:
+        jobs += [(k, False) for k in kinds(True, opts)]
+    if top in (None, CLUSTER):
+        jobs += [(k, True) for k in kinds(False, opts)]
+    if len(parts) == 2:
+        jobs = [(k, c) for k, c in jobs if k == parts[1]]
+        if not jobs:
+            raise RuntimeError(f"no folder {folder}")
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        results = list(pool.map(lambda job: get_all(job[0], namespace, job[1], opts), jobs))
+    entries, counts, failed = [], {}, []
+    for kind, cluster_scoped, items in results:
+        if items is None:
+            failed.append(kind)
+            continue
+        for item in items:
+            ns = None if cluster_scoped else item.get("metadata", {}).get("namespace")
+            top_folder = CLUSTER if cluster_scoped else ns
+            counts[(top_folder, kind)] = counts.get((top_folder, kind), 0) + 1
+            entry = resource_entry(item, ns, kind)
+            if wanted(entry["name"]):
+                entries.append({**entry, "folder": f"/{top_folder}/{kind}"})
+    # The folders on the way: kinds (with counts, as `list` shows them) and namespaces.
+    if len(parts) < 2:
+        for (top_folder, kind), n in counts.items():
+            if wanted(kind):
+                entries.append({"name": kind, "kind": "folder", "ref": f"/{top_folder}/{kind}",
+                                "label": f"{n} item{'s' if n != 1 else ''}", "folder": f"/{top_folder}"})
+    if not parts:
+        entries.extend({**e, "folder": "/"} for e in list_namespaces(opts) if wanted(e["name"]))
+    out = {"entries": [{k: v for k, v in e.items() if v is not None} for e in entries]}
+    if failed:
+        out["warnings"] = [f"couldn't search {', '.join(failed)}"]
+    return out
+
+
+def list_namespaces(opts):
+    items = json.loads(kubectl(["get", "namespaces", "-o", "json"], opts).stdout).get("items", [])
+    entries = [{"name": CLUSTER, "kind": "folder", "ref": "/" + CLUSTER, "label": "Cluster-scoped"}]
+    for item in items:
+        meta = item.get("metadata") or {}
+        entries.append({
+            "name": meta["name"],
+            "kind": "folder",
+            "ref": "/" + meta["name"],
+            "label": "Namespace · " + (status(item) or "Active"),
+            "modified": meta.get("creationTimestamp"),
+        })
+    return entries
+
+
+def cmd_list(folder, opts):
+    parts = [p for p in folder.split("/") if p]
+    warnings = []
+    if not parts:
+        entries = list_namespaces(opts)
+    elif len(parts) == 1:
+        namespace = None if parts[0] == CLUSTER else parts[0]
+        if namespace:
+            kubectl(["get", "namespace", namespace, "-o", "name"], opts)  # fails if it doesn't exist
+        entries = list_kinds(namespace, opts, warnings)
+        for e in entries:
+            e["ref"] = f"/{parts[0]}/{e['name']}"
+    elif len(parts) == 2:
+        namespace = None if parts[0] == CLUSTER else parts[0]
+        entries = list_resources(namespace, parts[1], opts)
+    else:
+        raise RuntimeError(f"no folder {folder}")
+    out = {"entries": [{k: v for k, v in e.items() if v is not None} for e in entries]}
+    if warnings:
+        out["warnings"] = warnings
+    return out
+
+
+def cmd_read(ref, dest, opts):
+    namespace, kind, name = json.loads(ref)
+    args = ["get", kind, name, "-o", "yaml"] + (["-n", namespace] if namespace else [])
+    yaml = kubectl(args, opts).stdout
+    with open(dest, "w") as f:
+        f.write(yaml)
+
+
+def cmd_login(opts):
+    # Local clusters (k3d, kind) need no sign-in; this just checks we can reach it.
+    # For a cloud cluster, run its login here (e.g. `kubectl oidc-login`).
+    kubectl(["get", "namespaces", "-o", "name"], opts)
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--context", help="kubeconfig context (default: the current one)")
+    p.add_argument("verb")
+    p.add_argument("args", nargs="*")
+    opts = p.parse_args()
+    try:
+        if opts.verb == "list":
+            print(json.dumps(cmd_list(opts.args[0] if opts.args else "/", opts)))
+        elif opts.verb == "read":
+            cmd_read(opts.args[0], opts.args[1], opts)
+        elif opts.verb == "search":
+            print(json.dumps(cmd_search(opts.args[0], opts.args[1], opts)))
+        elif opts.verb == "login":
+            cmd_login(opts)
+        else:
+            print(f"unknown verb {opts.verb!r}", file=sys.stderr)
+            sys.exit(NOT_SUPPORTED)
+    except NotSignedIn as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(NOT_SIGNED_IN)
+    except Exception as e:
+        print(str(e) or type(e).__name__, file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

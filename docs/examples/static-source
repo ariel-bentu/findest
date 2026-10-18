@@ -2,7 +2,7 @@
 """A Findest source adapter serving a fixed tree. See docs/sources.md.
 
 Copy this file to start your own adapter: keep main() and the output format,
-and replace TREE, FILES and the three cmd_* functions with calls to your
+and replace TREE, FILES and the cmd_* functions with calls to your
 system (a CLI, an HTTP API...).
 
 Try it by hand:
@@ -10,6 +10,7 @@ Try it by hand:
     ./static-source list /big
     ./static-source list /big 2
     ./static-source read hello /tmp/hello.txt
+    ./static-source search / '{"names": ["item"]}'
 """
 import json
 import sys
@@ -70,6 +71,23 @@ def cmd_read(ref, dest):
         f.write(FILES[ref])
 
 
+def cmd_search(folder, hints, token=None):
+    """Optional. Everything under `folder` whose name contains all of the
+    hint's `names`, each with the "folder" it's in. Returning more than
+    matches is fine: Findest checks every result against the full query
+    (here, extensions and everything else are left to Findest)."""
+    if folder not in TREE:
+        fail(f"no folder {folder}")
+    names = json.loads(hints).get("names", [])
+    found = []
+    for parent, entries in TREE.items():
+        if parent == folder or parent.startswith(folder.rstrip("/") + "/"):
+            for entry in entries:
+                if all(n in entry["name"].lower() for n in names):
+                    found.append({**entry, "folder": parent})
+    return {"entries": found}
+
+
 def cmd_login():
     """Signs in, e.g. by opening a browser. Nothing to do for a static tree."""
 
@@ -86,10 +104,15 @@ def main():
             print(json.dumps(cmd_list(*args)))
         elif verb == "read":
             cmd_read(*args)
+        elif verb == "search":
+            print(json.dumps(cmd_search(*args)))
         elif verb == "login":
             cmd_login()
         else:
-            fail(f"unknown verb {verb!r}")
+            # 64: "I don't do that". Findest then works without it (for
+            # `search`: by listing folder after folder).
+            print(f"unknown verb {verb!r}", file=sys.stderr)
+            sys.exit(64)
     except Exception as e:  # never exit 0 after a failure
         fail(str(e))
 

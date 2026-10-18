@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use findest_core::listing::Entry;
 use findest_core::search::{self, Excludes, LiveProgress, SearchOptions};
+use findest_core::sources;
 use gpui::{AppContext, Context, Entity, Focusable, ScrollStrategy, Subscription, Task, Window};
 
 use crate::browser::{Browser, Location};
@@ -206,8 +207,47 @@ impl Browser {
         search.scanned.store(0, Ordering::Relaxed);
         search.running = true;
         let cancel = search.cancel.clone();
-        match (index, under) {
-            (Some(index), Some(under)) if !search.live => {
+        // A source is searched through its adapter: the cache folder only
+        // holds what's been opened, so neither the index nor the disk will do.
+        let source_dir = current_dir.clone().filter(|d| !search.everywhere && sources::global().contains(d));
+        match (index, under, source_dir) {
+            (_, _, Some(dir)) => {
+                let name = sources::global().source_at(&dir).map(|s| s.name).unwrap_or_default();
+                search.note = Some(format!("Searching {name}…"));
+                let progress = Arc::new(LiveProgress::default());
+                search.live_progress = Some(progress.clone());
+                let opts = SearchOptions { under: None, include_hidden, max_content_bytes };
+                let work = cx.background_executor().spawn(async move {
+                    search::source::search_source(sources::global(), &dir, &query, &text, &opts, &progress, &cancel)
+                });
+                search._task = Some(cx.spawn(async move |this, cx| {
+                    let result = work.await;
+                    this.update(cx, |this, cx| match result {
+                        Ok(Some(mut found)) => {
+                            let total = found.entries.len();
+                            found.entries.truncate(max_results);
+                            if let Some(search) = &mut this.search {
+                                search.note = Some(found.how);
+                            }
+                            this.show_results(found.entries, total, refresh, cx);
+                            if let Some(first) = found.warnings.first() {
+                                let more = found.warnings.len() - 1;
+                                this.set_error(if more == 0 { first.clone() } else { format!("{first} (and {more} more)") }, cx);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            if let Some(search) = &mut this.search {
+                                search.running = false;
+                                search.error = Some(e.to_string());
+                            }
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                }));
+            }
+            (Some(index), Some(under), None) if !search.live => {
                 search.note = None;
                 search.live_progress = None;
                 let scanned = search.scanned.clone();
@@ -222,7 +262,7 @@ impl Browser {
                     this.update(cx, |this, cx| this.show_results(entries, total, refresh, cx)).ok();
                 }));
             }
-            (index, _) => {
+            (index, _, None) => {
                 let roots = match current_dir.filter(|_| !search.everywhere) {
                     Some(dir) => vec![dir],
                     None => self.config.search.root_paths(),
