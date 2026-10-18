@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context as _, Result};
@@ -192,6 +193,8 @@ pub struct Status {
     pub is_error: bool,
     /// More to see on click (e.g. files that couldn't be copied).
     pub details: Vec<String>,
+    /// A source (by id) the user needs to sign in to: shows a Sign In button.
+    pub sign_in: Option<String>,
 }
 
 pub struct ContextMenu {
@@ -222,6 +225,8 @@ pub enum MenuAction {
     History { back: bool, steps: usize },
     /// Color the selected folders (`None` clears it).
     SetColor(Option<listing::TagColor>),
+    /// Create a folder (or file) inside `dir`, expand it and name the new item.
+    NewIn { dir: PathBuf, folder: bool },
 }
 
 /// Details of the single selected item, shown in the info panel.
@@ -345,6 +350,10 @@ pub struct Browser {
     pub(crate) after_fetch: Option<Command>,
     /// Findest's own preview for YAML and other text Quick Look can't show.
     pub(crate) text_preview: Option<crate::text_preview::TextPreview>,
+    /// The source being signed in to, and the flag that cancels it.
+    pub(crate) signing_in: Option<(String, Arc<AtomicBool>)>,
+    /// Go to's Tab matches, for the text they were found for.
+    pub(crate) go_to_matches: Option<(String, Vec<String>)>,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -480,6 +489,8 @@ impl Browser {
             fetching: None,
             after_fetch: None,
             text_preview: None,
+            signing_in: None,
+            go_to_matches: None,
             _tasks: tasks,
             _subscriptions: subscriptions,
         };
@@ -658,7 +669,7 @@ impl Browser {
                             not_permitted: false,
                             sign_in: Some(id),
                         },
-                        SourceError::Failed(_) | SourceError::NotSupported { .. } => {
+                        SourceError::Failed(_) | SourceError::NotSupported { .. } | SourceError::Cancelled { .. } => {
                             LoadError { message: e.to_string(), not_permitted: false, sign_in: None }
                         }
                     })
@@ -901,12 +912,12 @@ impl Browser {
     // ---- Status -------------------------------------------------------
 
     pub fn set_error(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
-        self.status = Some(Status { message: message.into(), is_error: true, details: Vec::new() });
+        self.status = Some(Status { message: message.into(), is_error: true, details: Vec::new(), sign_in: None });
         cx.notify();
     }
 
     pub fn set_info(&mut self, message: impl Into<String>, cx: &mut Context<Self>) {
-        self.status = Some(Status { message: message.into(), is_error: false, details: Vec::new() });
+        self.status = Some(Status { message: message.into(), is_error: false, details: Vec::new(), sign_in: None });
         cx.notify();
     }
 
@@ -1189,6 +1200,7 @@ impl Browser {
         self.menu = None;
         match action {
             MenuAction::Command(command) => self.run(command, window, cx),
+            MenuAction::NewIn { dir, folder } => self.new_in(dir, folder, cx),
             MenuAction::SetColor(color) => self.set_folder_color(color, cx),
             MenuAction::RemoveFavorite(ix) => {
                 if ix < self.config.favorites.len() {
@@ -1367,6 +1379,7 @@ impl Browser {
             message: format!("{message} · {n} couldn't be read (click for details)"),
             is_error: true,
             details: skipped.iter().map(|(path, why)| format!("{}: {why}", contract_tilde(path))).collect(),
+            sign_in: None,
         });
         cx.notify();
     }
@@ -1795,8 +1808,19 @@ impl Browser {
             }
             Location::Recents => "~/".into(),
         };
+        // Selected, so pasting or typing a path replaces it (→ extends it instead).
         let len = text.len();
-        self.start_edit(EditKind::GoToFolder, text, len..len, "Path, e.g. ~/Projects", window, cx);
+        self.start_edit(EditKind::GoToFolder, text, 0..len, "Path, e.g. ~/Projects", window, cx);
+    }
+
+    /// Tab in Go to: completes the path like a terminal.
+    fn complete_go_to(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = &self.edit else { return };
+        let input = edit.input.clone();
+        let done = findest_core::paths::complete_path(input.read(cx).text());
+        let len = done.text.len();
+        self.go_to_matches = done.candidates.map(|c| (done.text.clone(), c));
+        input.update(cx, |input, cx| input.set_text(done.text, len..len, cx));
     }
 
     fn start_edit(
@@ -1825,7 +1849,10 @@ impl Browser {
             cx.subscribe_in(&input, window, |this, _, event, window, cx| match event {
                 TextInputEvent::Confirm => this.commit_edit(window, cx),
                 TextInputEvent::Cancel => this.cancel_edit(window, cx),
-                TextInputEvent::Up | TextInputEvent::Down => {}
+                TextInputEvent::Tab if matches!(this.edit.as_ref().map(|e| &e.kind), Some(EditKind::GoToFolder)) => {
+                    this.complete_go_to(cx)
+                }
+                TextInputEvent::Up | TextInputEvent::Down | TextInputEvent::Tab => {}
             }),
             cx.on_blur(&input.focus_handle(cx), window, |this, window, cx| {
                 // Clicking away commits a rename, but abandons go-to-folder.
@@ -2035,6 +2062,16 @@ impl Browser {
             entries.push(self.item("Open", Open, "open"));
             entries.extend(self.opener_items(all_dirs));
             entries.push(MenuEntry::Separator);
+            if let [folder] = &selection[..]
+                && folder.is_dir
+                && !sources::global().contains(&folder.path)
+            {
+                for (label, is_folder) in [("New Folder", true), ("New File", false)] {
+                    let action = MenuAction::NewIn { dir: folder.path.clone(), folder: is_folder };
+                    entries.push(MenuEntry::Item { label: label.into(), detail: None, action, danger: false });
+                }
+                entries.push(MenuEntry::Separator);
+            }
             if single {
                 entries.push(self.item("Rename", Rename, "rename"));
             }
@@ -2774,7 +2811,7 @@ impl Browser {
                     Ok(()) => this.fetching = None,
                     Err(e) => {
                         this.after_fetch = None;
-                        this.set_error(e.to_string(), cx);
+                        this.report_source_error(e, cx);
                     }
                 }
                 // The info panel read the file before it arrived.
@@ -2787,6 +2824,26 @@ impl Browser {
         false
     }
 
+    /// New folder or file inside `dir` (not the current folder): `dir` is
+    /// expanded (opened, in tiles) and the new item is named, as with ⇧⌘N.
+    fn new_in(&mut self, dir: PathBuf, folder: bool, cx: &mut Context<Self>) {
+        let target = dir.clone();
+        self.run_op(
+            cx,
+            move || if folder { ops::create_folder(&target) } else { ops::create_file(&target) },
+            move |this, path, cx| {
+                if this.view == ViewMode::Tiles {
+                    this.navigate(Location::Dir(dir), true, cx);
+                    this.pending_select = Some(PendingSelect { paths: vec![path], name_new: true });
+                } else {
+                    this.expanded.insert(dir);
+                    this.save_session(cx);
+                    this.reload_and_select(vec![path], true, cx);
+                }
+            },
+        );
+    }
+
     /// Lists the next page of a paged source folder ("Load more…").
     fn load_more(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
         self.set_info("Loading more…", cx);
@@ -2796,7 +2853,7 @@ impl Browser {
             this.update(cx, |this, cx| {
                 match result {
                     Ok(()) => this.status = None,
-                    Err(e) => this.set_error(e.to_string(), cx),
+                    Err(e) => this.report_source_error(e, cx),
                 }
                 this.reload(cx);
             })
@@ -2807,20 +2864,50 @@ impl Browser {
 
     /// Runs the adapter's sign-in, then lists the folder again.
     pub(crate) fn sign_in(&mut self, id: String, cx: &mut Context<Self>) {
-        self.set_info("Signing in… finish in your browser", cx);
-        let task = cx.background_executor().spawn(async move { sources::global().login(&id) });
+        if self.signing_in.is_some() {
+            return;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.signing_in = Some((id.clone(), cancel.clone()));
+        self.status = None;
+        cx.notify();
+        let task = cx.background_executor().spawn(async move { sources::global().login(&id, &cancel) });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             this.update(cx, |this, cx| {
+                this.signing_in = None;
                 match result {
                     Ok(()) => this.set_info("Signed in", cx),
-                    Err(e) => this.set_error(e.to_string(), cx),
+                    Err(e) => this.report_source_error(e, cx),
                 }
+                // Lists the folder (or runs the search) again.
                 this.reload(cx);
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Stops a sign-in that's waiting (e.g. for the browser).
+    pub(crate) fn cancel_sign_in(&mut self, cx: &mut Context<Self>) {
+        if let Some((_, cancel)) = &self.signing_in {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        cx.notify();
+    }
+
+    /// Shows a source's error in the status bar; "not signed in" gets a
+    /// Sign In button.
+    pub(crate) fn report_source_error(&mut self, e: SourceError, cx: &mut Context<Self>) {
+        match e {
+            SourceError::NotSignedIn { ref id, .. } => {
+                let sign_in = Some(id.clone());
+                self.status = Some(Status { message: e.to_string(), is_error: true, details: Vec::new(), sign_in });
+                cx.notify();
+            }
+            SourceError::Cancelled { .. } => self.set_info(e.to_string(), cx),
+            _ => self.set_error(e.to_string(), cx),
+        }
     }
 }
 

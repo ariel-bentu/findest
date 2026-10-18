@@ -19,6 +19,8 @@ pub struct SearchUi {
     /// Search all indexed folders rather than just the current one.
     pub everywhere: bool,
     pub error: Option<String>,
+    /// The error is "not signed in" to this source (by id): offer Sign In.
+    pub sign_in: Option<String>,
     /// Extra context, e.g. why the scope was widened.
     pub note: Option<String>,
     pub running: bool,
@@ -87,7 +89,7 @@ impl Browser {
                         input.update(cx, |input, cx| input.set_text("", 0..0, cx));
                     }
                 }
-                TextInputEvent::Up => {}
+                TextInputEvent::Up | TextInputEvent::Tab => {}
             }),
         ];
         window.focus(&input.focus_handle(cx));
@@ -95,6 +97,7 @@ impl Browser {
             input,
             everywhere: self.current_dir().is_none(),
             error: None,
+            sign_in: None,
             note: None,
             running: false,
             total: 0,
@@ -183,6 +186,7 @@ impl Browser {
 
         if text.is_empty() {
             search.error = None;
+            search.sign_in = None;
             search.note = None;
             search.running = false;
             search._task = None;
@@ -196,6 +200,7 @@ impl Browser {
             }
         };
         search.error = None;
+        search.sign_in = None;
         // Search the disk directly when asked to, when there's no index (off,
         // or not built yet), or when "This folder" isn't in it.
         let under = match (&index, search.everywhere, current_dir.as_deref()) {
@@ -240,6 +245,9 @@ impl Browser {
                             if let Some(search) = &mut this.search {
                                 search.running = false;
                                 search.error = Some(e.to_string());
+                                if let findest_core::sources::SourceError::NotSignedIn { id, .. } = e {
+                                    search.sign_in = Some(id);
+                                }
                             }
                             cx.notify();
                         }

@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -62,6 +63,8 @@ pub enum SourceError {
     NotSignedIn { id: String, name: String },
     /// The adapter doesn't have this verb (exit 64).
     NotSupported { verb: String, name: String },
+    /// The user stopped it (signing in).
+    Cancelled { name: String },
     Failed(String),
 }
 
@@ -70,6 +73,7 @@ impl std::fmt::Display for SourceError {
         match self {
             SourceError::NotSignedIn { name, .. } => write!(f, "Not signed in to {name}"),
             SourceError::NotSupported { verb, name } => write!(f, "{name} doesn't support `{verb}`"),
+            SourceError::Cancelled { name } => write!(f, "Stopped signing in to {name}"),
             SourceError::Failed(message) => f.write_str(message),
         }
     }
@@ -120,6 +124,8 @@ struct State {
     files: HashSet<PathBuf>,
     listings: HashMap<PathBuf, Listing>,
     fetched: HashMap<PathBuf, Instant>,
+    /// Sources whose adapter last said "not signed in".
+    signed_out: HashSet<String>,
 }
 
 pub struct Sources {
@@ -281,7 +287,7 @@ impl Sources {
         let source = self.source_for(dir)?;
         let mut args = vec![self.folder_ref(&source, dir)];
         args.extend(listing.next.take());
-        let out = run(&source, "list", &args, REQUEST_TIMEOUT)?;
+        let out = self.run(&source, "list", &args, REQUEST_TIMEOUT, None)?;
         let page = parse_page(&source, "list", &out)?;
         listing.warnings.extend(page.warnings.iter().map(|w| format!("{}: {w}", source.name)));
         let mut seen: HashSet<PathBuf> = listing.rows.iter().map(|(e, _)| e.path.clone()).collect();
@@ -372,7 +378,7 @@ impl Sources {
         let under = self.folder_ref(&source, dir);
         let mut args = vec![under.clone(), hints.to_string()];
         args.extend(next);
-        let out = run(&source, "search", &args, REQUEST_TIMEOUT)?;
+        let out = self.run(&source, "search", &args, REQUEST_TIMEOUT, None)?;
         let page = parse_page(&source, "search", &out)?;
         let mut warnings: Vec<String> = page.warnings.iter().map(|w| format!("{}: {w}", source.name)).collect();
         let mount = self.mount_path(&source);
@@ -474,7 +480,7 @@ impl Sources {
         }
         // A stale copy must not pass for the new one.
         let _ = std::fs::remove_file(path);
-        run(&source, "read", &[reference, path.to_string_lossy().into_owned()], REQUEST_TIMEOUT)?;
+        self.run(&source, "read", &[reference, path.to_string_lossy().into_owned()], REQUEST_TIMEOUT, None)?;
         if !path.is_file() {
             return Err(SourceError::Failed(format!("{}: `read` finished without writing {name}", source.name)));
         }
@@ -491,12 +497,41 @@ impl Sources {
         })
     }
 
-    /// Runs the adapter's sign-in; drops cached listings so they're fetched again.
-    pub fn login(&self, id: &str) -> Result<(), SourceError> {
+    /// Runs the adapter's sign-in; drops cached listings so they're fetched
+    /// again. Setting `cancel` stops it (`SourceError::Cancelled`).
+    pub fn login(&self, id: &str, cancel: &AtomicBool) -> Result<(), SourceError> {
         let source = self.sources().into_iter().find(|s| s.id == id).ok_or_else(|| SourceError::Failed(format!("No source \"{id}\"")))?;
-        run(&source, "login", &[], LOGIN_TIMEOUT)?;
+        self.run(&source, "login", &[], LOGIN_TIMEOUT, Some(cancel))?;
         self.invalidate(&self.mount_path(&source));
         Ok(())
+    }
+
+    /// True if the source's adapter last said "not signed in" (exit 77).
+    pub fn is_signed_out(&self, id: &str) -> bool {
+        self.state.lock().unwrap().signed_out.contains(id)
+    }
+
+    /// Runs the adapter and keeps track of whether the source is signed in.
+    fn run(
+        &self,
+        source: &Source,
+        verb: &str,
+        args: &[String],
+        timeout: Duration,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<Vec<u8>, SourceError> {
+        let result = run(source, verb, args, timeout, cancel);
+        let mut state = self.state.lock().unwrap();
+        match &result {
+            Ok(_) => {
+                state.signed_out.remove(&source.id);
+            }
+            Err(SourceError::NotSignedIn { .. }) => {
+                state.signed_out.insert(source.id.clone());
+            }
+            Err(_) => {}
+        }
+        result
     }
 
     /// The source whose mount folder is `path`, for breadcrumbs and titles.
@@ -521,8 +556,11 @@ fn more_row(dir: &Path) -> Entry {
     }
 }
 
-/// Runs `command… verb args…` and returns its stdout. Stopped after `timeout`.
-fn run(source: &Source, verb: &str, args: &[String], timeout: Duration) -> Result<Vec<u8>, SourceError> {
+/// Runs `command… verb args…` and returns its stdout. Stopped after
+/// `timeout`, or when `cancel` is set; stopping kills everything the adapter
+/// started (it runs in its own process group), e.g. a `uctl login`.
+fn run(source: &Source, verb: &str, args: &[String], timeout: Duration, cancel: Option<&AtomicBool>) -> Result<Vec<u8>, SourceError> {
+    use std::os::unix::process::CommandExt;
     let Some((program, own_args)) = source.command.split_first() else {
         return Err(SourceError::Failed(format!("{}: no command configured", source.name)));
     };
@@ -533,6 +571,7 @@ fn run(source: &Source, verb: &str, args: &[String], timeout: Duration) -> Resul
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()
         .map_err(|e| SourceError::Failed(format!("{}: can't run {program}: {e}", source.name)))?;
     // Read both pipes while waiting, so a chatty adapter can't block on a full pipe.
@@ -551,9 +590,12 @@ fn run(source: &Source, verb: &str, args: &[String], timeout: Duration) -> Resul
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
+            Ok(None) if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) => {
+                stop(&mut child);
+                return Err(SourceError::Cancelled { name: source.name.clone() });
+            }
             Ok(None) if started.elapsed() > timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
+                stop(&mut child);
                 return Err(SourceError::Failed(format!(
                     "{}: `{verb}` didn't finish within {timeout:?} and was stopped",
                     source.name
@@ -583,6 +625,14 @@ fn run(source: &Source, verb: &str, args: &[String], timeout: Duration) -> Resul
         },
     };
     Err(SourceError::Failed(format!("{}: {message}", source.name)))
+}
+
+/// Kills the adapter and whatever it started.
+fn stop(child: &mut std::process::Child) {
+    // SAFETY: plain syscall; the child leads its own process group.
+    unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGTERM) };
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn parse_page(source: &Source, verb: &str, out: &[u8]) -> Result<WireListing, SourceError> {
@@ -627,6 +677,7 @@ case "$1 $2" in
   "list /locked") exit 77 ;;
   "list /quiet") exit 3 ;;
   "list /slow") sleep 5 ;;
+  "login ") sleep 5 & echo $! > "$(dirname "$0")/login.pid"; wait ;;
   "list /junk") echo 'not json' ;;
   "list /bad") echo '{"entries":[{"name":"a/b","kind":"file","ref":"x"},{"name":"t","kind":"thing","ref":"x"},
     {"name":"f","kind":"file","ref":"F","modified":"yesterday"},{"name":"f","kind":"file","ref":"G"}],"warnings":["half the data is missing"]}' ;;
@@ -716,9 +767,35 @@ esac
         let tmp = tempfile::tempdir().unwrap();
         let source = broken(tmp.path());
         let started = Instant::now();
-        let err = run(&source, "list", &["/slow".into()], Duration::from_millis(200)).unwrap_err();
+        let err = run(&source, "list", &["/slow".into()], Duration::from_millis(200), None).unwrap_err();
         assert_eq!(err.to_string(), "Broken: `list` didn't finish within 200ms and was stopped");
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn tracks_signing_in_and_cancels_login() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_mount, sources, root) = mounted(&broken(tmp.path()));
+        assert!(!sources.is_signed_out("b"));
+        sources.list(&root.join("locked")).unwrap_err();
+        assert!(sources.is_signed_out("b"), "exit 77 marks the source signed out");
+        sources.list(&root.join("bad")).unwrap();
+        assert!(!sources.is_signed_out("b"), "any success clears it");
+
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        assert_eq!(sources.login("b", &cancel).unwrap_err(), SourceError::Cancelled { name: "Broken".into() });
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // What the adapter started was stopped too.
+        let pid: i32 = std::fs::read_to_string(tmp.path().join("login.pid")).unwrap().trim().parse().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        // SAFETY: signal 0 only checks whether the process exists.
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "the adapter's child is gone");
     }
 
     #[test]

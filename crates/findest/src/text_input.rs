@@ -17,7 +17,7 @@ actions!(
     [
         Backspace, Delete, Left, Right, WordLeft, WordRight, SelectLeft, SelectRight, SelectAll,
         Home, End, SelectHome, SelectEnd, Paste, Cut, Copy, Confirm, Cancel, DeleteToStart,
-        DeleteWordLeft, MoveUp, MoveDown,
+        DeleteWordLeft, MoveUp, MoveDown, Tab,
     ]
 );
 
@@ -50,6 +50,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("alt-backspace", DeleteWordLeft, c),
         KeyBinding::new("enter", Confirm, c),
         KeyBinding::new("escape", Cancel, c),
+        KeyBinding::new("tab", Tab, c),
     ]);
 }
 
@@ -59,6 +60,7 @@ pub enum TextInputEvent {
     /// ↑/↓ when `emit_vertical` is set (e.g. to move into a result list).
     Up,
     Down,
+    Tab,
 }
 
 pub struct TextInput {
@@ -204,6 +206,10 @@ impl TextInput {
 
     fn move_down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<Self>) {
         if self.emit_vertical { cx.emit(TextInputEvent::Down) } else { self.move_to(self.content.len(), cx) }
+    }
+
+    fn tab(&mut self, _: &Tab, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(TextInputEvent::Tab);
     }
 
     fn confirm(&mut self, _: &Confirm, _: &mut Window, cx: &mut Context<Self>) {
@@ -658,6 +664,7 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::move_up))
             .on_action(cx.listener(Self::move_down))
             .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::tab))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))

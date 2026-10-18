@@ -30,6 +30,8 @@ const TOP_BAR_HEIGHT: f32 = 44.0;
 const NAME_START: f32 = 4.0 + 8.0 + TREE_GUTTER + 22.0;
 /// Grab width of a column edge in the header.
 const COLUMN_HANDLE: f32 = 8.0;
+/// How to write a source adapter.
+const SOURCES_DOCS_URL: &str = "https://github.com/ariel-bentu/findest/blob/main/docs/sources.md";
 /// Width of the disclosure-triangle column, and the indent per tree level.
 const TREE_GUTTER: f32 = 14.0;
 const TREE_INDENT: f32 = 16.0;
@@ -477,6 +479,7 @@ impl Browser {
                         .text_color(if is_error { theme.danger } else { theme.text_muted })
                         .child(summary),
                 )
+                .children(search.sign_in.as_ref().map(|id| self.render_sign_in("search", id, cx)))
                 .children(index_status.map(|status| {
                     div()
                         .id("index-status")
@@ -619,11 +622,18 @@ impl Browser {
         let edit = self.edit.as_ref().filter(|e| matches!(e.kind, EditKind::GoToFolder))?;
         let theme = &self.theme;
         // Checked every frame while the bar is open: one stat() call, so typing gets live feedback.
-        let (hint, hint_color, border) = match go_to_target(edit.input.read(cx).text()) {
-            GoToTarget::Missing => ("⚠ This path doesn't exist", theme.danger, theme.danger),
-            GoToTarget::File => ("↩ shows the file in its folder · ⎋ cancel", theme.text_muted, theme.accent),
-            GoToTarget::Folder | GoToTarget::Empty => ("↩ go · ⎋ cancel", theme.text_muted, theme.accent),
+        let text = edit.input.read(cx).text();
+        let (mut hint, hint_color, border) = match go_to_target(text) {
+            GoToTarget::Missing => ("⚠ This path doesn't exist".to_string(), theme.danger, theme.danger),
+            GoToTarget::File => ("↩ shows the file in its folder · ⎋ cancel".into(), theme.text_muted, theme.accent),
+            GoToTarget::Folder | GoToTarget::Empty => ("↩ go · ⇥ complete · ⎋ cancel".into(), theme.text_muted, theme.accent),
         };
+        // After a Tab that couldn't complete further: what matches.
+        if let Some((for_text, matches)) = &self.go_to_matches
+            && for_text == text
+        {
+            hint = if matches.is_empty() { "No matches".into() } else { matches.join("   ") };
+        }
         Some(
             div()
                 .flex()
@@ -650,10 +660,12 @@ impl Browser {
                 )
                 .child(
                     div()
-                        .flex_none()
+                        .flex_shrink()
+                        .min_w_0()
+                        .max_w(gpui::relative(0.5))
+                        .truncate()
                         .text_color(hint_color)
                         .text_size(px(theme.font_size - 1.))
-                        .whitespace_nowrap()
                         .child(hint),
                 ),
         )
@@ -671,6 +683,7 @@ impl Browser {
                 label: fav.label(),
                 path,
                 favorite: Some(ix),
+                signed_out: None,
             });
         }
         for (ix, place) in self.cloud.iter().enumerate() {
@@ -682,6 +695,7 @@ impl Browser {
                 label: place.label.clone(),
                 path: place.path.clone(),
                 favorite: None,
+                signed_out: None,
             });
         }
         let mounts = findest_core::sources::global();
@@ -693,10 +707,11 @@ impl Browser {
                 label: source.name.clone(),
                 path: mounts.root_path(&source),
                 favorite: None,
+                signed_out: mounts.is_signed_out(&source.id).then(|| source.id.clone()),
             });
         }
         let mut push_location = |id: String, symbol, label: String, path: PathBuf| {
-            places.push(SidebarPlace { section: "Locations", id, symbol, label, path, favorite: None });
+            places.push(SidebarPlace { section: "Locations", id, symbol, label, path, favorite: None, signed_out: None });
         };
         push_location("loc-root".into(), "internaldrive", "Macintosh HD".into(), PathBuf::from("/"));
         for (ix, v) in self.volumes.iter().enumerate() {
@@ -752,6 +767,45 @@ impl Browser {
             .border_r_1()
             .border_color(theme.border)
             .child(self.render_places(cx))
+            .children(self.render_sources_teaser(cx))
+    }
+
+    /// At the bottom of the sidebar while no sources are configured: a pointer
+    /// to the docs.
+    fn render_sources_teaser(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if !self.config.sources.is_empty() {
+            return None;
+        }
+        let theme = &self.theme;
+        Some(
+            div()
+                .flex_none()
+                .px_4()
+                .py_2()
+                .border_t_1()
+                .border_color(theme.border)
+                .text_size(px(theme.font_size - 2.))
+                .text_color(theme.text_muted)
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap_1()
+                .child("No sources yet.")
+                .child(
+                    div()
+                        .id("sources-learn-more")
+                        .text_color(theme.accent)
+                        .cursor_pointer()
+                        .hover(|s| s.underline())
+                        .tooltip(tooltip("Browse cloud resources, clusters and more as folders, through a small program you plug in"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Err(e) = findest_core::launch::open_url(SOURCES_DOCS_URL) {
+                                this.set_error(format!("{e:#}"), cx);
+                            }
+                        }))
+                        .child("Learn more"),
+                ),
+        )
     }
 
     fn render_places(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -763,6 +817,7 @@ impl Browser {
             "Recents".into(),
             self.location == Location::Recents,
             cx.listener(|this, _: &MouseDownEvent, _, cx| this.navigate(Location::Recents, true, cx)),
+            None,
             None,
             cx,
         ));
@@ -784,6 +839,7 @@ impl Browser {
                     move |this, _: &MouseDownEvent, _, cx| this.navigate_to_path(path.clone(), cx)
                 }),
                 Some((path, place.favorite)),
+                place.signed_out.map(|id| self.render_sign_in_badge(id, cx)),
                 cx,
             ));
         }
@@ -810,6 +866,7 @@ impl Browser {
         active: bool,
         on_click: impl Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
         menu_target: Option<(PathBuf, Option<usize>)>,
+        badge: Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = &self.theme;
@@ -845,6 +902,63 @@ impl Browser {
                 ),
             )
             .child(div().flex_1().min_w_0().truncate().child(label))
+            .children(badge)
+    }
+
+    /// Sign In for a source, or "Signing in…" with Cancel while it runs.
+    /// `place` keeps element ids apart where it appears more than once.
+    pub(crate) fn render_sign_in(&self, place: &'static str, id: &str, cx: &mut Context<Self>) -> AnyElement {
+        let theme = &self.theme;
+        let button = |element_id: &'static str, label: &'static str, primary: bool| {
+            div()
+                .id(SharedString::from(format!("{element_id}-{place}")))
+                .flex_none()
+                .px_2()
+                .rounded_md()
+                .whitespace_nowrap()
+                .cursor_pointer()
+                .when(primary, |d| d.bg(theme.accent).text_color(theme.selection_text))
+                .when(!primary, |d| d.border_1().border_color(theme.border).text_color(theme.text).hover(|s| s.bg(theme.hover)))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(label)
+        };
+        if self.signing_in.as_ref().is_some_and(|(signing, _)| signing == id) {
+            return div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .flex_none()
+                .child(div().whitespace_nowrap().text_color(theme.text_muted).child("Signing in… finish in your browser"))
+                .child(button("cancel-sign-in", "Cancel", false).on_click(cx.listener(|this, _, _, cx| this.cancel_sign_in(cx))))
+                .into_any_element();
+        }
+        let id = id.to_string();
+        button("sign-in", "Sign In", true)
+            .on_click(cx.listener(move |this, _, _, cx| this.sign_in(id.clone(), cx)))
+            .into_any_element()
+    }
+
+    /// The sidebar's "Sign in" next to a signed-out source.
+    fn render_sign_in_badge(&self, id: String, cx: &mut Context<Self>) -> AnyElement {
+        let theme = &self.theme;
+        let signing = self.signing_in.as_ref().is_some_and(|(signing, _)| *signing == id);
+        div()
+            .id(SharedString::from(format!("badge-{id}")))
+            .flex_none()
+            .px_1()
+            .rounded_sm()
+            .text_size(px(theme.font_size - 2.))
+            .text_color(if signing { theme.text_muted } else { theme.accent })
+            .when(!signing, |d| {
+                d.cursor_pointer()
+                    .hover(|s| s.bg(theme.hover))
+                    .tooltip(tooltip("Not signed in. Click to sign in"))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| this.sign_in(id.clone(), cx)))
+            })
+            .child(if signing { "Signing in…" } else { "Sign in" })
+            .into_any_element()
     }
 
     fn render_file_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -976,21 +1090,10 @@ impl Browser {
                         }))
                         .child("Open Privacy Settings"),
                 );
-        } else if let Some(id) = error.sign_in.clone() {
-            panel = panel.child(div().font_weight(FontWeight::SEMIBOLD).child(error.message.clone())).child(
-                div()
-                    .id("source-sign-in")
-                    .mt_2()
-                    .px_3()
-                    .py_1()
-                    .rounded_md()
-                    .bg(theme.accent)
-                    .text_color(theme.selection_text)
-                    .cursor_pointer()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(cx.listener(move |this, _, _, cx| this.sign_in(id.clone(), cx)))
-                    .child("Sign In"),
-            );
+        } else if let Some(id) = &error.sign_in {
+            panel = panel
+                .child(div().font_weight(FontWeight::SEMIBOLD).child(error.message.clone()))
+                .child(div().mt_2().child(self.render_sign_in("load", id, cx)));
         } else {
             panel = panel.child(div().text_color(theme.danger).child(error.message.clone()));
         }
@@ -1627,6 +1730,10 @@ impl Browser {
                     })
                     .child(message),
             )
+            .children(match (&self.signing_in, self.status.as_ref().and_then(|s| s.sign_in.as_ref())) {
+                (Some((id, _)), _) | (None, Some(id)) => Some(self.render_sign_in("status", id, cx)),
+                (None, None) => None,
+            })
             .children(self.render_type_ahead())
             .children(self.render_index_activity(cx))
             .children(self.render_transfers(cx))
@@ -2082,6 +2189,8 @@ struct SidebarPlace {
     label: String,
     path: PathBuf,
     favorite: Option<usize>,
+    /// A source that's signed out (by id): shows a "Sign in" badge.
+    signed_out: Option<String>,
 }
 
 /// Finder-style SF Symbol for well-known folders.

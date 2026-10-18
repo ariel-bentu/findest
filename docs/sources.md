@@ -37,7 +37,7 @@ Exit codes, for every verb:
 | Exit | Meaning | Findest shows |
 |---|---|---|
 | `0` | success | the result |
-| `77` | not signed in | a **Sign In** button, which runs `login` and then retries |
+| `77` | not signed in | a **Sign In** button (in place of the folder, in the status bar or the search bar, and a "Sign in" badge in the sidebar), which runs `login` and then retries |
 | `64` | this adapter doesn't have that verb | for `search`: Findest lists folder after folder instead |
 | anything else | failure | the **last non-empty line of stderr**, so make it a useful sentence |
 
@@ -78,7 +78,7 @@ Write the file's content to `dest` (the folder already exists) and exit 0. Print
 
 ### `login`
 
-Sign in and exit 0 once it worked; exit non-zero with a message on stderr if it didn't. There's no terminal: open a browser, or a dialog (`osascript`), for anything interactive. Keep tokens wherever your tools keep them; Findest never sees them. If your system needs no sign-in, exit 0 and never return 77.
+Sign in and exit 0 once it worked; exit non-zero with a message on stderr if it didn't. While it runs, Findest shows "Signing in…" with **Cancel**. Cancel, like a timeout, stops the adapter and everything it started (Findest runs it in its own process group), so a browser-based login tool you launched is stopped too. There's no terminal: open a browser, or a dialog (`osascript`), for anything interactive. Keep tokens wherever your tools keep them; Findest never sees them. If your system needs no sign-in, exit 0 and never return 77.
 
 Refreshing expired tokens is also the adapter's job. Do it inside `list` and `read`, and return 77 only when the user really has to sign in again.
 
