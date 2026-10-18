@@ -343,6 +343,8 @@ pub struct Browser {
     fetching: Option<(Vec<PathBuf>, Task<()>)>,
     /// Runs once the selection's source files are fetched (Open, Quick Look…).
     pub(crate) after_fetch: Option<Command>,
+    /// Findest's own preview for YAML and other text Quick Look can't show.
+    pub(crate) text_preview: Option<crate::text_preview::TextPreview>,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -477,6 +479,7 @@ impl Browser {
             last_title: String::new(),
             fetching: None,
             after_fetch: None,
+            text_preview: None,
             _tasks: tasks,
             _subscriptions: subscriptions,
         };
@@ -586,6 +589,7 @@ impl Browser {
             cx.background_executor().spawn(async move { visited.save(&Recents::locations_path()) }).detach();
         }
         self.location = location;
+        self.text_preview = None;
         self.selected.clear();
         self.cursor = None;
         self.anchor = None;
@@ -966,6 +970,10 @@ impl Browser {
                 self.selected = self.entries.iter().map(|e| e.path.clone()).collect();
                 cx.notify();
             }
+            ClearSelection if self.text_preview.is_some() => {
+                self.text_preview = None;
+                cx.notify();
+            }
             ClearSelection => {
                 if self.selected.is_empty() && self.search.is_some() {
                     self.close_search(window, cx);
@@ -1010,7 +1018,11 @@ impl Browser {
                     Err(e) => self.set_error(format!("Couldn't save the setting: {e:#}"), cx),
                 }
             }
-            QuickLook => crate::quick_look::toggle(window, self.selection(), cx),
+            QuickLook => {
+                if !self.toggle_text_preview(cx) {
+                    crate::quick_look::toggle(window, self.selection(), cx);
+                }
+            }
             Expand => self.expand_selection(cx),
             Collapse => self.collapse_selection(cx),
             Open => self.open_selection(cx),

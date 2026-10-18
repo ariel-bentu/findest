@@ -15,6 +15,7 @@ trash.workspace = true
 rayon.workspace = true
 libc.workspace = true
 regex.workspace = true
+syntect.workspace = true
 memchr.workspace = true
 chrono.workspace = true
 

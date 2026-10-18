@@ -43,8 +43,18 @@ impl Render for Browser {
         if fetched && let Some(command) = self.after_fetch.take() {
             self.run(command, window, cx);
         }
+        self.follow_text_preview(fetched, window, cx);
         if fetched && crate::quick_look::is_open_for(window) {
-            crate::quick_look::follow(selection, cx);
+            // Quick Look shows nothing for YAML and the like: hand over to ours.
+            // (Quick Look closes asynchronously, so this can run on several frames.)
+            if let Some(path) = self.preview_target().filter(|p| crate::text_preview::handles(p)) {
+                if self.text_preview.is_none() {
+                    crate::quick_look::toggle(window, Vec::new(), cx);
+                    self.open_text_preview(path, cx);
+                }
+            } else {
+                crate::quick_look::follow(selection, cx);
+            }
         }
         if std::mem::take(&mut self.refocus_list) {
             window.focus(&self.focus);
@@ -105,6 +115,7 @@ impl Render for Browser {
                     .child(self.render_path_bar(cx))
                     .child(self.render_status_bar(cx)),
             )
+            .children(self.render_text_preview(cx))
             .children(self.render_menu(cx))
             .children(self.render_syntax_help(cx));
         if let Some(family) = &theme.font_family {

@@ -11,6 +11,7 @@ mod render;
 mod search_service;
 mod system;
 mod text_input;
+mod text_preview;
 mod theme;
 mod watcher;
 
