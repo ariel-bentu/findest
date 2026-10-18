@@ -57,6 +57,8 @@ $ static-source list /
 | `modified` | no | RFC 3339 time, e.g. `"2026-10-01T12:00:00Z"`. |
 | `has_children` | no | Folders only. `false` hides the disclosure triangle. Default `true`. |
 
+Next to `entries`, a listing can carry `"warnings": ["…"]`, for problems that shouldn't fail the whole folder ("couldn't list pods.metrics.k8s.io"). They're shown in the status bar. Don't hide partial failures: stderr is only shown when the adapter fails.
+
 Folder refs come from the path, so `list` is also called for folders the user types in the Go to bar or goes back to from history. Answer with an error (not exit 0) if the folder doesn't exist.
 
 **Paging.** If a folder is large, return part of it with `"continue": "<token>"`. Findest ends the folder with a **Load more…** row; opening that row runs `list <folder-ref> <token>` and appends the result. Leave `continue` out on the last page.

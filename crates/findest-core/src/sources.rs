@@ -75,6 +75,9 @@ struct WireListing {
     entries: Vec<WireEntry>,
     #[serde(rename = "continue")]
     next: Option<String>,
+    /// Problems the adapter wants shown, without failing the listing.
+    #[serde(default)]
+    warnings: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -275,6 +278,7 @@ impl Sources {
         let page: WireListing = serde_json::from_slice(&out).map_err(|e| {
             SourceError::Failed(format!("{}: `list` printed something that isn't a listing: {e}", source.name))
         })?;
+        listing.warnings.extend(page.warnings.iter().map(|w| format!("{}: {w}", source.name)));
         let mut names: HashSet<String> = listing.rows.iter().map(|(e, _)| e.name.clone()).collect();
         let mut refs = Vec::new();
         let mut files = Vec::new();
@@ -536,7 +540,7 @@ case "$1 $2" in
   "list /slow") sleep 5 ;;
   "list /junk") echo 'not json' ;;
   "list /bad") echo '{"entries":[{"name":"a/b","kind":"file","ref":"x"},{"name":"t","kind":"thing","ref":"x"},
-    {"name":"f","kind":"file","ref":"F","modified":"yesterday"},{"name":"f","kind":"file","ref":"G"}]}' ;;
+    {"name":"f","kind":"file","ref":"F","modified":"yesterday"},{"name":"f","kind":"file","ref":"G"}],"warnings":["half the data is missing"]}' ;;
   "read F") ;;
   *) echo "no such thing: $*" >&2; exit 1 ;;
 esac
@@ -606,7 +610,8 @@ esac
 
         let tree = sources.read_tree(&root.join("bad"), &HashSet::new(), false, ORDER).unwrap();
         assert_eq!(names(&tree), vec![("f", 0)]);
-        assert_eq!(tree.warnings.len(), 4, "{:?}", tree.warnings);
+        assert_eq!(tree.warnings.len(), 5, "{:?}", tree.warnings);
+        assert_eq!(tree.warnings[0], "Broken: half the data is missing");
 
         let f = root.join("bad/f");
         assert_eq!(sources.fetch(&f).unwrap_err().to_string(), "Broken: `read` finished without writing f");
