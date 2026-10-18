@@ -2053,7 +2053,7 @@ impl Render for Tooltip {
     }
 }
 
-fn tooltip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut gpui::App) -> gpui::AnyView {
+pub(crate) fn tooltip(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut gpui::App) -> gpui::AnyView {
     let text = text.into();
     move |_, cx| cx.new(|_| Tooltip(text.clone())).into()
 }

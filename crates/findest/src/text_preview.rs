@@ -7,8 +7,9 @@ use std::sync::Arc;
 
 use findest_core::highlight::{self, Highlighted};
 use gpui::{
-    Context, FontWeight, HighlightStyle, InteractiveElement, IntoElement, ParentElement, Rgba, StatefulInteractiveElement,
-    Styled, StyledText, Task, UniformListScrollHandle, Window, div, prelude::FluentBuilder, px, uniform_list,
+    Context, FontWeight, HighlightStyle, InteractiveElement, IntoElement, ObjectFit, ParentElement, Rgba,
+    StatefulInteractiveElement, Styled, StyledImage, StyledText, Task, UniformListScrollHandle, Window, div, img,
+    prelude::FluentBuilder, px, uniform_list,
 };
 
 use crate::browser::Browser;
@@ -100,31 +101,40 @@ impl Browser {
             notes = text.notes.clone();
         }
 
+        let close_icon = self.icons.peek(&self.symbol_key_colored("xmark", theme.text_muted));
+        let close = div()
+            .id("text-preview-close")
+            .size(px(24.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .cursor_pointer()
+            .text_color(theme.text_muted)
+            .hover(|s| s.bg(theme.hover))
+            .tooltip(crate::render::tooltip("Close (Space or Esc)"))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.text_preview = None;
+                cx.notify();
+            }))
+            .child(match close_icon {
+                Some(image) => img(image).size(px(11.)).object_fit(ObjectFit::Contain).into_any_element(),
+                None => div().child("✕").into_any_element(),
+            });
         let header = div()
             .flex()
             .flex_row()
             .items_center()
             .gap_2()
-            .px_3()
-            .py_2()
+            .pl_1()
+            .pr_3()
+            .py_1()
             .border_b_1()
             .border_color(theme.border)
+            .child(close)
             .child(div().font_weight(FontWeight::SEMIBOLD).truncate().child(name))
-            .child(div().flex_1().text_color(theme.text_muted).text_size(px(font_size - 1.)).child(subtitle))
-            .child(
-                div()
-                    .id("text-preview-close")
-                    .px_2()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .text_color(theme.text_muted)
-                    .hover(|s| s.bg(theme.hover))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.text_preview = None;
-                        cx.notify();
-                    }))
-                    .child("Close  Space"),
-            );
+            .child(div().flex_1().text_color(theme.text_muted).text_size(px(font_size - 1.)).child(subtitle));
 
         let gutter = theme.text_muted;
         let body = match &preview.content {
