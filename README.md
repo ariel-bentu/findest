@@ -5,7 +5,7 @@ A fast, keyboard-friendly file browser for macOS, written in Rust on [GPUI](http
 ## Features
 
 - **List or tiles:** a tree list that expands folders in place, with resizable columns, or a tiles grid with image thumbnails and adjustable size (⌘1 / ⌘2, ⌘= / ⌘-).
-- **Quick Look:** Space previews the selection in the macOS Quick Look panel (images, PDFs, text, JSON, YAML, video and anything else macOS can preview). ↑/↓ move through files while it's open.
+- **Quick Look:** Space previews the selection in the macOS Quick Look panel (images, PDFs, text, JSON, video and anything else macOS can preview). YAML, TOML and other config files open in Findest's own syntax-highlighted viewer. ↑/↓ move through files while it's open.
 - **Info panel (⌘I):** a preview plus size (folder totals computed in the background), dates, dimensions, location and permissions.
 - **Fast search (⌘F):** an in-memory index of file names with a query language (wildcards, `ext:`, `size:`, `dm:`, `content:`, regex…), or **Live** search straight from the disk. See [Search](#search-f).
 - **Type to jump:** start typing a name to select it; repeat a letter to cycle through matches.
@@ -15,12 +15,12 @@ A fast, keyboard-friendly file browser for macOS, written in Rust on [GPUI](http
 - **Compress and uncompress** zip files; opening a .zip unpacks it next to it, in Findest.
 - **Folder colors:** right-click folders to pick a color. They're Finder's color tags, so Finder and Spotlight see them too.
 - **Sidebar:** Recents, Favorites, iCloud Drive and other cloud drives, Macintosh HD, external volumes and the Trash.
-- **Toolbar and path bar:** back/forward with history, the current folder's name (click for the folders above), a Go to bar that accepts pasted paths, a ⋯ menu of folder actions, and a clickable path bar at the bottom.
+- **Toolbar and path bar:** back/forward with history, the current folder's name (click for the folders above), a Go to bar that accepts pasted paths and completes them with Tab, a ⋯ menu of folder actions, and a clickable path bar at the bottom.
 - **Multiple windows (⌘N)**, each restored at launch with its folder, expanded folders, view and column widths.
 - **New folders and files start unnamed:** type a name, or press Esc to remove the item.
 - **Open in…:** VS Code, Terminal or any app you configure, from the menu or a shortcut.
 - **Default file viewer:** "Show in Finder" in other apps can open Findest instead (see [Install](#install)).
-- **Sources:** browse things that aren't on disk (cloud resources, buckets, wikis) as folders, through a small program you plug in. See [Sources](docs/sources.md).
+- **Sources:** browse things that aren't on disk (cloud resources, buckets, wikis) as folders, through a small program you plug in, e.g. a Kubernetes cluster. See [Sources](docs/sources.md).
 - **Configurable:** theme, colors, fonts, favorites and every shortcut, in a commented TOML file that applies as soon as you save it.
 
 ## Install
