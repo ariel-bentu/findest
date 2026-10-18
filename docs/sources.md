@@ -133,3 +133,183 @@ Then sign out in your system and check that `list /` exits 77.
 ## Writing one with a coding agent
 
 Give the agent this file and `examples/static-source`, then describe your system: which command or API lists a folder, how to fetch one item, and how sign-in works. For example: "Write a Findest source adapter like docs/examples/static-source, for S3. `list` uses `aws s3api list-objects-v2` with a delimiter, and `read` uses `aws s3 cp`. Return 77 when the AWS session has expired; `login` runs `aws sso login`."
+
+---
+
+## Protocol v2 — long-lived adapter
+
+The default protocol (v1) spawns a new process per request. Protocol v2 keeps one process alive: Findest sends commands over stdin and the adapter streams responses over stdout. Use it when your adapter has expensive startup (connecting to an API, loading credentials) or when you want to push results to the UI as they arrive.
+
+### Opting in
+
+Add `protocolVersion = 2` to the source's config entry:
+
+```toml
+[[sources]]
+id = "example-v2"
+name = "Example v2"
+command = ["~/findest/static-source-v2"]
+protocolVersion = 2
+```
+
+### Commands → stdin
+
+Findest writes one JSON object per line. Each command has an `id` that the adapter echoes back in every response line.
+
+| Verb | Extra fields | Description |
+|---|---|---|
+| `list` | `folder`, `continue` (optional) | List a folder |
+| `search` | `folder`, `hints`, `continue` (optional) | Search under a folder |
+| `read` | `ref`, `dest` | Fetch a file to `dest` |
+| `preview` | `ref`, `dest`, `name` | Return an alternative preview (optional verb) |
+| `login` | — | Sign in |
+| `exit` | — | Shut down (no response expected) |
+
+Examples:
+
+```json
+{"id": "1", "verb": "list",    "folder": "/docs"}
+{"id": "2", "verb": "list",    "folder": "/big",  "continue": "page2"}
+{"id": "3", "verb": "search",  "folder": "/",     "hints": {"query": "item ext:txt", "names": ["item"], "extensions": ["txt"], "kind": null}}
+{"id": "4", "verb": "read",    "ref": "hello",    "dest": "/Users/me/Library/Caches/findest/sources/ex/hello.txt"}
+{"id": "5", "verb": "preview", "ref": "hello",    "dest": "/Users/me/Library/Caches/findest/sources/ex/hello.txt", "name": "hello.txt"}
+{"id": "6", "verb": "login"}
+{"id": "7", "verb": "exit"}
+```
+
+The `hints` object for `search` has the same fields as in v1: `query`, `names`, `extensions`, `kind`.
+
+### Responses → stdout (JSONL)
+
+Every response line carries the originating `id`. Multiple requests may be in flight simultaneously; the adapter may interleave responses as long as each line carries the correct `id`.
+
+#### `list` and `search` — streaming
+
+The adapter emits one entry per line, then a **sentinel** to signal the end. The sentinel is a JSON object with only the `id` field (all other fields absent):
+
+```jsonl
+{"id":"1","name":"docs","kind":"folder","ref":"/docs"}
+{"id":"1","name":"hello.txt","kind":"file","ref":"hello","label":"Greeting","size":28,"modified":"2026-10-01T12:00:00Z","mime_type":"text/plain"}
+{"id":"1"}
+```
+
+Entry fields are the same as in v1 (`name`, `kind`, `ref`, `label`, `size`, `modified`, `has_children`), plus the new optional `mime_type` field (see [MIME types](#mime-types-v2)).
+
+For `search`, each entry also carries `"folder"` (the folder ref it's in), same as v1.
+
+**Warnings** may be sent as separate lines at any point before the sentinel:
+
+```jsonl
+{"id":"1","warning":"couldn't read permissions for /restricted"}
+{"id":"1"}
+```
+
+**Paging.** If a folder is large, end the stream with a sentinel that carries a `continue` token. Findest shows a **Load more…** row; opening it sends a new `list` command with `"continue": "<token>"`. Same semantics as v1 paging, just carried on the sentinel instead of in a wrapper object.
+
+```jsonl
+{"id":"1","name":"item-1.txt","kind":"file","ref":"item-1"}
+{"id":"1","name":"item-2.txt","kind":"file","ref":"item-2"}
+{"id":"1","continue":"page2"}
+```
+
+For `search`, Findest auto-follows up to 50 continuation pages.
+
+#### `read`
+
+```jsonl
+{"id":"4"}
+```
+
+Sentinel (id only) = success. The adapter has written the file's content to `dest`.
+
+#### `preview`
+
+The `preview` verb is optional. Findest sends it after `read` when it needs to display the file (Quick Look, the preview pane). The adapter can:
+
+- Return the sentinel with no extra fields — Findest uses the file at `dest` as-is:
+
+```jsonl
+{"id":"5"}
+```
+
+- Return an alternate file — Findest uses that for display instead:
+
+```jsonl
+{"id":"5","mime_type":"image/png","dest":"/tmp/preview-hello.png"}
+```
+
+The adapter writes the alternate content to any path it chooses and returns it in `dest`. **The file must have the correct extension** (`.png`, `.pdf`, etc.) — Findest passes the path to Quick Look as-is, and Quick Look determines the format from the extension. The `mime_type` field is accepted but currently unused by Findest.
+
+If the adapter doesn't support `preview`, it can return `"error": "not_supported"` and Findest falls back to the file at `dest`.
+
+#### `login`
+
+```jsonl
+{"id":"6"}
+```
+
+Sentinel = signed in.
+
+#### `exit`
+
+No response. The adapter should flush stdout and exit cleanly.
+
+#### Errors
+
+Any response line may carry `"error"` instead of entry data. This terminates the stream for that request (no sentinel needed after an error):
+
+```jsonl
+{"id":"1","error":"no such folder /missing"}
+```
+
+Two special error strings match the v1 exit codes:
+
+| Error string | Meaning | Findest shows |
+|---|---|---|
+| `"not_signed_in"` | Equivalent to v1 exit 77 | **Sign In** button |
+| `"not_supported"` | Equivalent to v1 exit 64 | Falls back (e.g. folder-walk for `search`) |
+
+Any other string is shown as a failure message in the status bar.
+
+### Timeouts (v2)
+
+| Verb | Timeout |
+|---|---|
+| `list`, `search` | **30 seconds of inactivity** — if no response line arrives for 30 s, the process is killed and the request fails |
+| `read`, `preview` | 60 seconds (wall-clock) |
+| `login` | 5 minutes (wall-clock) |
+
+Unlike v1, `list` and `search` may take longer than 60 s in total as long as lines keep arriving within 30 s of each other — useful for large remote datasets.
+
+### MIME types (v2)
+
+File entries in `list` and `search` may carry an optional `"mime_type"` field:
+
+```json
+{"id":"1","name":"config","kind":"file","ref":"config-ref","mime_type":"application/json"}
+```
+
+Findest uses this to pick the file icon and Quick Look behaviour when the filename has no extension, or when the extension doesn't reflect the actual format. If `mime_type` is absent, behaviour is unchanged (extension-based, same as v1).
+
+### Test an adapter by hand (v2)
+
+Use `printf` to simulate Findest's side:
+
+```sh
+printf '{"id":"1","verb":"list","folder":"/"}\n{"id":"2","verb":"exit"}\n' \
+  | ./static-source-v2
+
+# Expected: entries one per line, then {"id":"1"} sentinel, then exit
+```
+
+Or interactively with `rlwrap`:
+
+```sh
+rlwrap ./static-source-v2
+# type: {"id":"1","verb":"list","folder":"/"}
+# type: {"id":"2","verb":"exit"}
+```
+
+### Example
+
+`examples/static-source-v2` is the same fixed tree as `examples/static-source`, rewritten for the v2 protocol. It demonstrates streaming entries, paging, `mime_type`, and `preview`.

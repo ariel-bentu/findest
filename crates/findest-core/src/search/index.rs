@@ -342,6 +342,7 @@ impl Index {
             size: self.size(id),
             modified: u64::try_from(self.mtime(id)).ok().map(|s| UNIX_EPOCH + std::time::Duration::from_secs(s)),
             label: None,
+            mime_type: None,
         }
     }
 

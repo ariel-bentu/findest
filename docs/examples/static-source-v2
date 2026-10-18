@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""A Findest source adapter (protocol v2) serving a fixed tree. See docs/sources.md.
+
+This is the v2 version of examples/static-source. The adapter runs as a
+long-lived process: it reads JSON commands from stdin and writes JSONL
+responses to stdout, keeping state between calls.
+
+Copy this file to start your own v2 adapter: keep main() and the I/O loop,
+replace TREE, FILES and the cmd_* functions with calls to your system.
+
+Try it by hand:
+    printf '{"id":"1","verb":"list","folder":"/"}\n{"id":"2","verb":"exit"}\n' \\
+      | ./static-source-v2
+"""
+import json
+import sys
+
+PAGE = 2  # /big has 3 entries, so it comes in two pages
+
+# Folder ref -> its entries.
+TREE = {
+    "/": [
+        {"name": "docs",  "kind": "folder", "ref": "/docs"},
+        {"name": "big",   "kind": "folder", "ref": "/big"},
+        {
+            "name": "hello.txt",
+            "kind": "file",
+            "ref": "hello",
+            "label": "Greeting",
+            "size": 28,
+            "modified": "2026-10-01T12:00:00Z",
+            "mime_type": "text/plain",  # v2: explicit MIME type
+        },
+    ],
+    "/docs": [
+        {"name": "readme.txt", "kind": "file", "ref": "readme"},
+        {"name": "notes.md",   "kind": "file", "ref": "notes"},
+    ],
+    "/big": [{"name": f"item-{i}.txt", "kind": "file", "ref": f"item-{i}"} for i in range(1, 4)],
+}
+
+# File ref -> content.
+FILES = {
+    "hello": "Hello from a static source.\n",
+    "readme": "Read me.\n",
+    "notes": "# Notes\n\n- one\n- two\n",
+    **{f"item-{i}": f"Item {i}\n" for i in range(1, 4)},
+}
+
+
+def cmd_list(id_, folder, token=None):
+    """Streams folder entries one per line, then a sentinel."""
+    if folder not in TREE:
+        emit({"id": id_, "error": f"no folder {folder}"})
+        return
+    start = int(token or 0)
+    entries = TREE[folder]
+    if folder != "/big":
+        page_entries = entries
+        next_token = None
+    else:
+        page_entries = entries[start: start + PAGE]
+        next_token = str(start + PAGE) if start + PAGE < len(entries) else None
+    for entry in page_entries:
+        emit({"id": id_, **entry})
+    sentinel = {"id": id_}
+    if next_token:
+        sentinel["continue"] = next_token
+    emit(sentinel)
+
+
+def cmd_read(id_, ref, dest):
+    """Writes the file's content to dest, then sends the sentinel."""
+    if ref not in FILES:
+        emit({"id": id_, "error": f"no file {ref}"})
+        return
+    with open(dest, "w") as f:
+        f.write(FILES[ref])
+    emit({"id": id_})
+
+
+def cmd_preview(id_, ref, dest, name):
+    """Optional: return same-as-content (just the sentinel) for all files.
+    A real adapter could render a thumbnail and return an alternate mime_type here.
+    """
+    emit({"id": id_})  # same-as-content: Findest uses the file at `dest` as-is
+
+
+def cmd_search(id_, folder, hints_json, token=None):
+    """Streams search results, one per line, then a sentinel.
+    Returns all entries whose name contains all hint names; 'folder' added per entry.
+    """
+    hints = json.loads(hints_json)
+    names = hints.get("names", [])
+    if folder not in TREE and not any(f.startswith(folder.rstrip("/") + "/") for f in TREE):
+        emit({"id": id_, "error": f"no folder {folder}"})
+        return
+    for parent, entries in TREE.items():
+        if parent == folder or parent.startswith(folder.rstrip("/") + "/"):
+            for entry in entries:
+                if all(n in entry["name"].lower() for n in names):
+                    emit({"id": id_, **entry, "folder": parent})
+    emit({"id": id_})
+
+
+def cmd_login(id_):
+    """Nothing to do for a static tree."""
+    emit({"id": id_})
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+def main():
+    # Main loop: read one command per line.
+    for raw in sys.stdin:
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            cmd = json.loads(raw)
+        except json.JSONDecodeError as e:
+            sys.stderr.write(f"bad JSON: {e}\n")
+            continue
+        id_ = cmd.get("id", "")
+        verb = cmd.get("verb", "")
+        try:
+            if verb == "list":
+                cmd_list(id_, cmd["folder"], cmd.get("continue"))
+            elif verb == "read":
+                cmd_read(id_, cmd["ref"], cmd["dest"])
+            elif verb == "preview":
+                cmd_preview(id_, cmd["ref"], cmd["dest"], cmd.get("name", ""))
+            elif verb == "search":
+                cmd_search(id_, cmd["folder"], json.dumps(cmd.get("hints", {})), cmd.get("continue"))
+            elif verb == "login":
+                cmd_login(id_)
+            elif verb == "exit":
+                break
+            else:
+                emit({"id": id_, "error": "not_supported"})
+        except Exception as e:
+            emit({"id": id_, "error": str(e)})
+
+
+if __name__ == "__main__":
+    main()

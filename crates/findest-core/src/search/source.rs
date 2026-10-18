@@ -269,7 +269,7 @@ mod tests {
     fn mount(command: Vec<String>) -> (tempfile::TempDir, Sources, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let sources = Sources::new(tmp.path().join("mounts"));
-        let source = Source { id: "s".into(), name: "S".into(), command, root: "/".into() };
+        let source = Source { id: "s".into(), name: "S".into(), command, root: "/".into(), protocol_version: 1 };
         assert!(sources.set(vec![source.clone()]).is_empty());
         let root = sources.root_path(&source);
         (tmp, sources, root)
