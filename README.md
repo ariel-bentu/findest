@@ -2,13 +2,26 @@
 
 A fast, keyboard-friendly file browser for macOS, written in Rust on [GPUI](https://gpui.rs) (Zed's GPU-accelerated UI framework).
 
-## Layout
+## Features
 
-```
-crates/
-  findest-core/   UI-free library: listing, sorting, file ops, config, recents, launchers (unit tested)
-  findest/        The GPUI app: window, sidebar, file list, menus, keybindings
-```
+- **List or tiles:** a tree list that expands folders in place, with resizable columns, or a tiles grid with image thumbnails and adjustable size (⌘1 / ⌘2, ⌘= / ⌘-).
+- **Quick Look:** Space previews the selection in the macOS Quick Look panel (images, PDFs, text, JSON, YAML, video and anything else macOS can preview). ↑/↓ move through files while it's open.
+- **Info panel (⌘I):** a preview plus size (folder totals computed in the background), dates, dimensions, location and permissions.
+- **Fast search (⌘F):** an in-memory index of file names with a query language (wildcards, `ext:`, `size:`, `dm:`, `content:`, regex…), or **Live** search straight from the disk. See [Search](#search-f).
+- **Type to jump:** start typing a name to select it; repeat a letter to cycle through matches.
+- **Copy, cut and paste** with progress, speed and time left. Copies can be paused, cancelled, and retried where they stopped. Name clashes ask first (Replace, Keep Both, Skip). Paste goes into the selected folder, or next to the selected file.
+- **Undo (⌘Z)** for the last paste, drop, duplicate, compress or uncompress.
+- **Drag and drop** between Findest windows, Finder and other apps, with auto-scroll near the list's edges.
+- **Compress and uncompress** zip files; opening a .zip unpacks it next to it, in Findest.
+- **Folder colors:** right-click folders to pick a color. They're Finder's color tags, so Finder and Spotlight see them too.
+- **Sidebar:** Recents, Favorites, iCloud Drive and other cloud drives, Macintosh HD, external volumes and the Trash.
+- **Toolbar and path bar:** back/forward with history, the current folder's name (click for the folders above), a Go to bar that accepts pasted paths, a ⋯ menu of folder actions, and a clickable path bar at the bottom.
+- **Multiple windows (⌘N)**, each restored at launch with its folder, expanded folders, view and column widths.
+- **New folders and files start unnamed:** type a name, or press Esc to remove the item.
+- **Open in…:** VS Code, Terminal or any app you configure, from the menu or a shortcut.
+- **Default file viewer:** "Show in Finder" in other apps can open Findest instead (see [Install](#install)).
+- **Sources:** browse things that aren't on disk (cloud resources, buckets, wikis) as folders, through a small program you plug in. See [Sources](docs/sources.md).
+- **Configurable:** theme, colors, fonts, favorites and every shortcut, in a commented TOML file that applies as soon as you save it.
 
 ## Install
 
@@ -37,6 +50,12 @@ To have "Show in Finder" / "Reveal in Finder" in other apps (browser downloads, 
 
 ## Develop
 
+```
+crates/
+  findest-core/   UI-free library: listing, sorting, file ops, search, config, recents, launchers (unit tested)
+  findest/        The GPUI app: window, sidebar, file list, menus, keybindings
+```
+
 ```sh
 cargo run -p findest [-- <path>]   # debug builds always run in place
 cargo test --workspace
@@ -52,31 +71,38 @@ GPUI is built with `runtime_shaders`, so you don't need Xcode's separately downl
 On first launch Findest writes a commented config to `~/.config/findest/config.toml` (override it with `$FINDEST_CONFIG`).
 Changes apply as soon as you save the file. Open it with **⌘,**.
 
-- `[general]`: start folder, hidden files, sort order, Trash confirmation, recents size
+- `[general]`: start folder, session restore, info panel, default view and tile size, hidden files, sort order, Trash confirmation, recents size
 - `[appearance]`: `dark` / `light` / `system` theme, font, row height, per-color overrides
 - `[[favorites]]`: sidebar folders (you can also add them from the app with ⌃⌘T)
 - `[[openers]]`: "Open in …" targets, e.g. VS Code and Terminal, with `{path}` / `{dir}` placeholders
 - `[[sources]]`: hierarchies listed by a program you provide (an adapter), shown in the sidebar. See [docs/sources.md](docs/sources.md)
+- `[search]`: indexing on/off, which folders are indexed and excluded, result limit, content-search size limit
 - `[keybindings]`: any shortcut → command, layered on the defaults (`"none"` disables one)
 
 ## Default shortcuts
 
 | Keys | Command | Keys | Command |
 |---|---|---|---|
-| ↑ ↓ / ⇧↑ ⇧↓ | move / extend selection | ⌘O, ⌘↓, double-click | open |
-| ↩ | rename | ⌘↑ | enclosing folder |
-| ⌘[ / ⌘] | back / forward | ⇧⌘G | go to folder |
+| ↑ ↓ | move selection | ⇧↑ ⇧↓ | extend selection |
+| ⌥↑ / ⌥↓, Home / End | first / last item | ⌘A / Esc | select all / clear selection |
+| → / ← | expand / collapse folder | Space, ⌘Y | Quick Look |
+| ⌘O, ⌘↓, double-click | open | ↩ | rename |
+| ⌘↑ | enclosing folder | ⌘[ / ⌘] | back / forward |
+| ⇧⌘H | home | ⇧⌘G | go to folder |
 | ⇧⌘N / ⌥⌘N | new folder / new file | ⌘D | duplicate |
-| ⌫ | move to Trash (asks) | ⇧⌫ | move to Trash (no prompt) |
-| ⌘⌫ | move to Trash | ⌥⌘⌫ | delete permanently |
-| ⌘C / ⌘V / ⌥⌘V | copy / paste / move here | ⌥⌘C | copy path |
-| ⌘E | open in VS Code | ⌥⌘T | open in Terminal |
+| ⌘C / ⌘X / ⌘V | copy / cut / paste | ⌥⌘V | move here |
+| ⌘Z | undo | ⌥⌘C | copy path |
+| ⌘⌫ | move to Trash | ⌫ / ⇧⌫ | move to Trash (asks / no prompt) |
+| ⌥⌘⌫ | delete permanently | ⇧⌘⌫ | empty Trash |
+| ⌘F | search | ⌘I | info panel |
+| ⌘1 / ⌘2 | list / tiles | ⌘= / ⌘- | bigger / smaller tiles |
 | ⇧⌘. | toggle hidden files | ⌘R | refresh |
 | ⌃⌘T | add to Favorites | ⇧⌘R | Recents |
+| ⌘E | open in VS Code | ⌥⌘T | open in Terminal |
 | ⌥⌘R | reveal in Finder | ⌘, | open config |
-| Space, ⌘Y | Quick Look (Esc closes) | | |
+| ⌘N / ⌘W | new / close window | | |
 
-Typing letters jumps to the first matching name.
+In tiles, the arrow keys move through the grid in both directions. In Quick Look, Esc or clicking elsewhere closes the preview. Typing letters jumps to the first matching name.
 
 ## Search (⌘F)
 
@@ -105,5 +131,8 @@ Search **This folder** or **Everywhere**. Press ↓ or Enter to move to the resu
 ## Mouse
 
 - **▾** next to back/forward: recently visited folders.
-- Drag items onto a folder, a sidebar entry, or a path segment to move them. Hold ⌥ to copy. Drops across volumes copy, like Finder. You can also drop files in from Finder.
-- Right-click items, empty space, or sidebar entries for context menus.
+- Click the folder name in the toolbar for the folders above it; right-click it, or any part of the path bar, for that folder's menu.
+- Drag items onto a folder, a sidebar entry, or a path segment to move them. Hold ⌥ to copy. Drops across volumes copy, like Finder. You can also drop files in from Finder, or drag items out to other apps. Esc cancels a drag.
+- Drag a column's edge in the list header to resize it; double-click the edge to reset it.
+- Right-click items, empty space, or sidebar entries for context menus (Compress, folder colors, paste into a folder, Open in…, Add to Favorites and more).
+- Click the indexing status in the status bar to pause, rebuild, or turn off indexing.
