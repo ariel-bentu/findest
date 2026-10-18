@@ -195,6 +195,7 @@ fn main() {
     app.run(move |cx: &mut App| {
         cx.on_action(|_: &Quit, cx| {
             cx.set_global(Quitting(true));
+            findest_core::sources::global().shutdown();
             cx.quit();
         });
         bind_global_keys(cx);

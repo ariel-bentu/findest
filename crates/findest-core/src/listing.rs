@@ -29,6 +29,8 @@ pub struct Entry {
     pub color: Option<TagColor>,
     /// Replaces the kind, e.g. for items in a source ("ManagedService · Ready").
     pub label: Option<String>,
+    /// MIME type for source entries when the filename extension is absent or misleading.
+    pub mime_type: Option<String>,
 }
 
 /// Finder's color labels (the color tags), numbered as macOS stores them.
@@ -119,6 +121,7 @@ impl Entry {
             path: path.to_path_buf(),
             name,
             label: None,
+            mime_type: None,
         })
     }
 

@@ -1,7 +1,7 @@
 //! The main window: state, navigation, selection and command handling.
 //! Rendering lives in `render.rs`.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -348,6 +348,9 @@ pub struct Browser {
     fetching: Option<(Vec<PathBuf>, Task<()>)>,
     /// Runs once the selection's source files are fetched (Open, Quick Look…).
     pub(crate) after_fetch: Option<Command>,
+    /// Resolved preview paths for v2 source files (cache path → preview path).
+    /// Populated eagerly after fetch completes; used by info panel and Quick Look.
+    pub(crate) preview_paths_cache: HashMap<PathBuf, PathBuf>,
     /// Findest's own preview for YAML and other text Quick Look can't show.
     pub(crate) text_preview: Option<crate::text_preview::TextPreview>,
     /// The source being signed in to, and the flag that cancels it.
@@ -488,6 +491,7 @@ impl Browser {
             last_title: String::new(),
             fetching: None,
             after_fetch: None,
+            preview_paths_cache: HashMap::new(),
             text_preview: None,
             signing_in: None,
             go_to_matches: None,
@@ -700,6 +704,7 @@ impl Browser {
     fn finish_load(&mut self, result: Result<(Vec<listing::TreeRow>, Vec<String>), LoadError>, cx: &mut Context<Self>) {
         self.loading = false;
         self.load_error = None;
+        self.preview_paths_cache.clear();
         match result {
             Ok((rows, warnings)) => {
                 if let Some(first) = warnings.first() {
@@ -1033,7 +1038,14 @@ impl Browser {
             }
             QuickLook => {
                 if !self.toggle_text_preview(cx) {
-                    crate::quick_look::toggle(window, self.selection(), cx);
+                    let selection = self.selection();
+                    if self.in_source() && selection.len() == 1 {
+                        let path = &selection[0];
+                        let preview_path = self.preview_paths_cache.get(path).cloned().unwrap_or_else(|| path.clone());
+                        crate::quick_look::toggle(window, vec![preview_path], cx);
+                    } else {
+                        crate::quick_look::toggle(window, selection, cx);
+                    }
                 }
             }
             Expand => self.expand_selection(cx),
@@ -2655,9 +2667,11 @@ impl Browser {
             return;
         };
         let file = findest_core::info::file_info(&path).ok();
+        // For v2 source files use the resolved preview path for thumbnail/preview rendering.
+        let preview_path = self.preview_paths_cache.get(&path).cloned().unwrap_or_else(|| path.clone());
         // Folders and bundles (apps) get their total size measured.
         let is_dir = path.is_dir();
-        let is_image = !is_dir && is_image_path(&path);
+        let is_image = !is_dir && is_image_path(&preview_path);
         let icon_key = Entry::from_path(&path).ok().map(|e| IconKey::for_entry(&e, &self.home));
         if let Some(key) = icon_key.clone() {
             self.request_icon(key, cx);
@@ -2666,14 +2680,14 @@ impl Browser {
         let kind = if is_dir {
             PreviewKind::Folder
         } else if is_image {
-            if gpui_decodes(&path) { PreviewKind::Image } else { PreviewKind::RenderedImage }
-        } else if is_pdf(&path) {
+            if gpui_decodes(&preview_path) { PreviewKind::Image } else { PreviewKind::RenderedImage }
+        } else if is_pdf(&preview_path) {
             PreviewKind::RenderedImage
         } else {
             PreviewKind::Text
         };
         let task = {
-            let (path, cancel) = (path.clone(), cancel.clone());
+            let (path, cancel) = (preview_path.clone(), cancel.clone());
             let work = cx.background_executor().spawn(async move { load_details(&path, kind, &cancel) });
             cx.spawn(async move |this, cx| {
                 let details = work.await;
@@ -2808,7 +2822,35 @@ impl Browser {
             let result = task.await;
             this.update(cx, |this, cx| {
                 match result {
-                    Ok(()) => this.fetching = None,
+                    Ok(()) => {
+                        this.fetching = None;
+                        // For v2 source files, eagerly resolve preview paths so the
+                        // info panel thumbnail and Quick Look both use the right file.
+                        if this.in_source() {
+                            let paths = this.selection();
+                            let v2_paths: Vec<PathBuf> = paths.into_iter()
+                                .filter(|p| !p.is_dir() && sources::global().source_at(p).is_some_and(|s| s.protocol_version == 2))
+                                .collect();
+                            if !v2_paths.is_empty() {
+                                let task = cx.background_executor().spawn(async move {
+                                    v2_paths.into_iter().filter_map(|p| {
+                                        let preview = sources::global().preview_path(&p).ok()?;
+                                        Some((p, preview))
+                                    }).collect::<Vec<_>>()
+                                });
+                                cx.spawn(async move |this, cx| {
+                                    let resolved = task.await;
+                                    this.update(cx, |this, cx| {
+                                        for (cache, preview) in resolved {
+                                            this.preview_paths_cache.insert(cache, preview);
+                                        }
+                                        this.info = None;
+                                        cx.notify();
+                                    }).ok();
+                                }).detach();
+                            }
+                        }
+                    }
                     Err(e) => {
                         this.after_fetch = None;
                         this.report_source_error(e, cx);
@@ -3034,6 +3076,7 @@ mod tests {
             modified: None,
             color: None,
             label: None,
+            mime_type: None,
         }
     }
 

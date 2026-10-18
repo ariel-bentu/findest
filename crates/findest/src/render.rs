@@ -55,8 +55,13 @@ impl Render for Browser {
                     self.open_text_preview(path, cx);
                 }
             } else {
-                crate::quick_look::follow(selection, cx);
+                let follow_paths: Vec<PathBuf> = selection.iter()
+                    .map(|p| self.preview_paths_cache.get(p).cloned().unwrap_or_else(|| p.clone()))
+                    .collect();
+                crate::quick_look::follow(follow_paths, cx);
             }
+        } else {
+            // Panel closed — no cleanup needed; cache persists for Quick Look reopen.
         }
         if std::mem::take(&mut self.refocus_list) {
             window.focus(&self.focus);

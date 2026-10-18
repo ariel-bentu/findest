@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
+use libc;
 use serde::{Deserialize, Serialize};
 
 use crate::listing::{Entry, SortOrder, TreeRow};
@@ -51,10 +52,17 @@ pub struct Source {
     /// The folder shown first.
     #[serde(default = "default_root")]
     pub root: String,
+    /// Protocol version: 1 (default, spawn per request) or 2 (long-lived process).
+    #[serde(default = "default_protocol_version", rename = "protocolVersion")]
+    pub protocol_version: u8,
 }
 
 fn default_root() -> String {
     "/".into()
+}
+
+fn default_protocol_version() -> u8 {
+    1
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -90,7 +98,7 @@ struct WireListing {
 }
 
 #[derive(Deserialize)]
-struct WireEntry {
+pub(crate) struct WireEntry {
     /// Search results only: the folder ref the entry is in.
     folder: Option<String>,
     name: String,
@@ -101,6 +109,23 @@ struct WireEntry {
     size: Option<u64>,
     modified: Option<String>,
     has_children: Option<bool>,
+    mime_type: Option<String>,
+}
+
+impl From<crate::sources_v2::WireEntry> for WireEntry {
+    fn from(v: crate::sources_v2::WireEntry) -> Self {
+        WireEntry {
+            folder: v.folder,
+            name: v.name,
+            kind: v.kind,
+            reference: v.reference,
+            label: v.label,
+            size: v.size,
+            modified: v.modified,
+            has_children: v.has_children,
+            mime_type: v.mime_type,
+        }
+    }
 }
 
 /// A folder's listing as far as it's been fetched.
@@ -126,6 +151,8 @@ struct State {
     fetched: HashMap<PathBuf, Instant>,
     /// Sources whose adapter last said "not signed in".
     signed_out: HashSet<String>,
+    /// Live v2 processes keyed by source id.
+    v2_processes: HashMap<String, std::sync::Arc<crate::sources_v2::V2Process>>,
 }
 
 pub struct Sources {
@@ -151,6 +178,10 @@ pub struct SourceTree {
 
 impl Sources {
     pub fn new(mounts: PathBuf) -> Sources {
+        extern "C" fn on_exit() {
+            global().shutdown();
+        }
+        unsafe { libc::atexit(on_exit) };
         Sources { mounts, state: Mutex::new(State::default()) }
     }
 
@@ -185,12 +216,35 @@ impl Sources {
                 problems.push(format!("source \"{}\": can't create {}: {e}", source.id, root.display()));
             }
         }
-        *state = State { sources: valid, ..State::default() };
+        // Gracefully shut down v2 processes for sources that changed or were removed.
+        let valid_ids: HashSet<&str> = valid.iter().map(|s| s.id.as_str()).collect();
+        let unchanged_ids: HashSet<&str> = valid.iter()
+            .filter(|s| state.sources.iter().any(|old| old == *s))
+            .map(|s| s.id.as_str())
+            .collect();
+        for (id, proc) in &state.v2_processes {
+            if !valid_ids.contains(id.as_str()) || !unchanged_ids.contains(id.as_str()) {
+                proc.exit();
+            }
+        }
+        let keep: HashMap<String, _> = state.v2_processes.drain()
+            .filter(|(id, _)| unchanged_ids.contains(id.as_str()))
+            .collect();
+        *state = State { sources: valid, v2_processes: keep, ..State::default() };
         problems
     }
 
     pub fn sources(&self) -> Vec<Source> {
         self.state.lock().unwrap().sources.clone()
+    }
+
+    /// Sends `exit` to all live v2 processes. Call on app quit.
+    pub fn shutdown(&self) {
+        let mut state = self.state.lock().unwrap();
+        for proc in state.v2_processes.values() {
+            proc.exit();
+        }
+        state.v2_processes.clear();
     }
 
     pub fn mount_path(&self, source: &Source) -> PathBuf {
@@ -285,15 +339,28 @@ impl Sources {
     /// Runs `list` for the page after `listing.next` (or the first) and adds it.
     fn fetch_page(&self, dir: &Path, listing: &mut Listing) -> Result<(), SourceError> {
         let source = self.source_for(dir)?;
-        let mut args = vec![self.folder_ref(&source, dir)];
-        args.extend(listing.next.take());
-        let out = self.run(&source, "list", &args, REQUEST_TIMEOUT, None)?;
-        let page = parse_page(&source, "list", &out)?;
-        listing.warnings.extend(page.warnings.iter().map(|w| format!("{}: {w}", source.name)));
-        let mut seen: HashSet<PathBuf> = listing.rows.iter().map(|(e, _)| e.path.clone()).collect();
-        let rows = self.admit(&source, page.entries, &mut seen, &mut listing.warnings, |_| Ok(dir.to_path_buf()));
-        listing.rows.extend(rows);
-        listing.next = page.next.filter(|t| !t.is_empty());
+        let folder = self.folder_ref(&source, dir);
+        let continue_token = listing.next.take();
+        if source.protocol_version == 2 {
+            let mut seen: HashSet<PathBuf> = listing.rows.iter().map(|(e, _)| e.path.clone()).collect();
+            let mut wires: Vec<WireEntry> = Vec::new();
+            let next = self.v2_call(&source, |proc| {
+                proc.list(&source, folder, continue_token, &mut |e| wires.push(WireEntry::from(e)), &mut |w| listing.warnings.push(w))
+            })?;
+            let rows = self.admit(&source, wires, &mut seen, &mut listing.warnings, |_| Ok(dir.to_path_buf()));
+            listing.rows.extend(rows);
+            listing.next = next.filter(|t| !t.is_empty());
+        } else {
+            let mut args = vec![folder];
+            args.extend(continue_token);
+            let out = self.run(&source, "list", &args, REQUEST_TIMEOUT, None)?;
+            let page = parse_page(&source, "list", &out)?;
+            listing.warnings.extend(page.warnings.iter().map(|w| format!("{}: {w}", source.name)));
+            let mut seen: HashSet<PathBuf> = listing.rows.iter().map(|(e, _)| e.path.clone()).collect();
+            let rows = self.admit(&source, page.entries, &mut seen, &mut listing.warnings, |_| Ok(dir.to_path_buf()));
+            listing.rows.extend(rows);
+            listing.next = page.next.filter(|t| !t.is_empty());
+        }
         Ok(())
     }
 
@@ -335,7 +402,12 @@ impl Sources {
                 time
             });
             let is_dir = wire.kind == "folder";
-            let path = dir.unwrap().join(&wire.name);
+            let name_with_ext = if !is_dir {
+                ensure_extension(&wire.name, wire.mime_type.as_deref())
+            } else {
+                wire.name.clone()
+            };
+            let path = dir.unwrap().join(&name_with_ext);
             refs.push((path.clone(), wire.reference));
             if !is_dir {
                 files.push(path.clone());
@@ -351,6 +423,7 @@ impl Sources {
                 modified,
                 color: None,
                 label: wire.label,
+                mime_type: wire.mime_type,
             };
             rows.push((entry, is_dir && wire.has_children.unwrap_or(true)));
         }
@@ -376,14 +449,9 @@ impl Sources {
     ) -> Result<SearchPage, SourceError> {
         let source = self.source_for(dir)?;
         let under = self.folder_ref(&source, dir);
-        let mut args = vec![under.clone(), hints.to_string()];
-        args.extend(next);
-        let out = self.run(&source, "search", &args, REQUEST_TIMEOUT, None)?;
-        let page = parse_page(&source, "search", &out)?;
-        let mut warnings: Vec<String> = page.warnings.iter().map(|w| format!("{}: {w}", source.name)).collect();
         let mount = self.mount_path(&source);
         let inside = |folder: &str| folder == under || under == "/" || folder.starts_with(&format!("{under}/"));
-        let rows = self.admit(&source, page.entries, seen, &mut warnings, |wire| match wire.folder.as_deref() {
+        let place = |wire: &WireEntry| match wire.folder.as_deref() {
             None => Err("search results need \"folder\"".into()),
             Some(folder) if !folder.starts_with('/') || folder.split('/').any(|p| p == ".." || p == ".") => {
                 Err(format!("bad folder {folder:?}"))
@@ -394,8 +462,27 @@ impl Sources {
                 path.extend(folder.split('/').filter(|p| !p.is_empty()));
                 Ok(path)
             }
-        });
-        Ok(SearchPage { rows, next: page.next.filter(|t| !t.is_empty()), warnings })
+        };
+
+        if source.protocol_version == 2 {
+            let hints_val: serde_json::Value = serde_json::from_str(hints)
+                .map_err(|e| SourceError::Failed(format!("{}: bad hints JSON: {e}", source.name)))?;
+            let mut wires: Vec<WireEntry> = Vec::new();
+            let mut warnings: Vec<String> = Vec::new();
+            let page_next = self.v2_call(&source, |proc| {
+                proc.search(&source, under.clone(), hints_val, next, &mut |e| wires.push(WireEntry::from(e)), &mut |w| warnings.push(w))
+            })?;
+            let rows = self.admit(&source, wires, seen, &mut warnings, place);
+            Ok(SearchPage { rows, next: page_next.filter(|t| !t.is_empty()), warnings })
+        } else {
+            let mut args = vec![under.clone(), hints.to_string()];
+            args.extend(next);
+            let out = self.run(&source, "search", &args, REQUEST_TIMEOUT, None)?;
+            let page = parse_page(&source, "search", &out)?;
+            let mut warnings: Vec<String> = page.warnings.iter().map(|w| format!("{}: {w}", source.name)).collect();
+            let rows = self.admit(&source, page.entries, seen, &mut warnings, place);
+            Ok(SearchPage { rows, next: page.next.filter(|t| !t.is_empty()), warnings })
+        }
     }
 
     /// A folder in a source as people would say it: "URM canary /sap/x".
@@ -480,12 +567,51 @@ impl Sources {
         }
         // A stale copy must not pass for the new one.
         let _ = std::fs::remove_file(path);
-        self.run(&source, "read", &[reference, path.to_string_lossy().into_owned()], REQUEST_TIMEOUT, None)?;
+        if source.protocol_version == 2 {
+            let dest = path.to_string_lossy().into_owned();
+            self.v2_call(&source, |proc| proc.read(&source, reference.clone(), dest.clone()))?;
+        } else {
+            self.run(&source, "read", &[reference, path.to_string_lossy().into_owned()], REQUEST_TIMEOUT, None)?;
+        }
         if !path.is_file() {
             return Err(SourceError::Failed(format!("{}: `read` finished without writing {name}", source.name)));
         }
         self.state.lock().unwrap().fetched.insert(path.to_path_buf(), Instant::now());
         Ok(())
+    }
+
+    /// For v2 sources: calls the adapter's `preview` verb after `read` and
+    /// returns the path to pass to Quick Look — either the original cache path
+    /// (same-as-content) or an alternate written by the adapter.
+    /// For v1 sources: returns the cache path unchanged.
+    pub fn preview_path(&self, path: &Path) -> Result<PathBuf, SourceError> {
+        let source = self.source_for(path)?;
+        if source.protocol_version != 2 {
+            return Ok(path.to_path_buf());
+        }
+        let name = crate::paths::display_name(path).to_string();
+        let reference = self.state.lock().unwrap().refs.get(path).cloned().ok_or_else(|| {
+            SourceError::Failed(format!("{name} isn't listed any more; refresh the folder (⌘R)"))
+        })?;
+        let dest = path.to_string_lossy().into_owned();
+        let result = self.v2_call(&source, |proc| proc.preview(&source, reference, dest, name));
+        match result {
+            Ok(crate::sources_v2::PreviewResult::SameAsContent) => Ok(path.to_path_buf()),
+            Ok(crate::sources_v2::PreviewResult::Alternate { dest, mime_type }) => {
+                let p = PathBuf::from(&dest);
+                let fixed_name = ensure_extension(
+                    p.file_name().and_then(|n| n.to_str()).unwrap_or(&dest),
+                    Some(&mime_type),
+                );
+                let fixed = p.with_file_name(&fixed_name);
+                if fixed != p {
+                    let _ = std::fs::rename(&p, &fixed);
+                }
+                Ok(fixed)
+            }
+            Err(SourceError::NotSupported { .. }) => Ok(path.to_path_buf()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Fetches every file in `paths` that needs it.
@@ -498,10 +624,14 @@ impl Sources {
     }
 
     /// Runs the adapter's sign-in; drops cached listings so they're fetched
-    /// again. Setting `cancel` stops it (`SourceError::Cancelled`).
+    /// again. Setting `cancel` stops it (`SourceError::Cancelled` — v1 only).
     pub fn login(&self, id: &str, cancel: &AtomicBool) -> Result<(), SourceError> {
         let source = self.sources().into_iter().find(|s| s.id == id).ok_or_else(|| SourceError::Failed(format!("No source \"{id}\"")))?;
-        self.run(&source, "login", &[], LOGIN_TIMEOUT, Some(cancel))?;
+        if source.protocol_version == 2 {
+            self.v2_call(&source, |proc| proc.login(&source))?;
+        } else {
+            self.run(&source, "login", &[], LOGIN_TIMEOUT, Some(cancel))?;
+        }
         self.invalidate(&self.mount_path(&source));
         Ok(())
     }
@@ -539,6 +669,81 @@ impl Sources {
         let source = self.source_at(path)?;
         Some((self.mount_path(&source), source.name))
     }
+
+    fn v2_process(&self, source: &Source) -> Result<std::sync::Arc<crate::sources_v2::V2Process>, SourceError> {
+        {
+            let state = self.state.lock().unwrap();
+            if let Some(proc) = state.v2_processes.get(&source.id) {
+                return Ok(proc.clone());
+            }
+        }
+        // Spawn outside the lock (may block briefly), then re-check under the lock
+        // to handle the race where multiple threads both found nothing.
+        let proc = crate::sources_v2::V2Process::spawn(source)?;
+        let mut state = self.state.lock().unwrap();
+        if let Some(existing) = state.v2_processes.get(&source.id) {
+            // Another thread won the race: use its process, let ours exit.
+            proc.exit();
+            return Ok(existing.clone());
+        }
+        state.v2_processes.insert(source.id.clone(), proc.clone());
+        Ok(proc)
+    }
+
+    /// Wraps a v2 call: on failure, clears the process and tracks sign-out state.
+    fn v2_call<T>(
+        &self,
+        source: &Source,
+        f: impl FnOnce(&std::sync::Arc<crate::sources_v2::V2Process>) -> Result<T, SourceError>,
+    ) -> Result<T, SourceError> {
+        let proc = self.v2_process(source)?;
+        let result = f(&proc);
+        let mut state = self.state.lock().unwrap();
+        match &result {
+            Ok(_) => { state.signed_out.remove(&source.id); }
+            Err(SourceError::NotSignedIn { .. }) => { state.signed_out.insert(source.id.clone()); }
+            Err(SourceError::NotSupported { .. }) => {}
+            Err(_) => { state.v2_processes.remove(&source.id); }
+        }
+        result
+    }
+}
+
+/// Returns `name` with an extension appended if it has none and `mime_type` maps to one.
+fn ensure_extension(name: &str, mime_type: Option<&str>) -> String {
+    if Path::new(name).extension().is_some() {
+        return name.to_string();
+    }
+    let ext = mime_type.and_then(ext_for_mime);
+    match ext {
+        Some(e) => format!("{name}.{e}"),
+        None => name.to_string(),
+    }
+}
+
+fn ext_for_mime(mime: &str) -> Option<&'static str> {
+    // Strip parameters (e.g. "text/html; charset=utf-8" → "text/html").
+    let mime = mime.split(';').next().unwrap_or(mime).trim();
+    Some(match mime {
+        "text/plain"                => "txt",
+        "text/html"                 => "html",
+        "text/css"                  => "css",
+        "text/csv"                  => "csv",
+        "text/markdown"             => "md",
+        "text/xml" | "application/xml" => "xml",
+        "application/json"          => "json",
+        "application/yaml" | "text/yaml" | "application/x-yaml" => "yaml",
+        "application/toml"          => "toml",
+        "application/pdf"           => "pdf",
+        "application/zip"           => "zip",
+        "image/png"                 => "png",
+        "image/jpeg"                => "jpg",
+        "image/gif"                 => "gif",
+        "image/svg+xml"             => "svg",
+        "image/webp"                => "webp",
+        "application/octet-stream"  => return None,
+        _ => return None,
+    })
 }
 
 fn more_row(dir: &Path) -> Entry {
@@ -553,6 +758,7 @@ fn more_row(dir: &Path) -> Entry {
         modified: None,
         color: None,
         label: Some("Open to list more".into()),
+        mime_type: None,
     }
 }
 
@@ -663,7 +869,7 @@ mod tests {
     /// The example adapter from docs/sources.md: the docs stay true.
     fn example() -> Source {
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/examples/static-source");
-        Source { id: "ex".into(), name: "Example".into(), command: vec![script.to_string_lossy().into()], root: "/".into() }
+        Source { id: "ex".into(), name: "Example".into(), command: vec![script.to_string_lossy().into()], root: "/".into(), protocol_version: 1 }
     }
 
     /// An adapter for the failure cases.
@@ -688,7 +894,7 @@ esac
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        Source { id: "b".into(), name: "Broken".into(), command: vec![script.to_string_lossy().into()], root: "/".into() }
+        Source { id: "b".into(), name: "Broken".into(), command: vec![script.to_string_lossy().into()], root: "/".into(), protocol_version: 1 }
     }
 
     fn mounted(source: &Source) -> (tempfile::TempDir, Sources, PathBuf) {
@@ -807,6 +1013,7 @@ esac
             name: id.into(),
             command: command.iter().map(|s| s.to_string()).collect(),
             root: "/".into(),
+            protocol_version: 1,
         };
         let problems = sources.set(vec![source("a", &["x"]), source("a", &["y"]), source("b", &[]), source("c/d", &["x"])]);
         assert_eq!(problems.len(), 3, "{problems:?}");
