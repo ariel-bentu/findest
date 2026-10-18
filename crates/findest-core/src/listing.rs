@@ -23,14 +23,17 @@ pub struct Entry {
     pub is_package: bool,
     pub is_symlink: bool,
     pub is_hidden: bool,
-    pub size: u64,
+    /// `None` when unknown (a source that doesn't say).
+    pub size: Option<u64>,
     pub modified: Option<SystemTime>,
     /// A folder's color label (read for folders only).
     pub color: Option<TagColor>,
-    /// Replaces the kind, e.g. for items in a source ("ManagedService · Ready").
+    /// Replaces the kind, e.g. for items in a source ("Resource Group").
     pub label: Option<String>,
     /// MIME type for source entries when the filename extension is absent or misleading.
     pub mime_type: Option<String>,
+    /// A source entry's attributes (key, value), shown in the source's columns.
+    pub attributes: Vec<(String, String)>,
 }
 
 /// Finder's color labels (the color tags), numbered as macOS stores them.
@@ -116,12 +119,13 @@ impl Entry {
             is_dir,
             is_package,
             is_symlink,
-            size: if raw_dir { 0 } else { meta.len() },
+            size: Some(if raw_dir { 0 } else { meta.len() }),
             modified: meta.modified().ok(),
             path: path.to_path_buf(),
             name,
             label: None,
             mime_type: None,
+            attributes: Vec::new(),
         })
     }
 
@@ -144,6 +148,11 @@ impl Entry {
     }
 
     /// Human readable kind, e.g. "Folder", "PNG file".
+    /// The value of attribute `key` (ASCII case-insensitive).
+    pub fn attribute(&self, key: &str) -> Option<&str> {
+        self.attributes.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.as_str())
+    }
+
     pub fn kind(&self) -> String {
         if let Some(label) = &self.label {
             return label.clone();
@@ -247,6 +256,8 @@ pub enum SortKey {
     Size,
     Modified,
     Kind,
+    /// The source's nth column (see `sources::Sources::columns`).
+    Column(u8),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -257,6 +268,11 @@ pub struct SortOrder {
 }
 
 pub fn sort_entries(entries: &mut [Entry], order: SortOrder) {
+    sort_entries_by(entries, order, None);
+}
+
+/// Like `sort_entries`; `SortKey::Column` sorts by the attribute `column`.
+pub fn sort_entries_by(entries: &mut [Entry], order: SortOrder, column: Option<&str>) {
     entries.sort_by(|a, b| {
         if order.folders_first && a.is_dir != b.is_dir {
             return b.is_dir.cmp(&a.is_dir);
@@ -266,6 +282,11 @@ pub fn sort_entries(entries: &mut [Entry], order: SortOrder) {
             SortKey::Size => a.size.cmp(&b.size),
             SortKey::Modified => a.modified.cmp(&b.modified),
             SortKey::Kind => a.kind().cmp(&b.kind()),
+            SortKey::Column(_) => match column.map(|key| (a.attribute(key), b.attribute(key))) {
+                Some((Some(x), Some(y))) => natural_cmp(x, y),
+                Some((x, y)) => x.is_none().cmp(&y.is_none()),
+                None => Ordering::Equal,
+            },
         };
         let ord = primary.then_with(|| natural_cmp(&a.name, &b.name));
         if order.ascending { ord } else { ord.reverse() }
@@ -395,7 +416,7 @@ mod tests {
         assert!(entries[2].is_package && !entries[2].is_dir);
         assert_eq!(entries[2].display_name(), "Tool");
         assert_eq!(entries[1].display_name(), "b.txt");
-        assert_eq!(entries[1].size, 5);
+        assert_eq!(entries[1].size, Some(5));
 
         assert_eq!(read_dir(tmp.path(), true).unwrap().len(), 4);
     }

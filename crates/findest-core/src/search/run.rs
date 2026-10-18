@@ -81,6 +81,10 @@ pub(crate) trait Subject {
     fn size(&self) -> u64;
     /// Modification time in Unix seconds.
     fn mtime(&self) -> i64;
+    /// A source entry's attribute; local files have none, so `key:value` never matches them.
+    fn attribute(&self, _key: &str) -> Option<&str> {
+        None
+    }
 }
 
 /// An entry of the index.
@@ -177,6 +181,7 @@ impl<S: Subject> Ctx<'_, S> {
             Pred::Size(range) => (!subject.is_dir() && range.contains(subject.size() as i64)).into(),
             Pred::Modified(range) => range.contains(subject.mtime()).into(),
             Pred::Hidden => Tri::Yes,
+            Pred::Attr { key, value } => subject.attribute(key).is_some_and(|v| v.to_lowercase() == *value).into(),
             Pred::Content(re) => {
                 if subject.is_dir() {
                     return Tri::No;

@@ -122,6 +122,7 @@ Findest keeps an in-memory index of file names, a design inspired by FSearch and
 | `regex:^\d{4}-` | regular expression |
 | `case:`, `nocase:` | force case sensitivity |
 | `content:"TODO"` | text inside files (pair it with other terms to stay fast) |
+| `status:Ready`, `type:TenantData` | in a source: an attribute it shows as a column |
 | `hidden:` | include hidden files |
 
 Search **This folder** or **Everywhere**. Press ↓ or Enter to move to the results. Esc or the ✕ in the box clears the query; Esc again closes search. Run `cargo run --release -p findest-core --example search_bench` to benchmark indexing and search on your machine.

@@ -25,7 +25,7 @@ pub struct WindowSession {
 
 /// List view column widths in points. The list scrolls sideways when they
 /// add up to more than the window is wide.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ColumnWidths {
     pub name: f32,
@@ -33,16 +33,19 @@ pub struct ColumnWidths {
     pub size: f32,
     /// Kind, or Where in Recents and search results.
     pub kind: f32,
+    /// A source's columns, by attribute key.
+    pub attributes: std::collections::BTreeMap<String, f32>,
 }
 
 impl ColumnWidths {
     pub const MIN: f32 = 40.0;
     pub const MAX: f32 = 800.0;
+    pub const ATTRIBUTE: f32 = 120.0;
 }
 
 impl Default for ColumnWidths {
     fn default() -> Self {
-        ColumnWidths { name: 300.0, modified: 170.0, size: 90.0, kind: 130.0 }
+        ColumnWidths { name: 300.0, modified: 170.0, size: 90.0, kind: 130.0, attributes: Default::default() }
     }
 }
 

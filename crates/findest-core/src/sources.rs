@@ -95,6 +95,15 @@ struct WireListing {
     /// Problems the adapter wants shown, without failing the listing.
     #[serde(default)]
     warnings: Vec<String>,
+    /// Attributes to show as columns, in order.
+    #[serde(default)]
+    columns: Vec<WireColumn>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct WireColumn {
+    key: String,
+    title: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -110,6 +119,8 @@ pub(crate) struct WireEntry {
     modified: Option<String>,
     has_children: Option<bool>,
     mime_type: Option<String>,
+    #[serde(default)]
+    attributes: serde_json::Map<String, serde_json::Value>,
 }
 
 impl From<crate::sources_v2::WireEntry> for WireEntry {
@@ -124,6 +135,7 @@ impl From<crate::sources_v2::WireEntry> for WireEntry {
             modified: v.modified,
             has_children: v.has_children,
             mime_type: v.mime_type,
+            attributes: v.attributes,
         }
     }
 }
@@ -153,11 +165,27 @@ struct State {
     signed_out: HashSet<String>,
     /// Live v2 processes keyed by source id.
     v2_processes: HashMap<String, std::sync::Arc<crate::sources_v2::V2Process>>,
+    /// Each source's columns (key, title), in the order first declared.
+    columns: HashMap<String, Vec<(String, String)>>,
+    /// Notices from v2 adapters, newest last, numbered from 1.
+    notices: Vec<(u64, Notice)>,
+    notice_count: u64,
+}
+
+/// Something a v2 adapter said on its own (not answering a request).
+#[derive(Clone, Debug)]
+pub struct Notice {
+    /// The folder whose contents changed (its cached listings are dropped).
+    pub folder: PathBuf,
+    /// "URM Types: the API catalog is ready".
+    pub message: Option<String>,
 }
 
 pub struct Sources {
     mounts: PathBuf,
     state: Mutex<State>,
+    /// Called after each notice; dropped once it returns false.
+    listeners: Mutex<Vec<Box<dyn Fn() -> bool + Send>>>,
 }
 
 static GLOBAL: LazyLock<Sources> = LazyLock::new(|| {
@@ -182,7 +210,7 @@ impl Sources {
             global().shutdown();
         }
         unsafe { libc::atexit(on_exit) };
-        Sources { mounts, state: Mutex::new(State::default()) }
+        Sources { mounts, state: Mutex::new(State::default()), listeners: Mutex::new(Vec::new()) }
     }
 
     /// Replaces the configured sources (on config load) and returns problems
@@ -292,6 +320,35 @@ impl Sources {
         format!("/{}", parts.join("/"))
     }
 
+    /// A v2 adapter's notice: `folder` (a ref; the root if none) changed.
+    pub(crate) fn notice(&self, id: &str, folder: Option<&str>, message: Option<&str>) {
+        let Some(source) = self.sources().into_iter().find(|s| s.id == id) else { return };
+        let mut path = self.mount_path(&source);
+        path.extend(folder.unwrap_or("/").split('/').filter(|p| !p.is_empty() && *p != ".."));
+        self.invalidate(&path);
+        let message = message.filter(|m| !m.is_empty()).map(|m| format!("{}: {m}", source.name));
+        {
+            let mut state = self.state.lock().unwrap();
+            state.notice_count += 1;
+            let n = state.notice_count;
+            state.notices.push((n, Notice { folder: path, message }));
+            let excess = state.notices.len().saturating_sub(32);
+            state.notices.drain(..excess);
+        }
+        self.listeners.lock().unwrap().retain(|listener| listener());
+    }
+
+    /// Calls `listener` after every notice until it returns false.
+    pub fn on_notice(&self, listener: impl Fn() -> bool + Send + 'static) {
+        self.listeners.lock().unwrap().push(Box::new(listener));
+    }
+
+    /// Notices after number `seen`, and the number to pass next time.
+    pub fn notices_since(&self, seen: u64) -> (Vec<Notice>, u64) {
+        let state = self.state.lock().unwrap();
+        (state.notices.iter().filter(|(n, _)| *n > seen).map(|(_, notice)| notice.clone()).collect(), state.notice_count)
+    }
+
     /// Drops cached listings and files at and under `dir` (⌘R).
     pub fn invalidate(&self, dir: &Path) {
         let mut state = self.state.lock().unwrap();
@@ -344,9 +401,10 @@ impl Sources {
         if source.protocol_version == 2 {
             let mut seen: HashSet<PathBuf> = listing.rows.iter().map(|(e, _)| e.path.clone()).collect();
             let mut wires: Vec<WireEntry> = Vec::new();
-            let next = self.v2_call(&source, |proc| {
+            let (next, columns) = self.v2_call(&source, |proc| {
                 proc.list(&source, folder, continue_token, &mut |e| wires.push(WireEntry::from(e)), &mut |w| listing.warnings.push(w))
             })?;
+            self.add_columns(&source, &columns);
             let rows = self.admit(&source, wires, &mut seen, &mut listing.warnings, |_| Ok(dir.to_path_buf()));
             listing.rows.extend(rows);
             listing.next = next.filter(|t| !t.is_empty());
@@ -355,6 +413,7 @@ impl Sources {
             args.extend(continue_token);
             let out = self.run(&source, "list", &args, REQUEST_TIMEOUT, None)?;
             let page = parse_page(&source, "list", &out)?;
+            self.add_columns(&source, &page.columns);
             listing.warnings.extend(page.warnings.iter().map(|w| format!("{}: {w}", source.name)));
             let mut seen: HashSet<PathBuf> = listing.rows.iter().map(|(e, _)| e.path.clone()).collect();
             let rows = self.admit(&source, page.entries, &mut seen, &mut listing.warnings, |_| Ok(dir.to_path_buf()));
@@ -362,6 +421,22 @@ impl Sources {
             listing.next = page.next.filter(|t| !t.is_empty());
         }
         Ok(())
+    }
+
+    fn add_columns(&self, source: &Source, declared: &[WireColumn]) {
+        let mut state = self.state.lock().unwrap();
+        let columns = state.columns.entry(source.id.clone()).or_default();
+        for column in declared {
+            if !columns.iter().any(|(key, _)| key.eq_ignore_ascii_case(&column.key)) && columns.len() < u8::MAX as usize {
+                columns.push((column.key.clone(), column.title.clone().unwrap_or_else(|| column.key.clone())));
+            }
+        }
+    }
+
+    /// The columns (key, title) of the source `path` is in.
+    pub fn columns(&self, path: &Path) -> Vec<(String, String)> {
+        let Some(id) = self.mount_id(path) else { return Vec::new() };
+        self.state.lock().unwrap().columns.get(id).cloned().unwrap_or_default()
     }
 
     /// Checks the adapter's entries, turns them into rows at the folder
@@ -419,11 +494,20 @@ impl Sources {
                 is_dir,
                 is_package: false,
                 is_symlink: false,
-                size: wire.size.unwrap_or(0),
+                size: wire.size,
                 modified,
                 color: None,
                 label: wire.label,
                 mime_type: wire.mime_type,
+                attributes: wire
+                    .attributes
+                    .into_iter()
+                    .filter_map(|(key, value)| match value {
+                        serde_json::Value::Null => None,
+                        serde_json::Value::String(text) => Some((key, text)),
+                        other => Some((key, other.to_string())),
+                    })
+                    .collect(),
             };
             rows.push((entry, is_dir && wire.has_children.unwrap_or(true)));
         }
@@ -469,9 +553,10 @@ impl Sources {
                 .map_err(|e| SourceError::Failed(format!("{}: bad hints JSON: {e}", source.name)))?;
             let mut wires: Vec<WireEntry> = Vec::new();
             let mut warnings: Vec<String> = Vec::new();
-            let page_next = self.v2_call(&source, |proc| {
+            let (page_next, columns) = self.v2_call(&source, |proc| {
                 proc.search(&source, under.clone(), hints_val, next, &mut |e| wires.push(WireEntry::from(e)), &mut |w| warnings.push(w))
             })?;
+            self.add_columns(&source, &columns);
             let rows = self.admit(&source, wires, seen, &mut warnings, place);
             Ok(SearchPage { rows, next: page_next.filter(|t| !t.is_empty()), warnings })
         } else {
@@ -479,6 +564,7 @@ impl Sources {
             args.extend(next);
             let out = self.run(&source, "search", &args, REQUEST_TIMEOUT, None)?;
             let page = parse_page(&source, "search", &out)?;
+            self.add_columns(&source, &page.columns);
             let mut warnings: Vec<String> = page.warnings.iter().map(|w| format!("{}: {w}", source.name)).collect();
             let rows = self.admit(&source, page.entries, seen, &mut warnings, place);
             Ok(SearchPage { rows, next: page.next.filter(|t| !t.is_empty()), warnings })
@@ -533,7 +619,11 @@ impl Sources {
         tree.warnings.extend(listing.warnings);
         let children: HashMap<PathBuf, bool> = listing.rows.iter().map(|(e, c)| (e.path.clone(), *c)).collect();
         let mut entries: Vec<Entry> = listing.rows.into_iter().map(|(e, _)| e).filter(|e| show_hidden || !e.is_hidden).collect();
-        crate::listing::sort_entries(&mut entries, order);
+        let column = match order.key {
+            crate::listing::SortKey::Column(n) => self.columns(dir).get(n as usize).map(|(key, _)| key.clone()),
+            _ => None,
+        };
+        crate::listing::sort_entries_by(&mut entries, order, column.as_deref());
         for entry in entries {
             let has_children = children.get(&entry.path).copied().unwrap_or(false);
             let recurse = has_children && depth < MAX_TREE_DEPTH && expanded.contains(&entry.path);
@@ -754,11 +844,12 @@ fn more_row(dir: &Path) -> Entry {
         is_package: false,
         is_symlink: false,
         is_hidden: false,
-        size: 0,
+        size: None,
         modified: None,
         color: None,
         label: Some("Open to list more".into()),
         mime_type: None,
+        attributes: Vec::new(),
     }
 }
 
@@ -771,6 +862,7 @@ fn run(source: &Source, verb: &str, args: &[String], timeout: Duration, cancel: 
         return Err(SourceError::Failed(format!("{}: no command configured", source.name)));
     };
     let mut child = Command::new(crate::paths::expand_tilde(program))
+        .env("PATH", adapter_path())
         .args(own_args)
         .arg(verb)
         .args(args)
@@ -853,6 +945,24 @@ pub(crate) struct SearchPage {
     pub(crate) warnings: Vec<String>,
 }
 
+/// PATH for adapters. Apps opened from Finder get only /usr/bin:/bin:…, so
+/// the tools adapters call (uctl, kubectl…) wouldn't be found; add the usual
+/// install folders after what's there.
+pub(crate) fn adapter_path() -> std::ffi::OsString {
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    let home = dirs::home_dir().unwrap_or_default();
+    let extra = ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/local/sbin"]
+        .map(PathBuf::from)
+        .into_iter()
+        .chain([".local/bin", "bin", "go/bin", ".cargo/bin"].map(|d| home.join(d)));
+    for dir in extra {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    std::env::join_paths(dirs).unwrap_or_default()
+}
+
 fn parse_time(text: &str) -> Option<SystemTime> {
     let time = chrono::DateTime::parse_from_rfc3339(text).ok()?;
     Some(SystemTime::from(time))
@@ -907,6 +1017,42 @@ esac
 
     fn names(tree: &SourceTree) -> Vec<(&str, usize)> {
         tree.rows.iter().map(|r| (r.entry.name.as_str(), r.depth)).collect()
+    }
+
+    #[test]
+    fn notices_drop_listings_and_tell_listeners() {
+        let (_tmp, sources, root) = mounted(&example());
+        sources.read_tree(&root, &HashSet::new(), false, ORDER).unwrap();
+        let heard = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = heard.clone();
+        sources.on_notice(move || counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 1);
+        let (_, seen) = sources.notices_since(u64::MAX);
+
+        sources.notice("ex", Some("/"), Some("the index is ready"));
+        assert!(!sources.state.lock().unwrap().listings.contains_key(&root), "listed again next time");
+        let (notices, seen) = sources.notices_since(seen);
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].folder, root);
+        assert_eq!(notices[0].message.as_deref(), Some("Example: the index is ready"));
+
+        sources.notice("ex", Some("/docs"), None);
+        sources.notice("ex", None, None);
+        assert_eq!(sources.notices_since(seen).0.len(), 2);
+        assert_eq!(heard.load(std::sync::atomic::Ordering::Relaxed), 2, "a listener that returns false is dropped");
+        sources.notice("nope", None, Some("x"));
+        assert_eq!(sources.notices_since(seen).0.len(), 2, "unknown sources are ignored");
+    }
+
+    #[test]
+    fn attributes_show_as_columns_and_sort() {
+        let (_tmp, sources, root) = mounted(&example());
+        let by_owner = SortOrder { key: SortKey::Column(0), ascending: true, folders_first: false };
+        let tree = sources.read_tree(&root, &HashSet::new(), false, by_owner).unwrap();
+        assert_eq!(sources.columns(&root), vec![("owner".to_string(), "Owner".to_string())]);
+        assert_eq!(tree.rows[0].entry.name, "hello.txt", "the only one with an owner sorts before the rest");
+        assert_eq!(tree.rows[0].entry.attribute("Owner"), Some("docs-team"));
+        assert_eq!(tree.rows[0].entry.size, Some(28));
+        assert_eq!(tree.rows[1].entry.size, None, "a size the adapter doesn't give stays unknown");
     }
 
     #[test]

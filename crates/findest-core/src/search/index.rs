@@ -339,10 +339,11 @@ impl Index {
             is_package: flags & FLAG_PACKAGE != 0,
             is_symlink: flags & FLAG_SYMLINK != 0,
             is_hidden: flags & FLAG_HIDDEN != 0,
-            size: self.size(id),
+            size: Some(self.size(id)),
             modified: u64::try_from(self.mtime(id)).ok().map(|s| UNIX_EPOCH + std::time::Duration::from_secs(s)),
             label: None,
             mime_type: None,
+            attributes: Vec::new(),
         }
     }
 

@@ -27,6 +27,7 @@ TREE = {
             "kind": "file",
             "ref": "hello",  # file refs are yours: whatever `read` needs
             "label": "Greeting",  # optional: shown instead of the kind
+            "attributes": {"owner": "docs-team"},  # optional: see COLUMNS
             "size": 28,  # optional
             "modified": "2026-10-01T12:00:00Z",  # optional, RFC 3339
         },
@@ -46,6 +47,9 @@ FILES = {
     **{f"item-{i}": f"Item {i}\n" for i in range(1, 4)},
 }
 
+# Optional: attributes shown as columns. Searchable as owner:docs-team.
+COLUMNS = [{"key": "owner", "title": "Owner"}]
+
 PAGE = 2  # /big has 3 entries, so it comes in two pages
 
 
@@ -56,8 +60,8 @@ def cmd_list(folder, token=None):
     start = int(token or 0)
     entries = TREE[folder]
     if folder != "/big":
-        return {"entries": entries}
-    page = {"entries": entries[start : start + PAGE]}
+        return {"entries": entries, "columns": COLUMNS}
+    page = {"entries": entries[start : start + PAGE], "columns": COLUMNS}
     if start + PAGE < len(entries):
         page["continue"] = str(start + PAGE)  # passed back as the 2nd argument
     return page

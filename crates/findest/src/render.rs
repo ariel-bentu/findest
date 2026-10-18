@@ -10,7 +10,7 @@ use findest_core::locations;
 use findest_core::paths::contract_tilde;
 use findest_core::config::ViewMode;
 use gpui::{
-    AnyElement, Bounds, Context, DispatchPhase, ExternalPaths, FontWeight, Hsla, Image, MouseButton, MouseDownEvent,
+    Animation, AnimationExt, AnyElement, Bounds, Context, DispatchPhase, ElementId, ExternalPaths, FontWeight, Hsla, Image, MouseButton, MouseDownEvent,
     CursorStyle, ListHorizontalSizingBehavior, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Point, SharedString, Window, anchored, canvas, deferred, div, img,
     prelude::*, px, uniform_list,
 };
@@ -209,7 +209,7 @@ impl Browser {
                         .text_color(theme.text)
                         .child(self.location_label()),
                 )
-                .when(self.loading, |d| d.child(div().flex_none().text_color(theme.text_muted).child("Loading…"))),
+                .when(self.loading, |d| d.child(div().flex_none().flex().items_center().gap(px(4.)).text_color(theme.text_muted).child(spinner()).child("Loading…"))),
         )
     }
 
@@ -476,6 +476,7 @@ impl Browser {
                         .on_click(cx.listener(|this, _, _, cx| this.toggle_live_search(cx)))
                         .child("Live"),
                 )
+                .when(search.running, |d| d.child(div().flex_none().text_color(theme.text_muted).child(spinner())))
                 .child(
                     div()
                         .flex_1()
@@ -1108,7 +1109,7 @@ impl Browser {
     fn render_header(&self, recents: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = &self.theme;
         let general = &self.config.general;
-        let column = |id: &'static str, label: &'static str, key: Option<SortKey>, width: Option<f32>, right: bool| {
+        let column = |id: ElementId, label: SharedString, key: Option<SortKey>, width: Option<f32>, right: bool| {
             let arrow = match key {
                 Some(k) if !recents && general.sort_by == k => if general.sort_ascending { " ▲" } else { " ▼" },
                 _ => "",
@@ -1147,14 +1148,18 @@ impl Browser {
                     .flex_row()
                     .items_center()
                     .pl(px(NAME_START))
-                    .child(column("h-name", "Name", Some(SortKey::Name), Some(self.columns.name), false))
-                    .child(column("h-modified", "Date Modified", Some(SortKey::Modified), Some(self.columns.modified), false))
-                    .child(column("h-size", "Size", Some(SortKey::Size), Some(self.columns.size), true))
+                    .child(column("h-name".into(), "Name".into(), Some(SortKey::Name), Some(self.columns.name), false))
+                    .child(column("h-modified".into(), "Date Modified".into(), Some(SortKey::Modified), Some(self.columns.modified), false))
+                    .child(column("h-size".into(), "Size".into(), Some(SortKey::Size), Some(self.columns.size), true))
                     .child(if recents {
-                        column("h-where", "Where", None, Some(self.columns.kind), false)
+                        column("h-where".into(), "Where".into(), None, Some(self.columns.kind), false)
                     } else {
-                        column("h-kind", "Kind", Some(SortKey::Kind), Some(self.columns.kind), false)
+                        column("h-kind".into(), "Kind".into(), Some(SortKey::Kind), Some(self.columns.kind), false)
                     })
+                    .children(self.source_columns.iter().enumerate().map(|(n, (_, title))| {
+                        let width = self.column_width(Column::Attribute(n as u8));
+                        column(ElementId::named_usize("h-attribute", n), title.clone().into(), Some(SortKey::Column(n as u8)), Some(width), false)
+                    }))
                     .children(self.column_handles(cx)),
             )
     }
@@ -1164,8 +1169,13 @@ impl Browser {
         let theme = &self.theme;
         let mut edge = NAME_START;
         let mut handles = Vec::new();
-        let columns =
-            [("edge-name", Column::Name), ("edge-modified", Column::Modified), ("edge-size", Column::Size), ("edge-kind", Column::Kind)];
+        let mut columns: Vec<(ElementId, Column)> = vec![
+            ("edge-name".into(), Column::Name),
+            ("edge-modified".into(), Column::Modified),
+            ("edge-size".into(), Column::Size),
+            ("edge-kind".into(), Column::Kind),
+        ];
+        columns.extend((0..self.source_columns.len()).map(|n| (ElementId::named_usize("edge-attribute", n), Column::Attribute(n as u8))));
         for (id, column) in columns {
             edge += self.column_width(column);
             let dragging = self.column_drag.is_some();
@@ -1454,9 +1464,16 @@ impl Browser {
                     .justify_end()
                     .whitespace_nowrap()
                     .text_color(muted)
-                    .child(if entry.is_dir || entry.is_package { "--".into() } else { format_size(entry.size) }),
+                    .child(match entry.size {
+                        Some(bytes) if !entry.is_dir && !entry.is_package => format_size(bytes),
+                        _ => "--".into(),
+                    }),
             )
-            .child(div().w(px(self.columns.kind)).flex_none().px_2().truncate().text_color(muted).child(last_column));
+            .child(div().w(px(self.columns.kind)).flex_none().px_2().truncate().text_color(muted).child(last_column))
+            .children(self.source_columns.iter().enumerate().map(|(n, (key, _))| {
+                let width = self.column_width(Column::Attribute(n as u8));
+                div().w(px(width)).flex_none().px_2().truncate().text_color(muted).child(entry.attribute(key).unwrap_or_default().to_string())
+            }));
         // uniform_list lays rows out as roots: claim at least the visible width so
         // the hover and selection backgrounds span it; wider columns scroll sideways.
         // The inset is here rather than list padding, which sideways scrolling doubles.
@@ -1497,7 +1514,7 @@ impl Browser {
             let selected: Vec<&Entry> = self.entries.iter().filter(|e| self.selected.contains(&e.path)).collect();
             let folders = selected.iter().filter(|e| e.is_dir).count();
             let files = selected.len() - folders;
-            let bytes: u64 = selected.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
+            let bytes: u64 = selected.iter().filter(|e| !e.is_dir).filter_map(|e| e.size).sum();
             let mut rows = vec![];
             if files > 0 {
                 rows.push(("Files", format!("{files} · {}", format_size(bytes))));
@@ -1519,7 +1536,7 @@ impl Browser {
 
         // Preview: the image itself, an AppKit rendering, or a large icon. Text
         // files additionally get their first lines below the details.
-        let preview: AnyElement = if crate::browser::gpui_decodes(&entry.path) && entry.size <= MAX_PREVIEW_BYTES {
+        let preview: AnyElement = if crate::browser::gpui_decodes(&entry.path) && entry.size.is_some_and(|s| s <= MAX_PREVIEW_BYTES) {
             img(entry.path.clone()).w_full().max_h(px(220.)).object_fit(ObjectFit::Contain).rounded_md().into_any_element()
         } else if let Some(image) = info.preview.clone() {
             img(image).w_full().max_h(px(260.)).object_fit(ObjectFit::Contain).rounded_md().into_any_element()
@@ -1553,8 +1570,10 @@ impl Browser {
                 (None, true) => "Calculating…".into(),
                 (None, false) => "--".into(),
             }
+        } else if let Some(bytes) = entry.size {
+            format!("{} ({} bytes)", format_size(bytes), findest_core::info::group_digits(bytes))
         } else {
-            format!("{} ({} bytes)", format_size(entry.size), findest_core::info::group_digits(entry.size))
+            "--".into()
         };
         rows.push(("Size", size));
         if let Some((w, h)) = info.dimensions {
@@ -2115,6 +2134,14 @@ impl Browser {
             this.drop_paths(files.paths().to_vec(), dest.clone(), copy, window, cx);
         }))
     }
+}
+
+/// A turning busy indicator.
+fn spinner() -> impl IntoElement {
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    div().w(px(16.)).with_animation("spinner", Animation::new(std::time::Duration::from_millis(800)).repeat(), |d, t| {
+        d.child(FRAMES[((t * FRAMES.len() as f32) as usize).min(FRAMES.len() - 1)])
+    })
 }
 
 /// "Copying 120 of 3,400 items · 1.2 GB of 8.4 GB · 45 MB/s · about 3 min left".

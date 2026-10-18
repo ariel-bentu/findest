@@ -57,6 +57,8 @@ pub enum Column {
     Modified,
     Size,
     Kind,
+    /// The source's nth column (`Browser::source_columns`).
+    Attribute(u8),
 }
 
 /// Dragging a column's right edge: the columns after it move along.
@@ -299,6 +301,10 @@ pub struct Browser {
     pub(crate) view: ViewMode,
     pub(crate) tile_size: f32,
     pub(crate) columns: ColumnWidths,
+    /// The current source's columns (key, title); empty outside sources.
+    pub(crate) source_columns: Vec<(String, String)>,
+    /// The last source notice handled (`sources::Sources::notices_since`).
+    notices_seen: u64,
     /// A list column's edge is being dragged.
     pub(crate) column_drag: Option<ColumnDrag>,
     /// Tiles per row, as last laid out; arrow keys move by this much vertically.
@@ -402,6 +408,17 @@ impl Browser {
             None => None,
         };
 
+        // Sources' adapters can say a folder changed (e.g. a slow index is ready).
+        let (notice_tx, mut notice_rx) = futures::channel::mpsc::unbounded::<()>();
+        sources::global().on_notice(move || notice_tx.unbounded_send(()).is_ok());
+        tasks.push(cx.spawn_in(window, async move |this, cx| {
+            while notice_rx.next().await.is_some() {
+                if this.update(cx, |this, cx| this.on_source_notice(cx)).is_err() {
+                    break;
+                }
+            }
+        }));
+
         let subscriptions = vec![cx.observe_window_appearance(window, |this, window, cx| {
             this.apply_config(this.config.clone(), window, cx);
         })];
@@ -456,6 +473,8 @@ impl Browser {
             view,
             tile_size,
             columns: init.columns.unwrap_or_default(),
+            source_columns: Vec::new(),
+            notices_seen: sources::global().notices_since(u64::MAX).1,
             column_drag: None,
             tile_columns: 1,
             tile_slider_drag: false,
@@ -641,7 +660,24 @@ impl Browser {
             expanded: self.expanded.iter().cloned().collect(),
             view: Some(self.view),
             tile_size: Some(self.tile_size),
-            columns: Some(self.columns),
+            columns: Some(self.columns.clone()),
+        }
+    }
+
+    /// A source's adapter said a folder changed: reload if it's what we show.
+    fn on_source_notice(&mut self, cx: &mut Context<Self>) {
+        let (notices, seen) = sources::global().notices_since(self.notices_seen);
+        self.notices_seen = seen;
+        let Some(dir) = self.current_dir() else { return };
+        let mut reload = false;
+        for notice in notices.into_iter().filter(|n| dir.starts_with(&n.folder) || n.folder.starts_with(&dir)) {
+            reload = true;
+            if let Some(message) = notice.message {
+                self.set_info(message, cx);
+            }
+        }
+        if reload {
+            self.reload(cx);
         }
     }
 
@@ -705,6 +741,7 @@ impl Browser {
         self.loading = false;
         self.load_error = None;
         self.preview_paths_cache.clear();
+        self.source_columns = self.current_dir().map(|d| sources::global().columns(&d)).unwrap_or_default();
         match result {
             Ok((rows, warnings)) => {
                 if let Some(first) = warnings.first() {
@@ -1162,7 +1199,7 @@ impl Browser {
                     info_panel: Some(self.config.general.info_panel),
                     view: Some(self.view),
                     tile_size: Some(self.tile_size),
-                    columns: Some(self.columns),
+                    columns: Some(self.columns.clone()),
                     ..Default::default()
                 };
                 cx.defer(move |cx| {
@@ -1237,7 +1274,7 @@ impl Browser {
                     info_panel: Some(self.config.general.info_panel),
                     view: Some(self.view),
                     tile_size: Some(self.tile_size),
-                    columns: Some(self.columns),
+                    columns: Some(self.columns.clone()),
                     ..Default::default()
                 };
                 cx.defer(move |cx| {
@@ -2398,6 +2435,11 @@ impl Browser {
             Column::Modified => self.columns.modified,
             Column::Size => self.columns.size,
             Column::Kind => self.columns.kind,
+            Column::Attribute(n) => self
+                .source_columns
+                .get(n as usize)
+                .and_then(|(key, _)| self.columns.attributes.get(key).copied())
+                .unwrap_or(ColumnWidths::ATTRIBUTE),
         }
     }
 
@@ -2408,6 +2450,10 @@ impl Browser {
             Column::Modified => &mut self.columns.modified,
             Column::Size => &mut self.columns.size,
             Column::Kind => &mut self.columns.kind,
+            Column::Attribute(n) => {
+                let Some((key, _)) = self.source_columns.get(n as usize) else { return };
+                self.columns.attributes.entry(key.clone()).or_insert(ColumnWidths::ATTRIBUTE)
+            }
         };
         if *slot != width {
             *slot = width;
@@ -2440,6 +2486,7 @@ impl Browser {
             Column::Modified => defaults.modified,
             Column::Size => defaults.size,
             Column::Kind => defaults.kind,
+            Column::Attribute(_) => ColumnWidths::ATTRIBUTE,
         };
         self.set_column_width(column, width, cx);
         self.save_session(cx);
@@ -2451,7 +2498,7 @@ impl Browser {
         let entry = self.entries.get(ix)?;
         let icon = IconKey::for_entry(entry, &self.home);
         let icon = if self.tile_size > 64.0 { IconKey::Large(Box::new(icon)) } else { icon };
-        let thumbnail = !entry.is_dir && entry.size <= MAX_THUMBNAIL_BYTES && is_image_path(&entry.path);
+        let thumbnail = !entry.is_dir && entry.size.is_some_and(|s| s <= MAX_THUMBNAIL_BYTES) && is_image_path(&entry.path);
         let (path, modified) = (entry.path.clone(), entry.modified);
         if thumbnail {
             // Retina pixels, in a few buckets so resizing doesn't re-render every step.
@@ -2622,7 +2669,7 @@ impl Browser {
             general.sort_ascending = !general.sort_ascending;
         } else {
             general.sort_by = key;
-            general.sort_ascending = key == listing::SortKey::Name || key == listing::SortKey::Kind;
+            general.sort_ascending = !matches!(key, listing::SortKey::Size | listing::SortKey::Modified);
         }
         if self.location != Location::Recents {
             // Re-list rather than sort in place: each tree level sorts separately.
@@ -2732,7 +2779,7 @@ impl Browser {
 
     /// Total size of selected files (folders aren't measured).
     pub fn selection_size(&self) -> u64 {
-        self.entries.iter().filter(|e| !e.is_dir && self.selected.contains(&e.path)).map(|e| e.size).sum()
+        self.entries.iter().filter(|e| !e.is_dir && self.selected.contains(&e.path)).filter_map(|e| e.size).sum()
     }
 
     pub fn depth(&self, ix: usize) -> usize {
@@ -3089,11 +3136,12 @@ mod tests {
             is_package: false,
             is_symlink: false,
             is_hidden: false,
-            size: 0,
+            size: Some(0),
             modified: None,
             color: None,
             label: None,
             mime_type: None,
+            attributes: Vec::new(),
         }
     }
 

@@ -252,10 +252,13 @@ impl Subject for Item<'_> {
         self.entry.is_dir
     }
     fn size(&self) -> u64 {
-        self.entry.size
+        self.entry.size.unwrap_or(0)
     }
     fn mtime(&self) -> i64 {
         self.entry.modified.and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs() as i64)
+    }
+    fn attribute(&self, key: &str) -> Option<&str> {
+        self.entry.attribute(key)
     }
 }
 
@@ -313,7 +316,7 @@ mod tests {
             &script,
             r#"#!/bin/sh
 case "$1 $2" in
-  "list /") echo '{"entries":[{"name":"a","kind":"folder","ref":"/a"},{"name":"broken","kind":"folder","ref":"/broken"},{"name":"x.txt","kind":"file","ref":"x"}]}' ;;
+  "list /") echo '{"entries":[{"name":"a","kind":"folder","ref":"/a"},{"name":"broken","kind":"folder","ref":"/broken"},{"name":"x.txt","kind":"file","ref":"x","attributes":{"type":"TenantData","Status":"Ready","count":3}}]}' ;;
   "list /a") echo '{"entries":[{"name":"ax.txt","kind":"file","ref":"ax"}],"continue":"2"}' ;;
   "search "*) echo "search isn't supported" >&2; exit 64 ;;
   *) echo "nope: $*" >&2; exit 1 ;;
@@ -335,6 +338,9 @@ esac
             ]
         );
         assert_eq!(names(&find(&sources, &root, "path:/a/")), vec!["ax.txt"]);
+        assert_eq!(names(&find(&sources, &root, "type:tenantdata status:READY count:3")), vec!["x.txt"]);
+        assert!(find(&sources, &root, "type:Tenant").entries.is_empty(), "whole values only");
+        assert!(find(&sources, &root, "!status:Ready type:TenantData").entries.is_empty());
     }
 
     #[test]

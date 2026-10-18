@@ -16,7 +16,7 @@ Protocol: docs/sources.md. Configure it in ~/.config/findest/config.toml:
 Tree:
     /                       namespaces, plus "(cluster)" for cluster-scoped kinds
     /<ns>/                  kinds with something in them, e.g. "deployments.apps"
-    /<ns>/<kind>/           resources as <name>.yaml, labeled with their status
+    /<ns>/<kind>/           resources as <name>.yaml, with Type and Status columns
     /(cluster)/<kind>/      the same for cluster-scoped kinds (nodes, CRDs...)
 """
 import argparse
@@ -34,6 +34,9 @@ AUTH_ERRORS = ("must be logged in", "unauthorized", "provide credentials", "toke
 class NotSignedIn(Exception):
     pass
 
+
+# Attributes shown as columns; searchable as kind:Pod or status:Running.
+COLUMNS = [{"key": "kind", "title": "Type"}, {"key": "status", "title": "Status"}]
 
 def kubectl(args, opts, check=True):
     cmd = ["kubectl", "--request-timeout=20s", *args]
@@ -106,12 +109,11 @@ def resource_entry(item, namespace, kind):
     meta = item.get("metadata") or {}
     name = meta.get("name")
     state = status(item)
-    label = item.get("kind") or kind
     return {
         "name": f"{name}.yaml",
         "kind": "file",
         "ref": json.dumps([namespace or "", kind, name]),
-        "label": f"{label} · {state}" if state else label,
+        "attributes": {"kind": item.get("kind") or kind, "status": state},
         "modified": meta.get("creationTimestamp"),
     }
 
@@ -175,7 +177,7 @@ def cmd_search(folder, hints, opts):
                                 "label": f"{n} item{'s' if n != 1 else ''}", "folder": f"/{top_folder}"})
     if not parts:
         entries.extend({**e, "folder": "/"} for e in list_namespaces(opts) if wanted(e["name"]))
-    out = {"entries": [{k: v for k, v in e.items() if v is not None} for e in entries]}
+    out = {"entries": [{k: v for k, v in e.items() if v is not None} for e in entries], "columns": COLUMNS}
     if failed:
         out["warnings"] = [f"couldn't search {', '.join(failed)}"]
     return out
@@ -190,7 +192,8 @@ def list_namespaces(opts):
             "name": meta["name"],
             "kind": "folder",
             "ref": "/" + meta["name"],
-            "label": "Namespace · " + (status(item) or "Active"),
+            "label": "Namespace",
+            "attributes": {"kind": "Namespace", "status": status(item) or "Active"},
             "modified": meta.get("creationTimestamp"),
         })
     return entries
@@ -213,7 +216,7 @@ def cmd_list(folder, opts):
         entries = list_resources(namespace, parts[1], opts)
     else:
         raise RuntimeError(f"no folder {folder}")
-    out = {"entries": [{k: v for k, v in e.items() if v is not None} for e in entries]}
+    out = {"entries": [{k: v for k, v in e.items() if v is not None} for e in entries], "columns": COLUMNS}
     if warnings:
         out["warnings"] = warnings
     return out

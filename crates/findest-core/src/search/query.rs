@@ -17,6 +17,7 @@
 //! case:Readme  nocase:X   force case-sensitive / insensitive
 //! content:"TODO"          text inside files (combine with other terms to stay fast)
 //! hidden:                 also match hidden files
+//! status:Ready            in a source: an attribute equals a value (any key that isn't built in)
 //! ```
 
 use chrono::{Duration, Local, NaiveDate, TimeZone};
@@ -51,6 +52,9 @@ pub(crate) enum Pred {
     Modified(Range),
     Hidden,
     Content(regex::bytes::Regex),
+    /// `key:value` for a key that isn't built in: a source entry's attribute
+    /// equals the value (case-insensitive; the value is lowercase).
+    Attr { key: String, value: String },
 }
 
 #[derive(Debug)]
@@ -303,6 +307,10 @@ impl Parser {
         if let Some(dir) = kind {
             filters.push(Node::Leaf(Pred::IsDir(dir)));
         }
+        if !quoted && !regex && let Some((key, value)) = attribute_term(rest) {
+            filters.push(Node::Leaf(Pred::Attr { key: key.to_lowercase(), value: value.to_lowercase() }));
+            rest = "";
+        }
         if !rest.is_empty() {
             let sensitive = case.unwrap_or_else(|| has_upper(rest));
             let on_path = path || rest.contains('/');
@@ -336,6 +344,15 @@ fn split_key(text: &str) -> Option<(String, &str)> {
     let (key, value) = text.split_once(':')?;
     let key = key.to_ascii_lowercase();
     KEYS.contains(&key.as_str()).then_some((key, value))
+}
+
+/// `status:Ready`: a key that isn't built in (letters, digits, `-`, `_`,
+/// `.`, starting with a letter) and a value.
+fn attribute_term(text: &str) -> Option<(&str, &str)> {
+    let (key, value) = text.split_once(':')?;
+    let ok = key.starts_with(|c: char| c.is_ascii_alphabetic())
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    (ok && !value.is_empty()).then_some((key, value))
 }
 
 fn has_upper(s: &str) -> bool {

@@ -14,7 +14,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::sources::{Source, SourceError};
+use crate::sources::{Source, SourceError, WireColumn};
 
 /// How long `list` and `search` may be idle (no line received) before timing out.
 pub(crate) const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -59,6 +59,10 @@ struct RawLine {
     has_children: Option<bool>,
     folder: Option<String>,
     mime_type: Option<String>,
+    #[serde(default)]
+    attributes: serde_json::Map<String, Value>,
+    /// On the sentinel: attributes to show as columns.
+    columns: Option<Vec<WireColumn>>,
     #[serde(rename = "continue")]
     continue_token: Option<String>,
     warning: Option<String>,
@@ -78,13 +82,14 @@ pub(crate) struct WireEntry {
     pub(crate) has_children: Option<bool>,
     pub(crate) folder: Option<String>,
     pub(crate) mime_type: Option<String>,
+    pub(crate) attributes: serde_json::Map<String, Value>,
 }
 
 pub(crate) enum V2Line {
-    Entry(WireEntry),
+    Entry(Box<WireEntry>),
     Warning(String),
     /// End-of-stream sentinel; carries the continue token for paged list/search.
-    Done { continue_token: Option<String> },
+    Done { continue_token: Option<String>, columns: Vec<WireColumn> },
     Error(V2Error),
 }
 
@@ -135,6 +140,7 @@ impl V2Process {
             return Err(SourceError::Failed(format!("{}: no command configured", source.name)));
         };
         let mut child = Command::new(crate::paths::expand_tilde(program))
+            .env("PATH", crate::sources::adapter_path())
             .args(own_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -151,7 +157,8 @@ impl V2Process {
         let pending: Arc<PendingMap> = Arc::new(Mutex::new(HashMap::new()));
         let pending_bg = pending.clone();
         let src_name = source.name.clone();
-        std::thread::spawn(move || reader_loop(reader, pending_bg, src_name));
+        let src_id = source.id.clone();
+        std::thread::spawn(move || reader_loop(reader, pending_bg, src_name, src_id));
 
         Ok(Arc::new(V2Process {
             stdin: Mutex::new(writer),
@@ -188,7 +195,7 @@ impl V2Process {
         continue_token: Option<String>,
         on_entry: &mut impl FnMut(WireEntry),
         on_warning: &mut impl FnMut(String),
-    ) -> Result<Option<String>, SourceError> {
+    ) -> Result<(Option<String>, Vec<WireColumn>), SourceError> {
         let rx = self.send(&Cmd {
             id: self.next_id(),
             verb: "list",
@@ -210,7 +217,7 @@ impl V2Process {
         continue_token: Option<String>,
         on_entry: &mut impl FnMut(WireEntry),
         on_warning: &mut impl FnMut(String),
-    ) -> Result<Option<String>, SourceError> {
+    ) -> Result<(Option<String>, Vec<WireColumn>), SourceError> {
         let rx = self.send(&Cmd {
             id: self.next_id(),
             verb: "search",
@@ -283,7 +290,14 @@ impl V2Process {
 
 // ---- Background reader -----------------------------------------------
 
-fn reader_loop(mut reader: BufReader<ChildStdout>, pending: Arc<PendingMap>, src_name: String) {
+/// A line without an `id`: the adapter tells Findest something on its own.
+#[derive(Deserialize)]
+struct NoticeLine {
+    changed: Option<String>,
+    message: Option<String>,
+}
+
+fn reader_loop(mut reader: BufReader<ChildStdout>, pending: Arc<PendingMap>, src_name: String, src_id: String) {
     let mut buf = String::new();
     loop {
         buf.clear();
@@ -291,7 +305,17 @@ fn reader_loop(mut reader: BufReader<ChildStdout>, pending: Arc<PendingMap>, src
             Ok(0) | Err(_) => break, // EOF or read error
             Ok(_) => {}
         }
-        let raw: RawLine = match serde_json::from_str(buf.trim()) {
+        let value: Value = match serde_json::from_str(buf.trim()) {
+            Ok(v) => v,
+            Err(_) => continue, // malformed line: skip
+        };
+        if value.get("id").is_none() {
+            if let Ok(notice) = serde_json::from_value::<NoticeLine>(value) {
+                crate::sources::global().notice(&src_id, notice.changed.as_deref(), notice.message.as_deref());
+            }
+            continue;
+        }
+        let raw: RawLine = match serde_json::from_value(value) {
             Ok(r) => r,
             Err(_) => continue, // malformed line: skip
         };
@@ -326,7 +350,7 @@ fn decode_line(raw: RawLine) -> (bool, V2Line) {
     if let (Some(name), Some(kind), Some(reference)) = (raw.entry_name, raw.kind, raw.reference) {
         return (
             false,
-            V2Line::Entry(WireEntry {
+            V2Line::Entry(Box::new(WireEntry {
                 reference,
                 name,
                 kind,
@@ -336,7 +360,8 @@ fn decode_line(raw: RawLine) -> (bool, V2Line) {
                 has_children: raw.has_children,
                 folder: raw.folder,
                 mime_type: raw.mime_type,
-            }),
+                attributes: raw.attributes,
+            })),
         );
     }
     // Sentinel: done, optionally with a continue token or preview fields.
@@ -348,7 +373,7 @@ fn decode_line(raw: RawLine) -> (bool, V2Line) {
         // preview alternate response
         return (
             true,
-            V2Line::Entry(WireEntry {
+            V2Line::Entry(Box::new(WireEntry {
                 reference: String::new(),
                 name: d,   // dest stored in name for convenience
                 kind: String::new(),
@@ -358,10 +383,11 @@ fn decode_line(raw: RawLine) -> (bool, V2Line) {
                 has_children: None,
                 folder: None,
                 mime_type: Some(mt),
-            }),
+                attributes: Default::default(),
+            })),
         );
     }
-    (true, V2Line::Done { continue_token: raw.continue_token })
+    (true, V2Line::Done { continue_token: raw.continue_token, columns: raw.columns.unwrap_or_default() })
 }
 
 // ---- Receive helpers -------------------------------------------------
@@ -373,12 +399,12 @@ fn drain_stream(
     timeout: Duration,
     on_entry: &mut impl FnMut(WireEntry),
     on_warning: &mut impl FnMut(String),
-) -> Result<Option<String>, SourceError> {
+) -> Result<(Option<String>, Vec<WireColumn>), SourceError> {
     loop {
         match rx.recv_timeout(timeout) {
-            Ok(V2Line::Entry(e)) => on_entry(e),
+            Ok(V2Line::Entry(e)) => on_entry(*e),
             Ok(V2Line::Warning(w)) => on_warning(w),
-            Ok(V2Line::Done { continue_token }) => return Ok(continue_token),
+            Ok(V2Line::Done { continue_token, columns }) => return Ok((continue_token, columns)),
             Ok(V2Line::Error(e)) => return Err(e.into_source_error(source, verb)),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 return Err(SourceError::Failed(format!(
@@ -482,7 +508,7 @@ for cmd in (json.loads(l) for l in sys.stdin):
         let proc = V2Process::spawn(&source).unwrap();
         let mut entries = Vec::new();
         let mut warnings = Vec::new();
-        let cont = proc.list(&source, "/".into(), None, &mut |e| entries.push(e), &mut |w| warnings.push(w)).unwrap();
+        let (cont, _) = proc.list(&source, "/".into(), None, &mut |e| entries.push(e), &mut |w| warnings.push(w)).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].name, "a.txt");
         assert_eq!(entries[1].mime_type.as_deref(), Some("text/plain"));
@@ -513,12 +539,12 @@ for cmd in (json.loads(l) for l in sys.stdin):
         );
         let proc = V2Process::spawn(&source).unwrap();
         let mut entries = Vec::new();
-        let cont = proc.list(&source, "/".into(), None, &mut |e| entries.push(e.name.clone()), &mut |_| {}).unwrap();
+        let (cont, _) = proc.list(&source, "/".into(), None, &mut |e| entries.push(e.name.clone()), &mut |_| {}).unwrap();
         assert_eq!(entries, vec!["p1.txt"]);
         assert_eq!(cont.as_deref(), Some("page2"));
 
         entries.clear();
-        let cont2 = proc.list(&source, "/".into(), Some("page2".into()), &mut |e| entries.push(e.name.clone()), &mut |_| {}).unwrap();
+        let (cont2, _) = proc.list(&source, "/".into(), Some("page2".into()), &mut |e| entries.push(e.name.clone()), &mut |_| {}).unwrap();
         assert_eq!(entries, vec!["p2.txt"]);
         assert!(cont2.is_none());
         proc.exit();

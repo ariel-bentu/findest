@@ -255,11 +255,12 @@ mod tests {
             is_package: false,
             is_symlink: false,
             is_hidden: false,
-            size: 0,
+            size: Some(0),
             modified: None,
             color: None,
             label: None,
             mime_type: None,
+            attributes: Vec::new(),
         };
         assert_eq!(IconKey::for_entry(&entry, home), IconKey::Folder);
         entry.color = Some(TagColor::Purple);

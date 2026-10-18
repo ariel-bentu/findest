@@ -5,7 +5,7 @@ A source shows a hierarchy that isn't on disk, such as cloud resources, a bucket
 Findest doesn't know about any particular system. You provide a small program, an **adapter**, that answers three questions: what's in this folder, what's in this file, and how to sign in. Optionally it answers a fourth: what's in this folder and below that matches a search. Any language works. Two examples in Python, standard library only:
 
 - [`examples/static-source`](examples/static-source) serves a fixed tree in about 120 lines. Copy it to start your own.
-- [`examples/k8s-source`](examples/k8s-source) browses a Kubernetes cluster through `kubectl`. Namespaces, then the kinds that have something in them, then each resource as YAML labeled with its status (`Pod · Running`, `2/3 ready`). It implements `search` across the cluster.
+- [`examples/k8s-source`](examples/k8s-source) browses a Kubernetes cluster through `kubectl`. Namespaces, then the kinds that have something in them, then each resource as YAML with Type and Status columns (`Pod`, `Running`). It implements `search` across the cluster.
 
 ## Configure
 
@@ -48,8 +48,10 @@ $ static-source list /
 {"entries": [
   {"name": "docs", "kind": "folder", "ref": "/docs"},
   {"name": "hello.txt", "kind": "file", "ref": "hello",
-   "label": "Greeting", "size": 28, "modified": "2026-10-01T12:00:00Z"}
-]}
+   "label": "Greeting", "attributes": {"owner": "docs-team"},
+   "size": 28, "modified": "2026-10-01T12:00:00Z"}
+],
+ "columns": [{"key": "owner", "title": "Owner"}]}
 ```
 
 | Field | Required | Meaning |
@@ -57,10 +59,13 @@ $ static-source list /
 | `name` | yes | Shown, and used as a file name in the cache. Unique within the folder; no `/`. Give files an extension (`.yaml`, `.json`, `.md`): it picks the icon, Quick Look's preview and the app that opens it. |
 | `kind` | yes | `"folder"` or `"file"`. |
 | `ref` | yes | For a folder: its path, `/`-separated, which is the `name`s from the root joined (`/docs`). For a file: any string you like; it's passed back to `read` unchanged, so put what you need to fetch it there (an id, or a JSON array). |
-| `label` | no | Shown in the Kind column instead of "YAML file", e.g. `"ManagedService · Ready"`. |
-| `size` | no | Bytes. |
+| `label` | no | Shown in the Kind column instead of "YAML file", e.g. `"Resource Group"`. |
+| `attributes` | no | Your own fields, e.g. `{"type": "TenantData", "status": "Ready"}`. Values are strings (numbers and booleans are shown as text). Shown in the columns you declare, and searchable as `status:Ready`. |
+| `size` | no | Bytes. Left out, the Size column shows `--`. |
 | `modified` | no | RFC 3339 time, e.g. `"2026-10-01T12:00:00Z"`. |
 | `has_children` | no | Folders only. `false` hides the disclosure triangle. Default `true`. |
+
+**Columns.** Next to `entries`, `"columns": [{"key": "status", "title": "Status"}]` shows those attributes as columns after Kind, in that order, while browsing the source. They can be resized and sorted like the others. Send them with every `list` and `search` response; Findest keeps every column a source has declared. Search matches any attribute, declared or not: `status:Ready` finds entries whose `status` is `Ready` (ignoring case; the whole value must match), and `!status:Ready` the rest. Avoid keys that are built-in search filters (`size`, `path`, `ext`, `dm`, `date`, `modified`, `content`, `text`, `file`, `folder`, `dir`, `hidden`, `case`, `nocase`, `regex`): those can't be searched as attributes.
 
 Next to `entries`, a listing can carry `"warnings": ["…"]`, for problems that shouldn't fail the whole folder ("couldn't list pods.metrics.k8s.io"). They're shown in the status bar. Don't hide partial failures: stderr is only shown when the adapter fails.
 
@@ -213,6 +218,19 @@ For `search`, each entry also carries `"folder"` (the folder ref it's in), same 
 ```
 
 For `search`, Findest auto-follows up to 50 continuation pages.
+
+**Attributes and columns** work as in v1: an entry line can carry `"attributes": {…}`, and the sentinel can carry `"columns": [{"key": "status", "title": "Status"}]`.
+
+```jsonl
+{"id":"1","name":"x.yaml","kind":"file","ref":"x","attributes":{"status":"Ready"}}
+{"id":"1","columns":[{"key":"status","title":"Status"}]}
+```
+
+**Notices.** A line without an `id` isn't an answer: the adapter sends it on its own, at any time. `changed` is a folder ref whose contents changed (the root if left out): Findest forgets what it listed there and below, and reloads if it's showing it. `message` is shown in the status bar. Use it when work outlives a request, e.g. answering `list` quickly with a "still building the index" warning, then:
+
+```jsonl
+{"changed":"/","message":"The API catalog is ready"}
+```
 
 #### `read`
 

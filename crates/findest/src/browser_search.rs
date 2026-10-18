@@ -383,6 +383,10 @@ impl Browser {
         }
         if search.running {
             let scanned = search.scanned.load(Ordering::Relaxed);
+            // A source search: its note names the source ("Searching URM canary…").
+            if let Some(note) = search.note.as_ref().filter(|_| !search.everywhere && self.in_source()) {
+                return Some((note.clone(), false));
+            }
             if let Some(progress) = &search.live_progress {
                 let checked = progress.checked.load(Ordering::Relaxed) as u64;
                 let found = progress.found.lock().unwrap().len();
@@ -460,6 +464,7 @@ pub const SYNTAX_EXAMPLES: &[(&str, &str)] = &[
     ("regex:^IMG_\\d{4}", "regular expression on the name"),
     ("case:README", "force case-sensitive (nocase: for insensitive)"),
     ("ext:md content:TODO", "text inside files (add filters to keep it fast)"),
+    ("status:Ready", "in a source: by one of its columns"),
     ("hidden: .zshrc", "include hidden files"),
 ];
 
