@@ -73,6 +73,7 @@ pub struct Config {
     pub appearance: Appearance,
     pub favorites: Vec<Favorite>,
     pub openers: Vec<Opener>,
+    pub sources: Vec<crate::sources::Source>,
     pub search: SearchConfig,
     /// User overrides only; see [`Config::keybindings`] for the merged map.
     #[serde(rename = "keybindings")]
@@ -96,6 +97,7 @@ impl Default for Config {
                 opener("Terminal", "Terminal", "{dir}", OpenerTarget::Any),
                 opener("Preview", "Preview", "{path}", OpenerTarget::Files),
             ],
+            sources: Vec::new(),
             keybinding_overrides: BTreeMap::new(),
             search: SearchConfig::default(),
         }

@@ -13,6 +13,7 @@ use findest_core::locations::{self, Place};
 use findest_core::paths::{contract_tilde, display_name, home_dir};
 use findest_core::recents::Recents;
 use findest_core::session::{ColumnWidths, Session, WindowSession};
+use findest_core::sources::{self, SourceError};
 use findest_core::{launch, ops};
 use futures::StreamExt;
 use gpui::{
@@ -252,6 +253,8 @@ pub struct LoadError {
     pub message: String,
     /// macOS privacy protection (TCC) blocked access, e.g. cloud drives.
     pub not_permitted: bool,
+    /// The source (by id) whose adapter asked to sign in.
+    pub sign_in: Option<String>,
 }
 
 
@@ -335,6 +338,11 @@ pub struct Browser {
     watcher: Option<FsWatcher>,
     pub(crate) type_ahead: TypeAhead,
     pub(crate) last_title: String,
+    /// Source files being fetched for the selection; kept after a failure so
+    /// the same files aren't retried every frame.
+    fetching: Option<(Vec<PathBuf>, Task<()>)>,
+    /// Runs once the selection's source files are fetched (Open, Quick Look…).
+    pub(crate) after_fetch: Option<Command>,
     _tasks: Vec<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -352,6 +360,7 @@ impl Browser {
             Ok(config) => (config, Vec::new()),
             Err(e) => (Config::default(), vec![format!("{e:#}")]),
         };
+        errors.extend(sources::global().set(config.sources.clone()).into_iter().map(|p| format!("Config: {p}")));
         let (theme, theme_errors) = Theme::resolve(&config.appearance, window.appearance());
         errors.extend(theme_errors);
         let keymap = config.keybindings();
@@ -466,6 +475,8 @@ impl Browser {
             watcher,
             type_ahead: TypeAhead::default(),
             last_title: String::new(),
+            fetching: None,
+            after_fetch: None,
             _tasks: tasks,
             _subscriptions: subscriptions,
         };
@@ -512,7 +523,8 @@ impl Browser {
         if config.search != self.config.search {
             crate::search_service::set_config(config.search.clone(), cx);
         }
-        let listing_changed = config.general != self.config.general;
+        let listing_changed = config.general != self.config.general || config.sources != self.config.sources;
+        errors.extend(sources::global().set(config.sources.clone()));
         self.theme = theme;
         self.keymap = keymap;
         self.config = config;
@@ -625,15 +637,39 @@ impl Browser {
         let recents: Vec<PathBuf> = self.recents.items.clone();
         // Tiles show the folder's own items only; expansions are kept for the list.
         let expanded = if self.view == ViewMode::Tiles { HashSet::new() } else { self.expanded.clone() };
+        let label = self.location_label();
         self.loading = true;
         let listing = cx.background_executor().spawn(async move {
             match &location {
-                Location::Dir(dir) => listing::read_tree(dir, &expanded, show_hidden, order),
-                Location::Recents => Ok(recents
-                    .iter()
-                    .filter_map(|p| Entry::from_path(p).ok())
-                    .map(|entry| listing::TreeRow { entry, depth: 0, has_children: false })
-                    .collect()),
+                Location::Dir(dir) if let Some(id) = sources::global().orphan(dir) => Err(LoadError {
+                    message: format!("There's no source \"{id}\" in the config any more"),
+                    not_permitted: false,
+                    sign_in: None,
+                }),
+                Location::Dir(dir) if sources::global().contains(dir) => {
+                    let tree = sources::global().read_tree(dir, &expanded, show_hidden, order);
+                    tree.map(|t| (t.rows, t.warnings)).map_err(|e| match e {
+                        SourceError::NotSignedIn { id, name } => LoadError {
+                            message: format!("Sign in to {name} to see this folder"),
+                            not_permitted: false,
+                            sign_in: Some(id),
+                        },
+                        SourceError::Failed(message) => LoadError { message, not_permitted: false, sign_in: None },
+                    })
+                }
+                Location::Dir(dir) => listing::read_tree(dir, &expanded, show_hidden, order).map(|rows| (rows, Vec::new())).map_err(|e| LoadError {
+                    not_permitted: matches!(e.raw_os_error(), Some(1 /* EPERM */ | 13 /* EACCES */)),
+                    message: format!("Can't open {label}: {e}"),
+                    sign_in: None,
+                }),
+                Location::Recents => Ok((
+                    recents
+                        .iter()
+                        .filter_map(|p| Entry::from_path(p).ok())
+                        .map(|entry| listing::TreeRow { entry, depth: 0, has_children: false })
+                        .collect(),
+                    Vec::new(),
+                )),
             }
         });
         // Replacing the task drops (cancels) any listing still in flight.
@@ -644,11 +680,15 @@ impl Browser {
         cx.notify();
     }
 
-    fn finish_load(&mut self, result: std::io::Result<Vec<listing::TreeRow>>, cx: &mut Context<Self>) {
+    fn finish_load(&mut self, result: Result<(Vec<listing::TreeRow>, Vec<String>), LoadError>, cx: &mut Context<Self>) {
         self.loading = false;
         self.load_error = None;
         match result {
-            Ok(rows) => {
+            Ok((rows, warnings)) => {
+                if let Some(first) = warnings.first() {
+                    let more = warnings.len() - 1;
+                    self.set_error(if more == 0 { first.clone() } else { format!("{first} (and {more} more)") }, cx);
+                }
                 self.entries = Vec::with_capacity(rows.len());
                 self.depths = Vec::with_capacity(rows.len());
                 self.expandable = Vec::with_capacity(rows.len());
@@ -658,14 +698,11 @@ impl Browser {
                     self.expandable.push(row.has_children);
                 }
             }
-            Err(e) => {
+            Err(error) => {
                 self.entries.clear();
                 self.depths.clear();
                 self.expandable.clear();
-                self.load_error = Some(LoadError {
-                    not_permitted: matches!(e.raw_os_error(), Some(1 /* EPERM */ | 13 /* EACCES */)),
-                    message: format!("Can't open {}: {e}", self.location_label()),
-                });
+                self.load_error = Some(error);
             }
         }
         self.update_watches();
@@ -902,6 +939,13 @@ impl Browser {
         if !matches!(command, SelectPrev | SelectNext | ExtendPrev | ExtendNext) {
             self.status = None;
         }
+        if writes_files(&command) && self.in_source() {
+            return self.set_error("Sources are read-only", cx);
+        }
+        if matches!(command, Open | QuickLook | OpenWith(_) | Copy) && !self.fetched(&self.selection(), cx) {
+            self.after_fetch = Some(command);
+            return self.set_info(format!("Fetching {}…", describe(&self.selection())), cx);
+        }
         let tiles = self.view == ViewMode::Tiles;
         // In tiles, ↑/↓ move a whole row and ←/→ one tile.
         let row = if tiles { self.tile_columns.max(1) as isize } else { 1 };
@@ -1096,6 +1140,9 @@ impl Browser {
                 self.reload(cx);
             }
             Refresh => {
+                if let Some(dir) = self.current_dir() {
+                    sources::global().invalidate(&dir);
+                }
                 self.volumes = locations::volumes();
                 self.cloud = locations::cloud_places(&self.home);
                 self.icons.clear_paths();
@@ -1493,6 +1540,12 @@ impl Browser {
 
     fn open_selection(&mut self, cx: &mut Context<Self>) {
         let entries: Vec<Entry> = self.entries.iter().filter(|e| self.selected.contains(&e.path)).cloned().collect();
+        if let [entry] = entries.as_slice()
+            && sources::global().is_more_row(&entry.path)
+            && let Some(dir) = entry.path.parent()
+        {
+            return self.load_more(dir.to_path_buf(), cx);
+        }
         if let [entry] = entries.as_slice()
             && entry.is_dir
         {
@@ -2383,6 +2436,9 @@ impl Browser {
     /// Drops `paths` into `dest`: moves within a volume, copies across volumes
     /// or when ⌥ is held (like Finder).
     pub fn drop_paths(&mut self, paths: Vec<PathBuf>, dest: PathBuf, force_copy: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if sources::global().contains(&dest) {
+            return self.set_error("Sources are read-only", cx);
+        }
         // Dropping onto itself or into the folder it's already in is a no-op.
         let paths: Vec<PathBuf> =
             paths.into_iter().filter(|p| *p != dest && p.parent() != Some(dest.as_path())).collect();
@@ -2508,7 +2564,7 @@ impl Browser {
 
     /// Re-reads free space for the current folder's volume in the background.
     fn refresh_volume(&mut self, cx: &mut Context<Self>) {
-        let Some(dir) = self.current_dir() else {
+        let Some(dir) = self.current_dir().filter(|d| !sources::global().contains(d)) else {
             self.volume = None;
             return;
         };
@@ -2614,7 +2670,9 @@ impl Browser {
     fn update_watches(&mut self) {
         let Some(watcher) = &mut self.watcher else { return };
         let mut dirs = HashSet::new();
-        if let Location::Dir(root) = &self.location {
+        if let Location::Dir(root) = &self.location
+            && !sources::global().contains(root)
+        {
             dirs.insert(root.clone());
             dirs.extend(self.entries.iter().filter(|e| e.is_dir && self.expanded.contains(&e.path)).map(|e| e.path.clone()));
         }
@@ -2675,6 +2733,90 @@ impl Browser {
             self.select_only(parent_ix, cx);
         }
     }
+}
+
+impl Browser {
+    /// True when showing a folder in a source.
+    pub(crate) fn in_source(&self) -> bool {
+        self.current_dir().is_some_and(|d| sources::global().contains(&d))
+    }
+
+    /// True when every source file in `paths` is fetched to its cache path;
+    /// otherwise starts fetching them and redraws when done.
+    pub(crate) fn fetched(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) -> bool {
+        let wanted: Vec<PathBuf> = paths.iter().filter(|p| sources::global().needs_fetch(p)).cloned().collect();
+        if wanted.is_empty() {
+            return true;
+        }
+        if self.fetching.as_ref().is_some_and(|(p, _)| *p == wanted) {
+            return false;
+        }
+        let job = wanted.clone();
+        let task = cx.background_executor().spawn(async move { sources::global().fetch_all(&job) });
+        let watch = cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => this.fetching = None,
+                    Err(e) => {
+                        this.after_fetch = None;
+                        this.set_error(e.to_string(), cx);
+                    }
+                }
+                // The info panel read the file before it arrived.
+                this.info = None;
+                cx.notify();
+            })
+            .ok();
+        });
+        self.fetching = Some((wanted, watch));
+        false
+    }
+
+    /// Lists the next page of a paged source folder ("Load more…").
+    fn load_more(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        self.set_info("Loading more…", cx);
+        let task = cx.background_executor().spawn(async move { sources::global().load_more(&dir) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => this.status = None,
+                    Err(e) => this.set_error(e.to_string(), cx),
+                }
+                this.reload(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Runs the adapter's sign-in, then lists the folder again.
+    pub(crate) fn sign_in(&mut self, id: String, cx: &mut Context<Self>) {
+        self.set_info("Signing in… finish in your browser", cx);
+        let task = cx.background_executor().spawn(async move { sources::global().login(&id) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => this.set_info("Signed in", cx),
+                    Err(e) => this.set_error(e.to_string(), cx),
+                }
+                this.reload(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+}
+
+/// Commands that change files, refused inside a (read-only) source.
+fn writes_files(command: &Command) -> bool {
+    use Command::*;
+    matches!(
+        command,
+        NewFolder | NewFile | Duplicate | Compress | Extract | Trash | TrashConfirm | TrashNow | DeletePermanently | Cut | Paste | MoveHere | Rename
+    )
 }
 
 /// Re-registers all keybindings: text input defaults plus the browser map.
@@ -2790,6 +2932,7 @@ mod tests {
             size: 0,
             modified: None,
             color: None,
+            label: None,
         }
     }
 

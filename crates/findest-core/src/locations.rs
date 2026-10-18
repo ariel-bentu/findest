@@ -87,6 +87,9 @@ pub fn cloud_root(home: &Path, path: &Path) -> Option<Place> {
 /// A named place that `path` lives in (Trash or a cloud drive): breadcrumbs
 /// start there instead of walking through hidden folders.
 fn special_root(home: &Path, path: &Path) -> Option<Place> {
+    if let Some((mount, label)) = crate::sources::global().mount_named(path) {
+        return Some(Place { path: mount, label });
+    }
     let trash = trash(home);
     if path.starts_with(&trash) {
         return Some(Place { path: trash, label: "Trash".into() });

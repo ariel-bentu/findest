@@ -11,3 +11,4 @@ pub mod paths;
 pub mod recents;
 pub mod search;
 pub mod session;
+pub mod sources;

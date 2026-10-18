@@ -38,8 +38,13 @@ impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.load_sidebar_icons(cx);
         self.sync_info(cx);
-        if crate::quick_look::is_open_for(window) {
-            crate::quick_look::follow(self.selection(), cx);
+        let selection = self.selection();
+        let fetched = self.fetched(&selection, cx);
+        if fetched && let Some(command) = self.after_fetch.take() {
+            self.run(command, window, cx);
+        }
+        if fetched && crate::quick_look::is_open_for(window) {
+            crate::quick_look::follow(selection, cx);
         }
         if std::mem::take(&mut self.refocus_list) {
             window.focus(&self.focus);
@@ -668,6 +673,17 @@ impl Browser {
                 favorite: None,
             });
         }
+        let mounts = findest_core::sources::global();
+        for source in mounts.sources() {
+            places.push(SidebarPlace {
+                section: "Sources",
+                id: format!("source-{}", source.id),
+                symbol: "server.rack",
+                label: source.name.clone(),
+                path: mounts.root_path(&source),
+                favorite: None,
+            });
+        }
         let mut push_location = |id: String, symbol, label: String, path: PathBuf| {
             places.push(SidebarPlace { section: "Locations", id, symbol, label, path, favorite: None });
         };
@@ -949,6 +965,21 @@ impl Browser {
                         }))
                         .child("Open Privacy Settings"),
                 );
+        } else if let Some(id) = error.sign_in.clone() {
+            panel = panel.child(div().font_weight(FontWeight::SEMIBOLD).child(error.message.clone())).child(
+                div()
+                    .id("source-sign-in")
+                    .mt_2()
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .bg(theme.accent)
+                    .text_color(theme.selection_text)
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(move |this, _, _, cx| this.sign_in(id.clone(), cx)))
+                    .child("Sign In"),
+            );
         } else {
             panel = panel.child(div().text_color(theme.danger).child(error.message.clone()));
         }

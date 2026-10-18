@@ -27,6 +27,8 @@ pub struct Entry {
     pub modified: Option<SystemTime>,
     /// A folder's color label (read for folders only).
     pub color: Option<TagColor>,
+    /// Replaces the kind, e.g. for items in a source ("ManagedService · Ready").
+    pub label: Option<String>,
 }
 
 /// Finder's color labels (the color tags), numbered as macOS stores them.
@@ -116,6 +118,7 @@ impl Entry {
             modified: meta.modified().ok(),
             path: path.to_path_buf(),
             name,
+            label: None,
         })
     }
 
@@ -139,6 +142,9 @@ impl Entry {
 
     /// Human readable kind, e.g. "Folder", "PNG file".
     pub fn kind(&self) -> String {
+        if let Some(label) = &self.label {
+            return label.clone();
+        }
         if self.is_dir {
             return "Folder".into();
         }

@@ -56,6 +56,7 @@ Changes apply as soon as you save the file. Open it with **⌘,**.
 - `[appearance]`: `dark` / `light` / `system` theme, font, row height, per-color overrides
 - `[[favorites]]`: sidebar folders (you can also add them from the app with ⌃⌘T)
 - `[[openers]]`: "Open in …" targets, e.g. VS Code and Terminal, with `{path}` / `{dir}` placeholders
+- `[[sources]]`: hierarchies listed by a program you provide (an adapter), shown in the sidebar. See [docs/sources.md](docs/sources.md)
 - `[keybindings]`: any shortcut → command, layered on the defaults (`"none"` disables one)
 
 ## Default shortcuts

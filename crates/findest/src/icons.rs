@@ -258,6 +258,7 @@ mod tests {
             size: 0,
             modified: None,
             color: None,
+            label: None,
         };
         assert_eq!(IconKey::for_entry(&entry, home), IconKey::Folder);
         entry.color = Some(TagColor::Purple);

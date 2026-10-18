@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""A Findest source adapter serving a fixed tree. See docs/sources.md.
+
+Copy this file to start your own adapter: keep main() and the output format,
+and replace TREE, FILES and the three cmd_* functions with calls to your
+system (a CLI, an HTTP API...).
+
+Try it by hand:
+    ./static-source list /
+    ./static-source list /big
+    ./static-source list /big 2
+    ./static-source read hello /tmp/hello.txt
+"""
+import json
+import sys
+
+NOT_SIGNED_IN = 77  # exit code: Findest shows "Sign In", which runs `login`
+
+# Folder ref -> its entries. Folder refs are "/"-separated paths.
+TREE = {
+    "/": [
+        {"name": "docs", "kind": "folder", "ref": "/docs"},
+        {"name": "big", "kind": "folder", "ref": "/big"},
+        {
+            "name": "hello.txt",
+            "kind": "file",
+            "ref": "hello",  # file refs are yours: whatever `read` needs
+            "label": "Greeting",  # optional: shown instead of the kind
+            "size": 28,  # optional
+            "modified": "2026-10-01T12:00:00Z",  # optional, RFC 3339
+        },
+    ],
+    "/docs": [
+        {"name": "readme.txt", "kind": "file", "ref": "readme"},
+        {"name": "notes.md", "kind": "file", "ref": "notes"},
+    ],
+    "/big": [{"name": f"item-{i}.txt", "kind": "file", "ref": f"item-{i}"} for i in range(1, 4)],
+}
+
+# File ref -> content.
+FILES = {
+    "hello": "Hello from a static source.\n",
+    "readme": "Read me.\n",
+    "notes": "# Notes\n\n- one\n- two\n",
+    **{f"item-{i}": f"Item {i}\n" for i in range(1, 4)},
+}
+
+PAGE = 2  # /big has 3 entries, so it comes in two pages
+
+
+def cmd_list(folder, token=None):
+    """Prints the folder's entries; "continue" says there's another page."""
+    if folder not in TREE:
+        fail(f"no folder {folder}")
+    start = int(token or 0)
+    entries = TREE[folder]
+    if folder != "/big":
+        return {"entries": entries}
+    page = {"entries": entries[start : start + PAGE]}
+    if start + PAGE < len(entries):
+        page["continue"] = str(start + PAGE)  # passed back as the 2nd argument
+    return page
+
+
+def cmd_read(ref, dest):
+    """Writes the file's content to dest (Findest picks the path)."""
+    if ref not in FILES:
+        fail(f"no file {ref}")
+    with open(dest, "w") as f:
+        f.write(FILES[ref])
+
+
+def cmd_login():
+    """Signs in, e.g. by opening a browser. Nothing to do for a static tree."""
+
+
+def fail(message):
+    print(message, file=sys.stderr)  # the last stderr line is shown to the user
+    sys.exit(1)
+
+
+def main():
+    verb, args = (sys.argv[1], sys.argv[2:]) if len(sys.argv) > 1 else ("", [])
+    try:
+        if verb == "list":
+            print(json.dumps(cmd_list(*args)))
+        elif verb == "read":
+            cmd_read(*args)
+        elif verb == "login":
+            cmd_login()
+        else:
+            fail(f"unknown verb {verb!r}")
+    except Exception as e:  # never exit 0 after a failure
+        fail(str(e))
+
+
+if __name__ == "__main__":
+    main()
