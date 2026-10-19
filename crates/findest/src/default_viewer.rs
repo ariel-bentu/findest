@@ -184,3 +184,15 @@ mod imp {
 
 #[cfg(not(target_os = "macos"))]
 pub use imp::*;
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_viewer_stubs() {
+        assert!(!is_default());
+        assert!(use_findest().is_err());
+        assert!(use_finder().is_err());
+    }
+}

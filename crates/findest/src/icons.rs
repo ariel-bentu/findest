@@ -236,7 +236,6 @@ mod tests {
         bytes.starts_with(b"\x89PNG")
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn tinting_keeps_shading_and_transparency() {
         let red = TagColor::Red.rgb();
@@ -324,5 +323,13 @@ mod tests {
     fn uses_text_fallbacks_without_native_icons() {
         assert!(load_icon(&IconKey::Folder).is_none());
         assert!(load_icon(&IconKey::Symbol { name: "folder", rgb: 0 }).is_none());
+    }
+
+    #[test]
+    fn thumbnail_icon_loads() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/AppIcon.png");
+        let key = IconKey::Thumbnail { path, modified: None, pixels: 128 };
+        let bytes = load_icon(&key).unwrap();
+        assert!(bytes.starts_with(b"\x89PNG"));
     }
 }
