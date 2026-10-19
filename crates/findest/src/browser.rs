@@ -1227,6 +1227,13 @@ impl Browser {
             }
             AddFavorite => self.add_favorite(cx),
             ShowRecents => self.navigate(Location::Recents, true, cx),
+            RevealInFindest => {
+                let selection = self.selection();
+                let Some(parent) = selection.first().and_then(|p| p.parent()).map(Path::to_path_buf) else { return };
+                let paths = selection.into_iter().filter(|p| p.parent() == Some(parent.as_path())).collect();
+                self.navigate(Location::Dir(parent), true, cx);
+                self.pending_select = Some(PendingSelect { paths, name_new: false });
+            }
             RevealInFinder => {
                 for path in self.selection_or_current() {
                     self.report(crate::default_viewer::reveal_in_finder(&path), cx);
@@ -2148,7 +2155,11 @@ impl Browser {
             if single && all_dirs {
                 entries.push(self.item("Add to Favorites", AddFavorite, "add_favorite"));
             }
-            entries.push(self.item("Reveal in Finder", RevealInFinder, "reveal_in_finder"));
+            // Items shown outside their folder: search results, Recents, expanded subfolders.
+            let current = self.current_dir();
+            if selection.iter().any(|e| e.path.parent() != current.as_deref()) {
+                entries.push(self.item("Reveal in Findest", RevealInFindest, "reveal_in_findest"));
+            }
             if all_dirs {
                 // Ring the color they share, if any.
                 let colors: HashSet<Option<listing::TagColor>> = selection.iter().map(|e| e.color).collect();

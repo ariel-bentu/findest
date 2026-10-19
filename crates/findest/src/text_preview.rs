@@ -9,7 +9,7 @@ use findest_core::highlight::{self, Highlighted};
 use gpui::{
     Context, FontWeight, HighlightStyle, InteractiveElement, IntoElement, ObjectFit, ParentElement, Rgba,
     StatefulInteractiveElement, Styled, StyledImage, StyledText, Task, UniformListScrollHandle, Window, div, img,
-    prelude::FluentBuilder, px, uniform_list,
+    ListHorizontalSizingBehavior, prelude::FluentBuilder, px, uniform_list,
 };
 
 use crate::browser::Browser;
@@ -144,6 +144,8 @@ impl Browser {
                 let text = text.clone();
                 let digits = text.lines.len().max(1).to_string().len();
                 let gutter_width = digits as f32 * font_size * 0.62 + 16.;
+                // Long lines scroll sideways; the longest one sets the width.
+                let widest = text.lines.iter().enumerate().max_by_key(|(_, l)| l.text.chars().count()).map(|(ix, _)| ix);
                 uniform_list(
                     "text-preview-lines",
                     text.lines.len(),
@@ -183,6 +185,8 @@ impl Browser {
                     }),
                 )
                 .track_scroll(preview.scroll.clone())
+                .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+                .with_width_from_item(widest)
                 .size_full()
                 .py_2()
                 .into_any_element()

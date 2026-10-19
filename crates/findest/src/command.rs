@@ -93,6 +93,8 @@ pub enum Command {
     AddFavorite,
     ShowRecents,
     RevealInFinder,
+    /// Opens the selection's folder with it selected (from search results, Recents, a subfolder).
+    RevealInFindest,
     OpenConfig,
     NewWindow,
     CloseWindow,
@@ -161,6 +163,7 @@ impl FromStr for Command {
             "add_favorite" => AddFavorite,
             "show_recents" => ShowRecents,
             "reveal_in_finder" => RevealInFinder,
+            "reveal_in_findest" => RevealInFindest,
             "open_config" => OpenConfig,
             "new_window" => NewWindow,
             "close_window" => CloseWindow,
