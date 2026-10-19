@@ -38,7 +38,13 @@ jobs:
           ASSET="findest-${TAG#v}-macos.tar.gz"
           tar -czf "$ASSET" -C dist findest
           shasum -a 256 "$ASSET" | tee "$ASSET.sha256"
+          # A Homebrew bottle, so brew pours it instead of doing source-build (Xcode) checks.
+          mkdir -p "bottle/findest/${TAG#v}/bin" && cp dist/findest "bottle/findest/${TAG#v}/bin/"
+          BOTTLE="findest-${TAG#v}.all.bottle.tar.gz"
+          tar -czf "$BOTTLE" -C bottle findest
+          shasum -a 256 "$BOTTLE" | tee "$BOTTLE.sha256"
           echo "ASSET=$ASSET" >> "$GITHUB_ENV"
-      - run: gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --clobber
+          echo "BOTTLE=$BOTTLE" >> "$GITHUB_ENV"
+      - run: gh release upload "$TAG" "$ASSET" "$ASSET.sha256" "$BOTTLE" "$BOTTLE.sha256" --clobber
         env:
           GH_TOKEN: ${{ github.token }}
