@@ -1,0 +1,44 @@
+name: Release binary
+
+# Builds a universal macOS binary and attaches it to the GitHub release,
+# so the Homebrew formula can install it without compiling.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build (e.g. v0.8.0)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - run: |
+          cargo build --release --locked -p findest --target aarch64-apple-darwin
+          cargo build --release --locked -p findest --target x86_64-apple-darwin
+      - name: Package
+        run: |
+          mkdir dist
+          lipo -create -output dist/findest \
+            target/aarch64-apple-darwin/release/findest \
+            target/x86_64-apple-darwin/release/findest
+          lipo -info dist/findest
+          ASSET="findest-${TAG#v}-macos.tar.gz"
+          tar -czf "$ASSET" -C dist findest
+          shasum -a 256 "$ASSET" | tee "$ASSET.sha256"
+          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
+      - run: gh release upload "$TAG" "$ASSET" "$ASSET.sha256" --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
