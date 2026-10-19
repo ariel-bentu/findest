@@ -11,14 +11,14 @@ use syntect::parsing::{SyntaxReference, SyntaxSet};
 /// Extensions previewed by Findest instead of Quick Look, which shows
 /// nothing for them out of the box.
 pub const OWN_PREVIEW_EXTENSIONS: &[&str] =
-    &["yaml", "yml", "toml", "ini", "cfg", "conf", "env", "properties", "tf", "hcl", "gradle", "proto"];
+    &["yaml", "yml", "toml", "ini", "cfg", "conf", "env", "properties", "tf", "hcl", "gradle", "proto", "json", "ndjson", "jsonl"];
 
 /// Files larger than this are cut, and the preview says so.
 const MAX_BYTES: usize = 4 * 1024 * 1024;
 const MAX_LINES: usize = 20_000;
 /// Longer lines (e.g. base64 blobs) are cut: highlighting them is slow and they
 /// can't be read anyway.
-const MAX_LINE_CHARS: usize = 2_000;
+const MAX_LINE_CHARS: usize = 20_000;
 
 static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 static THEMES: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
@@ -74,6 +74,7 @@ pub fn highlight(text: &str, path: &Path, dark: bool) -> Highlighted {
     let mut notes = Vec::new();
     let mut cut_lines = 0;
     let mut failed = None;
+    let json = syntax.name == "JSON";
     for raw in syntect::util::LinesWithEndings::from(text) {
         if lines.len() == MAX_LINES {
             notes.push(format!("Showing the first {} lines", group_thousands(MAX_LINES)));
@@ -88,7 +89,10 @@ pub fn highlight(text: &str, path: &Path, dark: bool) -> Highlighted {
             cut_lines += 1;
         }
         let text = raw.trim_end_matches(['\n', '\r']).to_string();
-        let spans = match highlighter.highlight_line(raw, &SYNTAXES) {
+        // JSON skips syntect: its own coloring is cheaper on long lines.
+        let result = if json { Ok(Vec::new()) } else { highlighter.highlight_line(raw, &SYNTAXES) };
+        let spans = match result {
+            Ok(_) if json => json_spans(&text, dark),
             Ok(regions) => spans(&regions, text.len()),
             Err(e) => {
                 // Keep the text; only the colors are lost from here on.
@@ -114,6 +118,52 @@ pub fn highlight(text: &str, path: &Path, dark: bool) -> Highlighted {
     Highlighted { lines, syntax: syntax.name.clone(), notes }
 }
 
+/// JSON colored like a terminal JSON viewer: keys green, string values blue,
+/// braces gold. Works line by line, so it suits NDJSON and long lines.
+fn json_spans(line: &str, dark: bool) -> Vec<Span> {
+    let [key, string, number, literal, brace]: [[u8; 3]; 5] = if dark {
+        [[152, 205, 120], [138, 196, 247], [181, 206, 168], [86, 156, 214], [229, 192, 80]]
+    } else {
+        [[34, 134, 58], [3, 102, 214], [9, 134, 88], [0, 0, 255], [175, 125, 0]]
+    };
+    let bytes = line.as_bytes();
+    let mut spans = Vec::new();
+    let mut push = |range: std::ops::Range<usize>, rgb| spans.push(Span { range, rgb, bold: false });
+    let mut i = 0;
+    while i < bytes.len() {
+        let start = i;
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i = (i + 1).min(bytes.len());
+                let is_key = bytes[i..].iter().find(|b| !b.is_ascii_whitespace()) == Some(&b':');
+                push(start..i, if is_key { key } else { string });
+            }
+            b'{' | b'}' | b'[' | b']' => {
+                i += 1;
+                push(start..i, brace);
+            }
+            b'-' | b'0'..=b'9' => {
+                while i < bytes.len() && matches!(bytes[i], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9') {
+                    i += 1;
+                }
+                push(start..i, number);
+            }
+            b't' | b'f' | b'n' if ["true", "false", "null"].iter().any(|w| line[i..].starts_with(w)) => {
+                while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                push(start..i, literal);
+            }
+            _ => i += 1,
+        }
+    }
+    spans
+}
+
 fn syntax_for(path: &Path, text: &str) -> &'static SyntaxReference {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let by_ext = |ext: &str| SYNTAXES.find_syntax_by_extension(ext);
@@ -122,6 +172,7 @@ fn syntax_for(path: &Path, text: &str) -> &'static SyntaxReference {
         "toml" | "cfg" | "conf" | "env" | "properties" | "tf" | "hcl" => by_ext("ini").or_else(|| by_ext("sh")),
         "gradle" => by_ext("groovy").or_else(|| by_ext("java")),
         "proto" => by_ext("c"),
+        "ndjson" | "jsonl" => by_ext("json"),
         _ => None,
     };
     by_ext(ext)
@@ -194,7 +245,7 @@ mod tests {
         let long = format!("key: {}\n", "x".repeat(MAX_LINE_CHARS + 10));
         let h = highlight(&long, Path::new("a.yaml"), true);
         assert!(h.lines[0].text.ends_with('…'));
-        assert_eq!(h.notes, vec!["1 line longer than 2,000 characters is cut"]);
+        assert_eq!(h.notes, vec!["1 line longer than 20,000 characters is cut"]);
 
         let many = "a: 1\n".repeat(MAX_LINES + 5);
         let h = highlight(&many, Path::new("a.yaml"), true);
@@ -207,6 +258,23 @@ mod tests {
         assert_ne!(highlight("[a]\nb = 1\n", Path::new("x.toml"), true).syntax, "Plain Text");
         assert_eq!(highlight("just text\n", Path::new("x.unknownext"), true).syntax, "Plain Text");
         assert!(has_own_preview(Path::new("/a/B.YAML")));
-        assert!(!has_own_preview(Path::new("/a/b.json")), "Quick Look shows JSON itself");
+        assert!(has_own_preview(Path::new("/a/log.ndjson")));
+        assert_eq!(highlight("{\"a\": 1}\n{\"a\": 2}\n", Path::new("x.ndjson"), true).syntax, "JSON");
+    }
+
+    #[test]
+    fn colors_json_keys_values_and_braces() {
+        let line = r#"{"id":"a\"b","n":-1.5e3,"ok":true,"x":[null]}"#;
+        let spans = json_spans(line, true);
+        let text = |s: &Span| &line[s.range.clone()];
+        let colored: Vec<(&str, [u8; 3])> = spans.iter().map(|s| (text(s), s.rgb)).collect();
+        let key = colored[1].1;
+        assert_eq!(colored[0].0, "{");
+        assert_eq!(colored[1].0, "\"id\"");
+        assert_eq!(colored[2].0, r#""a\"b""#, "escaped quote stays inside the string");
+        assert_ne!(colored[2].1, key, "values aren't colored as keys");
+        assert!(colored.iter().any(|(t, _)| *t == "-1.5e3"));
+        assert!(colored.iter().any(|(t, _)| *t == "true"));
+        assert!(colored.iter().any(|(t, _)| *t == "null"));
     }
 }

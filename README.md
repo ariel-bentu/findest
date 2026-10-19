@@ -5,7 +5,7 @@ A fast, keyboard-friendly file browser for macOS, written in Rust on [GPUI](http
 ## Features
 
 - **List or tiles:** a tree list that expands folders in place, with resizable columns, or a tiles grid with image thumbnails and adjustable size (⌘1 / ⌘2, ⌘= / ⌘-).
-- **Quick Look:** Space previews the selection in the macOS Quick Look panel (images, PDFs, text, JSON, video and anything else macOS can preview). YAML, TOML and other config files open in Findest's own syntax-highlighted viewer. ↑/↓ move through files while it's open.
+- **Quick Look:** Space previews the selection in the macOS Quick Look panel (images, PDFs, text, video and anything else macOS can preview). JSON, NDJSON, YAML, TOML and other config files open in Findest's own syntax-highlighted viewer. ↑/↓ move through files while it's open.
 - **Info panel (⌘I):** a preview plus size (folder totals computed in the background), dates, dimensions, location and permissions.
 - **Fast search (⌘F):** an in-memory index of file names with a query language (wildcards, `ext:`, `size:`, `dm:`, `content:`, regex…), or **Live** search straight from the disk. See [Search](#search-f).
 - **Type to jump:** start typing a name to select it; repeat a letter to cycle through matches.
