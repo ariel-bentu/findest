@@ -19,18 +19,37 @@ pub fn run_opener(opener: &Opener, target: &Path) -> Result<()> {
         .with_context(|| format!("running \"{}\"", opener.name))
 }
 
-/// Opens `path` with its default application, like double-clicking in Finder.
+/// Opens `path` with its default application, like double-clicking in a file manager.
 pub fn open_default(path: &Path) -> Result<()> {
-    spawn_detached(&["open".to_string(), path.display().to_string()])
+    spawn_detached(&[opener().to_string(), path.display().to_string()])
 }
 
-/// Opens a URL (including `x-apple.systempreferences:` links) with its handler.
+/// Opens a URL with its handler.
 pub fn open_url(url: &str) -> Result<()> {
-    spawn_detached(&["open".to_string(), url.to_string()])
+    spawn_detached(&[opener().to_string(), url.to_string()])
 }
 
 pub fn reveal_in_finder(path: &Path) -> Result<()> {
-    spawn_detached(&["open".to_string(), "-R".to_string(), path.display().to_string()])
+    #[cfg(target_os = "macos")]
+    {
+        spawn_detached(&["open".to_string(), "-R".to_string(), path.display().to_string()])
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // xdg-open has no "select this file" mode, so open the containing folder.
+        let target = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
+        spawn_detached(&[opener().to_string(), target.display().to_string()])
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn opener() -> &'static str {
+    "open"
+}
+
+#[cfg(not(target_os = "macos"))]
+fn opener() -> &'static str {
+    "xdg-open"
 }
 
 fn spawn_detached(argv: &[String]) -> Result<()> {
@@ -65,5 +84,13 @@ mod tests {
         // For a folder, {dir} is the folder itself.
         let out = expand_command(&tpl, tmp.path());
         assert_eq!(out[3], format!("--cwd={}", tmp.path().display()));
+    }
+
+    #[test]
+    fn default_opener_binary() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(opener(), "open");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(opener(), "xdg-open");
     }
 }

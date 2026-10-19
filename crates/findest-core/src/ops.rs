@@ -357,7 +357,7 @@ pub fn compress(paths: &[PathBuf]) -> Result<PathBuf> {
     }
     let stem = if paths.len() == 1 { crate::paths::display_name(first) } else { "Archive".to_string() };
     let target = unique_path(dir, &stem, ".zip");
-    let status = if paths.len() == 1 {
+    let status = if cfg!(target_os = "macos") && paths.len() == 1 {
         // ditto is what Finder uses: keeps permissions, symlinks and Mac metadata.
         std::process::Command::new("/usr/bin/ditto")
             .args(["-c", "-k", "--sequesterRsrc", "--keepParent"])
@@ -366,7 +366,7 @@ pub fn compress(paths: &[PathBuf]) -> Result<PathBuf> {
             .status()
     } else {
         let names: Vec<_> = paths.iter().filter_map(|p| p.file_name()).collect();
-        std::process::Command::new("/usr/bin/zip")
+        std::process::Command::new("zip")
             .args(["-r", "-y", "-q"])
             .arg(&target)
             .args(names)
@@ -394,12 +394,22 @@ pub fn extract(zip: &Path) -> Result<PathBuf> {
     let staging = unique_path(dir, ".findest-extract", "");
     fs::create_dir(&staging).with_context(|| format!("creating {}", staging.display()))?;
     let result = (|| {
-        let status = std::process::Command::new("/usr/bin/ditto")
-            .args(["-x", "-k"])
-            .arg(zip)
-            .arg(&staging)
-            .status()
-            .context("running ditto")?;
+        let status = if cfg!(target_os = "macos") {
+            std::process::Command::new("/usr/bin/ditto")
+                .args(["-x", "-k"])
+                .arg(zip)
+                .arg(&staging)
+                .status()
+                .context("running ditto")?
+        } else {
+            std::process::Command::new("unzip")
+                .args(["-q"])
+                .arg(zip)
+                .arg("-d")
+                .arg(&staging)
+                .status()
+                .context("running unzip")?
+        };
         if !status.success() {
             bail!("Couldn't extract \"{}\" ({status})", crate::paths::display_name(zip));
         }
@@ -540,9 +550,17 @@ fn copy_file(src: &Path, dst: &Path, meta: &fs::Metadata, chunked: bool, resume:
 /// Permissions, extended attributes (tags, Finder info) and dates, like
 /// Finder keeps them. The date goes last: it marks the file complete.
 fn copy_metadata(src: &Path, dst: &Path, meta: &fs::Metadata) {
-    use std::os::unix::ffi::OsStrExt;
-    if let (Ok(from), Ok(to)) = (std::ffi::CString::new(src.as_os_str().as_bytes()), std::ffi::CString::new(dst.as_os_str().as_bytes())) {
-        unsafe { libc::copyfile(from.as_ptr(), to.as_ptr(), std::ptr::null_mut(), libc::COPYFILE_METADATA) };
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        if let (Ok(from), Ok(to)) = (std::ffi::CString::new(src.as_os_str().as_bytes()), std::ffi::CString::new(dst.as_os_str().as_bytes())) {
+            unsafe { libc::copyfile(from.as_ptr(), to.as_ptr(), std::ptr::null_mut(), libc::COPYFILE_METADATA) };
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = src;
+        let _ = fs::set_permissions(dst, meta.permissions());
     }
     if let (Ok(file), Ok(modified)) = (fs::OpenOptions::new().write(true).open(dst), meta.modified()) {
         let _ = file.set_modified(modified);

@@ -1,29 +1,54 @@
 # Findest
 
-A fast, keyboard-friendly file browser for macOS, written in Rust on [GPUI](https://gpui.rs) (Zed's GPU-accelerated UI framework).
+A fast, keyboard-friendly file browser for macOS and Linux, written in Rust on [GPUI](https://gpui.rs) (Zed's GPU-accelerated UI framework).
 
 ## Features
 
-- **List or tiles:** a tree list that expands folders in place, with resizable columns, or a tiles grid with image thumbnails and adjustable size (⌘1 / ⌘2, ⌘= / ⌘-).
-- **Quick Look:** Space previews the selection in the macOS Quick Look panel (images, PDFs, text, JSON, video and anything else macOS can preview). YAML, TOML and other config files open in Findest's own syntax-highlighted viewer. ↑/↓ move through files while it's open.
-- **Info panel (⌘I):** a preview plus size (folder totals computed in the background), dates, dimensions, location and permissions.
-- **Fast search (⌘F):** an in-memory index of file names with a query language (wildcards, `ext:`, `size:`, `dm:`, `content:`, regex…), or **Live** search straight from the disk. See [Search](#search-f).
+- **List or tiles:** a tree list that expands folders in place, with resizable columns, or a tiles grid with image thumbnails and adjustable size (⌘1 / ⌘2, ⌘= / ⌘- on macOS; Ctrl+1 / Ctrl+2, Ctrl+= / Ctrl+- on Linux).
+- **Quick Look:** Space previews the selection in the macOS Quick Look panel (images, PDFs, text, JSON, video and anything else macOS can preview). On Linux, or for text/code/config files (YAML, TOML, etc.), Findest opens its own syntax-highlighted viewer. ↑/↓ move through files while it's open.
+- **Info panel (⌘I / Ctrl+I):** a preview plus size (folder totals computed in the background), dates, dimensions, location and permissions.
+- **Fast search (⌘F / Ctrl+F):** an in-memory index of file names with a query language (wildcards, `ext:`, `size:`, `dm:`, `content:`, regex…), or **Live** search straight from the disk. See [Search](#search-f--ctrlf).
 - **Type to jump:** start typing a name to select it; repeat a letter to cycle through matches.
 - **Copy, cut and paste** with progress, speed and time left. Copies can be paused, cancelled, and retried where they stopped. Name clashes ask first (Replace, Keep Both, Skip). Paste goes into the selected folder, or next to the selected file.
-- **Undo (⌘Z)** for the last paste, drop, duplicate, compress or uncompress.
-- **Drag and drop** between Findest windows, Finder and other apps, with auto-scroll near the list's edges.
+- **Undo (⌘Z / Ctrl+Z)** for the last paste, drop, duplicate, compress or uncompress.
+- **Drag and drop** between Findest windows, Finder/file managers and other apps (on macOS), with auto-scroll near the list's edges.
 - **Compress and uncompress** zip files; opening a .zip unpacks it next to it, in Findest.
-- **Folder colors:** right-click folders to pick a color. They're Finder's color tags, so Finder and Spotlight see them too.
-- **Sidebar:** Recents, Favorites, iCloud Drive and other cloud drives, Macintosh HD, external volumes and the Trash.
+- **Folder colors (macOS):** right-click folders to pick a color. They're Finder's color tags, so Finder and Spotlight see them too.
+- **Sidebar:** Recents, Favorites, cloud drives (iCloud Drive on macOS; Dropbox, OneDrive, Google Drive on Linux), system disk (Macintosh HD / Filesystem), external volumes and the Trash.
 - **Toolbar and path bar:** back/forward with history, the current folder's name (click for the folders above), a Go to bar that accepts pasted paths and completes them with Tab, a ⋯ menu of folder actions, and a clickable path bar at the bottom.
-- **Multiple windows (⌘N)**, each restored at launch with its folder, expanded folders, view and column widths.
+- **Multiple windows (⌘N / Ctrl+N)**, each restored at launch with its folder, expanded folders, view and column widths.
 - **New folders and files start unnamed:** type a name, or press Esc to remove the item.
 - **Open in…:** VS Code, Terminal or any app you configure, from the menu or a shortcut.
-- **Default file viewer:** "Show in Finder" in other apps can open Findest instead (see [Install](#install)).
+- **Default file viewer (macOS):** "Show in Finder" in other apps can open Findest instead (see [Install](#install)).
 - **Sources:** browse things that aren't on disk (cloud resources, buckets, wikis) as folders, through a small program you plug in, e.g. a Kubernetes cluster. See [Sources](docs/sources.md).
 - **Configurable:** theme, colors, fonts, favorites and every shortcut, in a commented TOML file that applies as soon as you save it.
 
 ## Install
+
+### Linux
+
+Install build prerequisites:
+
+```sh
+# Debian / Ubuntu
+sudo apt install build-essential libxkbcommon-dev libxkbcommon-x11-0 libvulkan1 libfontconfig1
+
+# Fedora
+sudo dnf install gcc libxkbcommon-devel libxkbcommon-x11 vulkan-loader fontconfig-devel
+
+# Arch Linux
+sudo pacman -S base-devel libxkbcommon libxkbcommon-x11 vulkan-icd-loader fontconfig
+```
+
+Build and install from a clone:
+
+```sh
+cargo install --path crates/findest
+findest            # opens your home folder
+findest ~/code     # open a folder (like `code .`)
+```
+
+### macOS
 
 With Homebrew. This builds from source on your Mac, so there are no Gatekeeper warnings and no Apple developer account is needed:
 
@@ -69,17 +94,19 @@ GPUI is built with `runtime_shaders`, so you don't need Xcode's separately downl
 ## Configuration
 
 On first launch Findest writes a commented config to `~/.config/findest/config.toml` (override it with `$FINDEST_CONFIG`).
-Changes apply as soon as you save the file. Open it with **⌘,**.
+Changes apply as soon as you save the file. Open it with **⌘,** (macOS) or **Ctrl+,** (Linux).
 
 - `[general]`: start folder, session restore, info panel, default view and tile size, hidden files, sort order, Trash confirmation, recents size
 - `[appearance]`: `dark` / `light` / `system` theme, font, row height, per-color overrides
-- `[[favorites]]`: sidebar folders (you can also add them from the app with ⌃⌘T)
+- `[[favorites]]`: sidebar folders (you can also add them from the app with ⌃⌘T / Ctrl+Shift+T)
 - `[[openers]]`: "Open in …" targets, e.g. VS Code and Terminal, with `{path}` / `{dir}` placeholders
 - `[[sources]]`: hierarchies listed by a program you provide (an adapter), shown in the sidebar. See [docs/sources.md](docs/sources.md)
 - `[search]`: indexing on/off, which folders are indexed and excluded, result limit, content-search size limit
 - `[keybindings]`: any shortcut → command, layered on the defaults (`"none"` disables one)
 
 ## Default shortcuts
+
+> **Linux modifier keys:** On Linux, shortcuts use standard PC keys: **Ctrl** replaces **⌘**, **Alt** replaces **⌥**, **Enter** replaces **↩**, and **Backspace** replaces **⌫** (e.g. `Ctrl+F` for Find, `Ctrl+C` / `Ctrl+V` for Copy / Paste, `Ctrl+Shift+N` for New Folder, `Ctrl+Shift+T` for Add to Favorites, `Ctrl+Backspace` for Trash).
 
 | Keys | Command | Keys | Command |
 |---|---|---|---|
@@ -99,14 +126,14 @@ Changes apply as soon as you save the file. Open it with **⌘,**.
 | ⇧⌘. | toggle hidden files | ⌘R | refresh |
 | ⌃⌘T | add to Favorites | ⇧⌘R | Recents |
 | ⌘E | open in VS Code | ⌥⌘T | open in Terminal |
-| ⌥⌘R | reveal in Finder | ⌘, | open config |
+| ⌥⌘R | reveal in Finder / file manager | ⌘, | open config |
 | ⌘N / ⌘W | new / close window | | |
 
 In tiles, the arrow keys move through the grid in both directions. In Quick Look, Esc or clicking elsewhere closes the preview. Typing letters jumps to the first matching name.
 
-## Search (⌘F)
+## Search (⌘F / Ctrl+F)
 
-Findest keeps an in-memory index of file names, a design inspired by FSearch and Everything: flat name-sorted arrays searched on all cores. It indexes about 1.2M files in ~7 s, and most queries finish in a few milliseconds. The index is saved to disk, so search works right away at launch, and macOS's file-change history (FSEvents) catches it up on whatever changed while Findest wasn't running, without a rescan. After that, file changes are applied as they happen by re-reading only the folders involved, and a full rescan runs once a day at background priority, so indexing stays out of the way of everything else. While a scan runs the status bar shows its progress; click it to pause indexing (for an hour, or until you resume) or turn it off for good (`indexing = false` under `[search]`). You choose what's indexed in `[search]` in the config.
+Findest keeps an in-memory index of file names, a design inspired by FSearch and Everything: flat name-sorted arrays searched on all cores. It indexes about 1.2M files in ~7 s, and most queries finish in a few milliseconds. The index is saved to disk, so search works right away at launch. On macOS, file-change history (FSEvents) catches it up on whatever changed while Findest wasn't running without a rescan, and applies file changes as they happen. On Linux, current directories are watched live via inotify (`notify`), and a full rescan runs once a day at background priority (or on demand), so indexing stays out of the way of everything else. While a scan runs the status bar shows its progress; click it to pause indexing (for an hour, or until you resume) or turn it off for good (`indexing = false` under `[search]`). You choose what's indexed in `[search]` in the config.
 
 | Query | Matches |
 |---|---|

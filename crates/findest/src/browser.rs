@@ -2148,7 +2148,8 @@ impl Browser {
             if single && all_dirs {
                 entries.push(self.item("Add to Favorites", AddFavorite, "add_favorite"));
             }
-            entries.push(self.item("Reveal in Finder", RevealInFinder, "reveal_in_finder"));
+            let reveal_label = if cfg!(target_os = "macos") { "Reveal in Finder" } else { "Open Containing Folder" };
+            entries.push(self.item(reveal_label, RevealInFinder, "reveal_in_finder"));
             if all_dirs {
                 // Ring the color they share, if any.
                 let colors: HashSet<Option<listing::TagColor>> = selection.iter().map(|e| e.color).collect();
@@ -2217,7 +2218,8 @@ impl Browser {
         if !self.config.favorites.iter().any(|f| f.resolved_path() == path) {
             entries.push(item("Add to Favorites", MenuAction::AddFavoritePath(path.clone())));
         }
-        entries.push(item("Reveal in Finder", MenuAction::RevealPath(path)));
+        let reveal_label = if cfg!(target_os = "macos") { "Reveal in Finder" } else { "Open Containing Folder" };
+        entries.push(item(reveal_label, MenuAction::RevealPath(path)));
         self.menu = Some(ContextMenu { position, entries });
         cx.notify();
     }
@@ -2236,8 +2238,9 @@ impl Browser {
             })
             .collect();
         let is_trash = path == self.trash_dir();
+        let reveal_label = if cfg!(target_os = "macos") { "Reveal in Finder" } else { "Open Containing Folder" };
         entries.push(MenuEntry::Item {
-            label: "Reveal in Finder".into(),
+            label: reveal_label.into(),
             detail: None,
             action: MenuAction::RevealPath(path),
             danger: false,
@@ -3068,7 +3071,7 @@ pub fn is_image_path(path: &Path) -> bool {
 
 /// Formats gpui can decode itself; the info panel shows the file directly.
 pub fn gpui_decodes(path: &Path) -> bool {
-    has_extension(path, &["png", "jpg", "jpeg", "gif", "webp", "bmp"])
+    has_extension(path, &["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"])
 }
 
 fn is_pdf(path: &Path) -> bool {

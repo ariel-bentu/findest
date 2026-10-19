@@ -77,19 +77,20 @@ Folder refs come from the path, so `list` is also called for folders the user ty
 
 ```sh
 $ static-source read hello /Users/me/Library/Caches/findest/sources/example/hello.txt
+# On Linux: ~/.cache/findest/sources/example/hello.txt
 ```
 
 Write the file's content to `dest` (the folder already exists) and exit 0. Print nothing on stdout. Findest calls `read` when a file is selected, opened, previewed or copied, and again if the copy is older than 30 seconds.
 
 ### `login`
 
-Sign in and exit 0 once it worked; exit non-zero with a message on stderr if it didn't. While it runs, Findest shows "Signing in…" with **Cancel**. Cancel, like a timeout, stops the adapter and everything it started (Findest runs it in its own process group), so a browser-based login tool you launched is stopped too. There's no terminal: open a browser, or a dialog (`osascript`), for anything interactive. Keep tokens wherever your tools keep them; Findest never sees them. If your system needs no sign-in, exit 0 and never return 77.
+Sign in and exit 0 once it worked; exit non-zero with a message on stderr if it didn't. While it runs, Findest shows "Signing in…" with **Cancel**. Cancel, like a timeout, stops the adapter and everything it started (Findest runs it in its own process group), so a browser-based login tool you launched is stopped too. There's no terminal: open a browser (via `xdg-open` on Linux or `open` on macOS), or a dialog (`osascript` on macOS, `zenity`/`kdialog` on Linux), for anything interactive. Keep tokens wherever your tools keep them; Findest never sees them. If your system needs no sign-in, exit 0 and never return 77.
 
 Refreshing expired tokens is also the adapter's job. Do it inside `list` and `read`, and return 77 only when the user really has to sign in again.
 
 ### `search`
 
-⌘F inside a source searches that folder and everything below it. Findest parses the query, then runs:
+⌘F (macOS) or Ctrl+F (Linux) inside a source searches that folder and everything below it. Findest parses the query, then runs:
 
 ```sh
 $ static-source search / '{"query": "item ext:txt", "names": ["item"], "extensions": ["txt"], "kind": null}'

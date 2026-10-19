@@ -15,6 +15,7 @@
 
 use std::fs;
 use std::io::{self, BufWriter, Write};
+#[cfg(target_os = "macos")]
 use std::os::macos::fs::MetadataExt;
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{HashMap, HashSet};
@@ -35,8 +36,22 @@ pub const FLAG_PACKAGE: u8 = 8;
 /// Hidden itself or inside a hidden folder (e.g. anything under `~/.config`).
 pub const FLAG_HIDDEN_TREE: u8 = 16;
 
+#[cfg(target_os = "macos")]
 const UF_HIDDEN: u32 = 0x8000;
 pub(crate) const PACKAGE_EXTENSIONS: &[&str] = &["app", "bundle", "framework", "plugin", "kext", "xcarchive", "photoslibrary"];
+
+/// Whether the platform marks this entry as hidden independently of its name.
+fn has_hidden_flag(meta: &fs::Metadata) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        meta.st_flags() & UF_HIDDEN != 0
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = meta;
+        false
+    }
+}
 
 /// Paths and folder names left out of the index.
 #[derive(Clone, Debug, Default)]
@@ -642,7 +657,7 @@ fn read_entries(dir: &Path, excludes: &Excludes, cancel: &AtomicBool) -> (Vec<No
             Some(m) => (0, m.len()),
             None => (0, 0),
         };
-        if name.starts_with('.') || meta.as_ref().is_some_and(|m| m.st_flags() & UF_HIDDEN != 0) {
+        if name.starts_with('.') || meta.as_ref().is_some_and(has_hidden_flag) {
             flags |= FLAG_HIDDEN;
         }
         if flags & FLAG_DIR != 0 {
@@ -687,8 +702,11 @@ pub fn in_background<R: Send>(f: impl FnOnce() -> R + Send) -> R {
         rayon::ThreadPoolBuilder::new()
             .num_threads(4)
             .thread_name(|i| format!("findest-index-{i}"))
-            .start_handler(|_| unsafe {
-                libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_BACKGROUND, 0);
+            .start_handler(|_| {
+                #[cfg(target_os = "macos")]
+                unsafe {
+                    libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_BACKGROUND, 0);
+                }
             })
             .build()
             .ok()

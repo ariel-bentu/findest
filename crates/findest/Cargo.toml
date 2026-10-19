@@ -20,9 +20,15 @@ image.workspace = true
 chrono.workspace = true
 unicode-segmentation.workspace = true
 futures.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true
 objc2-foundation.workspace = true
 objc2-app-kit.workspace = true
 objc2-uniform-type-identifiers.workspace = true
 objc2-quick-look-ui.workspace = true
 raw-window-handle.workspace = true
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+image.workspace = true
+libc.workspace = true

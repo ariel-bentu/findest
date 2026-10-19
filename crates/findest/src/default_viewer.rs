@@ -9,11 +9,13 @@
 //! If Findest is deleted without switching back, reveals fall back to Finder
 //! (macOS ignores a viewer that isn't installed), but the setting lingers.
 
-use std::ffi::{CStr, c_char, c_void};
+#[cfg(target_os = "macos")]
+mod mac {
+    use std::ffi::{CStr, c_char, c_void};
 
-use anyhow::{Result, bail};
+    use anyhow::{Result, bail};
 
-use crate::install::BUNDLE_ID;
+    use crate::install::BUNDLE_ID;
 
 const FILE_VIEWER_KEY: &str = "NSFileViewer";
 
@@ -151,5 +153,46 @@ mod tests {
         let copy = unsafe { CFStringCreateWithBytes(std::ptr::null(), "x".as_ptr(), 1, UTF8, 0) };
         assert_eq!(unsafe { CfString::take(copy) }.as_deref(), Some("x"));
         drop(s);
+    }
+}
+}
+
+#[cfg(target_os = "macos")]
+pub use mac::*;
+
+#[cfg(not(target_os = "macos"))]
+mod imp {
+    use anyhow::{Result, bail};
+    use std::path::Path;
+
+    pub fn is_default() -> bool {
+        false
+    }
+
+    pub fn use_findest() -> Result<()> {
+        bail!("Setting default file viewer is only supported on macOS");
+    }
+
+    pub fn use_finder() -> Result<()> {
+        bail!("Setting default file viewer is only supported on macOS");
+    }
+
+    pub fn reveal_in_finder(path: &Path) -> Result<()> {
+        findest_core::launch::reveal_in_finder(path)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub use imp::*;
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_viewer_stubs() {
+        assert!(!is_default());
+        assert!(use_findest().is_err());
+        assert!(use_finder().is_err());
     }
 }
