@@ -100,6 +100,7 @@ fn menus() -> Vec<Menu> {
                 item("Smaller Tiles", "zoom_out"),
                 MenuItem::separator(),
                 item("Quick Look", "quick_look"),
+                item("Reset Layout", "reset_layout"),
                 item("Show/Hide Info Panel", "toggle_info"),
                 item("Show/Hide Hidden Files", "toggle_hidden"),
                 item("Refresh", "refresh"),
@@ -167,6 +168,8 @@ fn initial_windows(start: Option<PathBuf>) -> Vec<BrowserInit> {
                 view: w.view,
                 tile_size: w.tile_size,
                 columns: w.columns,
+                sidebar_width: w.sidebar_width,
+                info_panel_width: w.info_panel_width,
             })
             .collect()
     } else {

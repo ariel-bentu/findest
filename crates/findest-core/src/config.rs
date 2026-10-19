@@ -210,6 +210,14 @@ pub struct Appearance {
     pub row_height: f32,
     pub font_family: String,
     pub colors: BTreeMap<String, String>,
+    /// Minimum width of the left sidebar in points (default 120).
+    pub sidebar_min_width: f32,
+    /// Maximum width of the left sidebar in points (default 400).
+    pub sidebar_max_width: f32,
+    /// Minimum width of the right info panel in points (default 180).
+    pub info_panel_min_width: f32,
+    /// Maximum width of the right info panel in points (default 500).
+    pub info_panel_max_width: f32,
 }
 
 impl Default for Appearance {
@@ -220,6 +228,10 @@ impl Default for Appearance {
             row_height: 26.0,
             font_family: String::new(),
             colors: BTreeMap::new(),
+            sidebar_min_width: 120.0,
+            sidebar_max_width: 400.0,
+            info_panel_min_width: 180.0,
+            info_panel_max_width: 500.0,
         }
     }
 }

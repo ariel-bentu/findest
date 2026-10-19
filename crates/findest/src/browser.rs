@@ -38,6 +38,8 @@ pub struct BrowserInit {
     pub view: Option<ViewMode>,
     pub tile_size: Option<f32>,
     pub columns: Option<ColumnWidths>,
+    pub sidebar_width: Option<f32>,
+    pub info_panel_width: Option<f32>,
 }
 
 /// Paste's destination given the single selected item (if exactly one),
@@ -67,6 +69,16 @@ pub struct ColumnDrag {
     start_x: Pixels,
     start_width: f32,
 }
+
+/// Dragging a sidebar panel edge to resize it.
+pub struct PanelDrag {
+    pub(crate) start_x: Pixels,
+    pub(crate) start_width: f32,
+}
+
+/// Default and clamping constants for sidebar panel widths (in points).
+pub const DEFAULT_SIDEBAR_WIDTH: f32 = 200.0;
+pub const DEFAULT_INFO_PANEL_WIDTH: f32 = 270.0;
 
 /// Tile size range (points), and the step for ⌘= / ⌘-.
 pub const MIN_TILE: f32 = 32.0;
@@ -307,6 +319,14 @@ pub struct Browser {
     notices_seen: u64,
     /// A list column's edge is being dragged.
     pub(crate) column_drag: Option<ColumnDrag>,
+    /// Left sidebar width in points (user-resizable).
+    pub(crate) sidebar_width: f32,
+    /// Right info panel width in points (user-resizable).
+    pub(crate) info_panel_width: f32,
+    /// Left sidebar edge is being dragged.
+    pub(crate) sidebar_drag: Option<PanelDrag>,
+    /// Right info panel edge is being dragged.
+    pub(crate) info_panel_drag: Option<PanelDrag>,
     /// Tiles per row, as last laid out; arrow keys move by this much vertically.
     pub(crate) tile_columns: usize,
     /// The tile size slider is being dragged.
@@ -427,6 +447,10 @@ impl Browser {
         let restore_info_panel = init.info_panel;
         let view = init.view.unwrap_or(config.general.view);
         let tile_size = init.tile_size.unwrap_or(config.general.tile_size).clamp(MIN_TILE, MAX_TILE);
+        let sidebar_width = init.sidebar_width.unwrap_or(DEFAULT_SIDEBAR_WIDTH)
+            .clamp(config.appearance.sidebar_min_width, config.appearance.sidebar_max_width);
+        let info_panel_width = init.info_panel_width.unwrap_or(DEFAULT_INFO_PANEL_WIDTH)
+            .clamp(config.appearance.info_panel_min_width, config.appearance.info_panel_max_width);
         let start = init.start.unwrap_or_else(|| config.start_path());
 
         let me = cx.weak_entity();
@@ -476,6 +500,10 @@ impl Browser {
             source_columns: Vec::new(),
             notices_seen: sources::global().notices_since(u64::MAX).1,
             column_drag: None,
+            sidebar_width,
+            info_panel_width,
+            sidebar_drag: None,
+            info_panel_drag: None,
             tile_columns: 1,
             tile_slider_drag: false,
             loading: false,
@@ -661,6 +689,8 @@ impl Browser {
             view: Some(self.view),
             tile_size: Some(self.tile_size),
             columns: Some(self.columns.clone()),
+            sidebar_width: Some(self.sidebar_width),
+            info_panel_width: Some(self.info_panel_width),
         }
     }
 
@@ -1207,6 +1237,12 @@ impl Browser {
                 });
             }
             CloseWindow => window.remove_window(),
+            ResetLayout => {
+                self.sidebar_width = DEFAULT_SIDEBAR_WIDTH;
+                self.info_panel_width = DEFAULT_INFO_PANEL_WIDTH;
+                self.save_session(cx);
+                cx.notify();
+            }
             ToggleInfo => {
                 self.config.general.info_panel = !self.config.general.info_panel;
                 self.save_session(cx);
@@ -2490,6 +2526,41 @@ impl Browser {
         };
         self.set_column_width(column, width, cx);
         self.save_session(cx);
+    }
+
+    pub fn start_sidebar_drag(&mut self, x: Pixels) {
+        self.sidebar_drag = Some(PanelDrag { start_x: x, start_width: self.sidebar_width });
+    }
+
+    pub fn drag_sidebar(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let Some(drag) = &self.sidebar_drag else { return };
+        let (min, max) = (self.config.appearance.sidebar_min_width, self.config.appearance.sidebar_max_width);
+        self.sidebar_width = (drag.start_width + f32::from(x - drag.start_x)).clamp(min, max);
+        cx.notify();
+    }
+
+    pub fn end_sidebar_drag(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_drag.take().is_some() {
+            self.save_session(cx);
+        }
+    }
+
+    pub fn start_info_panel_drag(&mut self, x: Pixels) {
+        self.info_panel_drag = Some(PanelDrag { start_x: x, start_width: self.info_panel_width });
+    }
+
+    pub fn drag_info_panel(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let Some(drag) = &self.info_panel_drag else { return };
+        let (min, max) = (self.config.appearance.info_panel_min_width, self.config.appearance.info_panel_max_width);
+        // Dragging left increases the panel width (the handle is on the left edge of the panel).
+        self.info_panel_width = (drag.start_width - f32::from(x - drag.start_x)).clamp(min, max);
+        cx.notify();
+    }
+
+    pub fn end_info_panel_drag(&mut self, cx: &mut Context<Self>) {
+        if self.info_panel_drag.take().is_some() {
+            self.save_session(cx);
+        }
     }
 
     /// The picture for tile `ix`: the image itself for image files (once its

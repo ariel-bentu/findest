@@ -96,6 +96,8 @@ pub enum Command {
     OpenConfig,
     NewWindow,
     CloseWindow,
+    /// Reset sidebar and info panel widths to their defaults.
+    ResetLayout,
     OpenWith(String),
 }
 
@@ -164,6 +166,7 @@ impl FromStr for Command {
             "open_config" => OpenConfig,
             "new_window" => NewWindow,
             "close_window" => CloseWindow,
+            "reset_layout" => ResetLayout,
             other => return Err(format!("unknown command \"{other}\"")),
         })
     }

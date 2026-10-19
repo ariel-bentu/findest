@@ -20,11 +20,9 @@ use crate::browser::{
 };
 use crate::command::BROWSER_CONTEXT;
 
-const SIDEBAR_WIDTH: f32 = 200.0;
-const INFO_PANEL_WIDTH: f32 = 270.0;
+const TOP_BAR_HEIGHT: f32 = 44.0;
 /// Images up to this size are previewed in the info panel.
 const MAX_PREVIEW_BYTES: u64 = 64 * 1024 * 1024;
-const TOP_BAR_HEIGHT: f32 = 44.0;
 /// Where the Name column starts in a row: list padding, row padding,
 /// disclosure triangle and icon (the header starts its Name label there too).
 const NAME_START: f32 = 4.0 + 8.0 + TREE_GUTTER + 22.0;
@@ -70,10 +68,10 @@ impl Render for Browser {
             self.start_name_new(window, cx);
         }
         if self.view == ViewMode::Tiles {
-            // The list's width is what the sidebar and info panel leave (both fixed).
-            let mut width = window.viewport_size().width - px(SIDEBAR_WIDTH + 1. + 8.);
+            // The list's width is what the sidebar and info panel leave (both resizable).
+            let mut width = window.viewport_size().width - px(self.sidebar_width + 1. + 8.);
             if self.config.general.info_panel {
-                width -= px(INFO_PANEL_WIDTH + 1.);
+                width -= px(self.info_panel_width + 1.);
             }
             self.tile_columns = ((width / px(self.tile_cell_width())).floor() as usize).max(1);
         }
@@ -763,17 +761,67 @@ impl Browser {
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = &self.theme;
+        let sidebar_width = self.sidebar_width;
+        let dragging = self.sidebar_drag.is_some();
+        let this = cx.entity().downgrade();
+        let this2 = this.clone();
         div()
-            .flex()
-            .flex_col()
-            .w(px(SIDEBAR_WIDTH))
+            .relative()
             .flex_none()
             .h_full()
-            .bg(theme.sidebar)
-            .border_r_1()
-            .border_color(theme.border)
-            .child(self.render_places(cx))
-            .children(self.render_sources_teaser(cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w(px(sidebar_width))
+                    .flex_none()
+                    .h_full()
+                    .bg(theme.sidebar)
+                    .border_r_1()
+                    .border_color(theme.border)
+                    .child(self.render_places(cx))
+                    .children(self.render_sources_teaser(cx)),
+            )
+            .child(
+                div()
+                    .id("sidebar-resize-handle")
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(sidebar_width - COLUMN_HANDLE / 2.))
+                    .w(px(COLUMN_HANDLE))
+                    .flex()
+                    .justify_center()
+                    .cursor(CursorStyle::ResizeLeftRight)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.start_sidebar_drag(e.position.x);
+                        }),
+                    )
+                    .child(div().w(px(1.)).my_1().bg(theme.border).when(dragging, |d| d.bg(theme.text_muted))),
+            )
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |_, (), window, _| {
+                        let moved = this.clone();
+                        window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Bubble && e.pressed_button == Some(MouseButton::Left) {
+                                moved.update(cx, |b, cx| b.drag_sidebar(e.position.x, cx)).ok();
+                            }
+                        });
+                        window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Bubble {
+                                this2.update(cx, |b, cx| b.end_sidebar_drag(cx)).ok();
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
     }
 
     /// At the bottom of the sidebar while no sources are configured: a pointer
@@ -1484,13 +1532,57 @@ impl Browser {
         if !self.config.general.info_panel {
             return None;
         }
+        let dragging = self.info_panel_drag.is_some();
+        let theme = &self.theme;
+        let this = cx.entity().downgrade();
+        let this2 = this.clone();
         Some(
             div()
                 .relative()
                 .flex_none()
                 .h_full()
                 .child(self.render_info_contents()?)
-                .child(self.info_close_button(cx)),
+                .child(self.info_close_button(cx))
+                .child(
+                    div()
+                        .id("info-panel-resize-handle")
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(-COLUMN_HANDLE / 2.))
+                        .w(px(COLUMN_HANDLE))
+                        .flex()
+                        .justify_center()
+                        .cursor(CursorStyle::ResizeLeftRight)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.start_info_panel_drag(e.position.x);
+                            }),
+                        )
+                        .child(div().w(px(1.)).my_1().bg(theme.border).when(dragging, |d| d.bg(theme.text_muted))),
+                )
+                .child(
+                    canvas(
+                        |_, _, _| (),
+                        move |_, (), window, _| {
+                            let moved = this.clone();
+                            window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+                                if phase == DispatchPhase::Bubble && e.pressed_button == Some(MouseButton::Left) {
+                                    moved.update(cx, |b, cx| b.drag_info_panel(e.position.x, cx)).ok();
+                                }
+                            });
+                            window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                                if phase == DispatchPhase::Bubble {
+                                    this2.update(cx, |b, cx| b.end_info_panel_drag(cx)).ok();
+                                }
+                            });
+                        },
+                    )
+                    .absolute()
+                    .size_full(),
+                ),
         )
     }
 
@@ -1498,7 +1590,7 @@ impl Browser {
         let theme = &self.theme;
         let panel = div()
             .id("info-panel")
-            .w(px(INFO_PANEL_WIDTH))
+            .w(px(self.info_panel_width))
             .flex_none()
             .h_full()
             .overflow_y_scroll()
