@@ -11,7 +11,7 @@ use findest_core::paths::contract_tilde;
 use findest_core::config::ViewMode;
 use gpui::{
     Animation, AnimationExt, AnyElement, Bounds, Context, DispatchPhase, ElementId, ExternalPaths, FontWeight, Hsla, Image, MouseButton, MouseDownEvent,
-    CursorStyle, ListHorizontalSizingBehavior, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Point, SharedString, Window, anchored, canvas, deferred, div, img,
+    CursorStyle, ListHorizontalSizingBehavior, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Point, SharedString, TextRun, Window, anchored, canvas, deferred, div, font, img,
     prelude::*, px, uniform_list,
 };
 
@@ -23,6 +23,9 @@ use crate::command::BROWSER_CONTEXT;
 const TOP_BAR_HEIGHT: f32 = 44.0;
 /// Images up to this size are previewed in the info panel.
 const MAX_PREVIEW_BYTES: u64 = 64 * 1024 * 1024;
+/// Horizontal space consumed by the sidebar item's margins (mx_2 * 2), padding (px_2 * 2),
+/// icon width, and gap between icon and label — all at the default 16px rem.
+const SIDEBAR_ITEM_LABEL_OVERHEAD: f32 = 8. + 8. + 8. + 8. + 18. + 8.;
 /// Where the Name column starts in a row: list padding, row padding,
 /// disclosure triangle and icon (the header starts its Name label there too).
 const NAME_START: f32 = 4.0 + 8.0 + TREE_GUTTER + 22.0;
@@ -97,7 +100,7 @@ impl Render for Browser {
             .text_color(theme.text)
             .text_size(px(theme.font_size))
             // The sidebar runs full height; toolbar and status bar belong to the file pane.
-            .child(self.render_sidebar(cx))
+            .child(self.render_sidebar(window, cx))
             .child(
                 div()
                     .flex()
@@ -759,7 +762,7 @@ impl Browser {
         }
     }
 
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = &self.theme;
         let sidebar_width = self.sidebar_width;
         let dragging = self.sidebar_drag.is_some();
@@ -779,7 +782,7 @@ impl Browser {
                     .bg(theme.sidebar)
                     .border_r_1()
                     .border_color(theme.border)
-                    .child(self.render_places(cx))
+                    .child(self.render_places(window, cx))
                     .children(self.render_sources_teaser(cx)),
             )
             .child(
@@ -862,7 +865,7 @@ impl Browser {
         )
     }
 
-    fn render_places(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_places(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut list = div().id("sidebar").flex().flex_col().flex_1().min_h_0().overflow_y_scroll().py_2();
 
         list = list.child(self.sidebar_item(
@@ -873,6 +876,7 @@ impl Browser {
             cx.listener(|this, _: &MouseDownEvent, _, cx| this.navigate(Location::Recents, true, cx)),
             None,
             None,
+            window,
             cx,
         ));
 
@@ -894,6 +898,7 @@ impl Browser {
                 }),
                 Some((path, place.favorite)),
                 place.signed_out.map(|id| self.render_sign_in_badge(id, cx)),
+                window,
                 cx,
             ));
         }
@@ -921,9 +926,30 @@ impl Browser {
         on_click: impl Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
         menu_target: Option<(PathBuf, Option<usize>)>,
         badge: Option<AnyElement>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = &self.theme;
+        let label_id = SharedString::from(format!("{id}-label"));
+
+        // Measure the label's natural text width to determine if it will be truncated.
+        let font_family = if theme.font_family.as_ref().is_some_and(|f| !f.is_empty()) {
+            SharedString::from(theme.font_family.as_ref().unwrap().clone())
+        } else {
+            ".SystemUIFont".into()
+        };
+        let text_run = TextRun {
+            len: label.len(),
+            font: font(font_family),
+            color: Hsla::default(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let shaped = window.text_system().shape_line(label.clone(), px(theme.font_size), &[text_run], None);
+        let available_width = px(self.sidebar_width - SIDEBAR_ITEM_LABEL_OVERHEAD);
+        let is_truncated = shaped.width > available_width;
+
         div()
             .id(id)
             .mx_2()
@@ -955,7 +981,15 @@ impl Browser {
                     },
                 ),
             )
-            .child(div().flex_1().min_w_0().truncate().child(label))
+            .child(
+                div()
+                    .id(label_id)
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .when(is_truncated, |d| d.tooltip(tooltip(label.clone())))
+                    .child(label),
+            )
             .children(badge)
     }
 
