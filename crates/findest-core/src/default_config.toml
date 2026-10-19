@@ -21,6 +21,8 @@ sort_ascending = true
 confirm_trash = false
 # How many recently opened files to remember.
 max_recents = 50
+# Show the Recents item at the top of the sidebar.
+show_recents = true
 
 [appearance]
 # dark | light | system
@@ -55,6 +57,13 @@ path = "~/Downloads"
 
 [[favorites]]
 path = "/Applications"
+
+# Sidebar "Locations" section. Set any to false to hide it.
+# If all are false the "Locations" header is hidden too.
+[locations]
+macintosh_hd = true
+volumes = true   # all mounted external drives
+trash = true
 
 # "Open with" targets. Placeholders in `command`:
 #   {path} - the selected item (or the current folder if nothing is selected)

@@ -720,11 +720,18 @@ impl Browser {
         let mut push_location = |id: String, symbol, label: String, path: PathBuf| {
             places.push(SidebarPlace { section: "Locations", id, symbol, label, path, favorite: None, signed_out: None });
         };
-        push_location("loc-root".into(), "internaldrive", "Macintosh HD".into(), PathBuf::from("/"));
-        for (ix, v) in self.volumes.iter().enumerate() {
-            push_location(format!("loc-{ix}"), "externaldrive", v.label.clone(), v.path.clone());
+        let locs = &self.config.locations;
+        if locs.macintosh_hd {
+            push_location("loc-root".into(), "internaldrive", "Macintosh HD".into(), PathBuf::from("/"));
         }
-        push_location("loc-trash".into(), "trash", "Trash".into(), self.trash_dir());
+        if locs.volumes {
+            for (ix, v) in self.volumes.iter().enumerate() {
+                push_location(format!("loc-{ix}"), "externaldrive", v.label.clone(), v.path.clone());
+            }
+        }
+        if locs.trash {
+            push_location("loc-trash".into(), "trash", "Trash".into(), self.trash_dir());
+        }
         places
     }
 
@@ -868,17 +875,19 @@ impl Browser {
     fn render_places(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut list = div().id("sidebar").flex().flex_col().flex_1().min_h_0().overflow_y_scroll().py_2();
 
-        list = list.child(self.sidebar_item(
-            "recents".into(),
-            "clock",
-            "Recents".into(),
-            self.location == Location::Recents,
-            cx.listener(|this, _: &MouseDownEvent, _, cx| this.navigate(Location::Recents, true, cx)),
-            None,
-            None,
-            window,
-            cx,
-        ));
+        if self.config.general.show_recents {
+            list = list.child(self.sidebar_item(
+                "recents".into(),
+                "clock",
+                "Recents".into(),
+                self.location == Location::Recents,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| this.navigate(Location::Recents, true, cx)),
+                None,
+                None,
+                window,
+                cx,
+            ));
+        }
 
         let mut section = "";
         for place in self.sidebar_places() {
