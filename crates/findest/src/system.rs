@@ -183,4 +183,12 @@ mod tests {
         assert!(total > 0 && available <= total);
         assert!(volume_capacity(Path::new("/no/such/place")).is_none_or(|(a, t)| a <= t));
     }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn linux_color_stubs() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(findest_core::listing::read_color(tmp.path()), None);
+        assert!(set_color(tmp.path(), Some(findest_core::listing::TagColor::Red)).is_ok());
+    }
 }

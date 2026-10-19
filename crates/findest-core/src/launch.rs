@@ -85,4 +85,12 @@ mod tests {
         let out = expand_command(&tpl, tmp.path());
         assert_eq!(out[3], format!("--cwd={}", tmp.path().display()));
     }
+
+    #[test]
+    fn default_opener_binary() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(opener(), "open");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(opener(), "xdg-open");
+    }
 }

@@ -212,4 +212,25 @@ mod tests {
         let plain: Vec<String> = breadcrumbs(home, Path::new("/Users/me/code")).into_iter().map(|p| p.label).collect();
         assert_eq!(plain, vec![root_label(), "Users", "me", "code"]);
     }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn finds_linux_cloud_places() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        fs::create_dir_all(home.join("Dropbox")).unwrap();
+        fs::create_dir_all(home.join("OneDrive")).unwrap();
+        fs::create_dir_all(home.join("Google Drive")).unwrap();
+
+        let labels: Vec<String> = cloud_places(home).into_iter().map(|p| p.label).collect();
+        assert_eq!(labels, vec!["OneDrive", "Dropbox", "Google Drive"]);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn linux_trash() {
+        let home = tempfile::tempdir().unwrap();
+        let t = trash(home.path());
+        assert!(t.ends_with("Trash/files"));
+    }
 }
