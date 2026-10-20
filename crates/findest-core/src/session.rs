@@ -21,6 +21,8 @@ pub struct WindowSession {
     pub view: Option<ViewMode>,
     pub tile_size: Option<f32>,
     pub columns: Option<ColumnWidths>,
+    pub sidebar_width: Option<f32>,
+    pub info_panel_width: Option<f32>,
 }
 
 /// List view column widths in points. The list scrolls sideways when they

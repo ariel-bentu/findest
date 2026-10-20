@@ -21,6 +21,8 @@ sort_ascending = true
 confirm_trash = false
 # How many recently opened files to remember.
 max_recents = 50
+# Show the Recents item at the top of the sidebar.
+show_recents = true
 
 [appearance]
 # dark | light | system
@@ -32,6 +34,11 @@ font_family = ""
 # Override any theme color with a hex value, e.g. accent = "#ff8800".
 # Keys: background, sidebar, surface, border, text, text_muted, accent,
 #       selection, selection_text, hover, danger
+# Sidebar and info panel width limits in points (drag the divider to resize).
+# sidebar_min_width = 120
+# sidebar_max_width = 400
+# info_panel_min_width = 180
+# info_panel_max_width = 500
 [appearance.colors]
 
 # Sidebar favorites, in order. Add or remove them from the app too
@@ -50,6 +57,13 @@ path = "~/Downloads"
 
 [[favorites]]
 path = "/Applications"
+
+# Sidebar "Locations" section. Set any to false to hide it.
+# If all are false the "Locations" header is hidden too.
+[locations]
+macintosh_hd = true
+volumes = true   # all mounted external drives
+trash = true
 
 # "Open with" targets. Placeholders in `command`:
 #   {path} - the selected item (or the current folder if nothing is selected)
