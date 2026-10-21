@@ -413,7 +413,8 @@ impl Index {
                 continue; // replaced while re-reading its parent
             }
             let path = self.path(dir);
-            let (mut nodes, subdirs) = read_entries(&path, excludes, &no_cancel);
+            // Unreadable (e.g. no permission from this process): keep what's indexed.
+            let Some((mut nodes, subdirs)) = try_read_entries(&path, excludes, &no_cancel) else { continue };
             let mut indexed: HashMap<&str, u32> =
                 children.get(&dir).into_iter().flatten().map(|&id| (self.name(id), id)).collect();
             let mut is_new = vec![true; nodes.len()];
@@ -472,12 +473,21 @@ impl Index {
 
     // ---- Persistence ----------------------------------------------------
 
-    const MAGIC: &'static [u8; 8] = b"FNDIDX01";
+    const MAGIC: &'static [u8; 8] = b"FNDIDX02";
+    /// Before `updated_at` was saved.
+    const MAGIC_V1: &'static [u8; 8] = b"FNDIDX01";
 
-    /// Saves the full scan. Changes applied since aren't saved: they are
-    /// lost on quit anyway, so launch always rescans.
+    /// Saves the index, changes since the full scan included (merged into
+    /// it, so ids differ once loaded). `built_at` is kept, so the daily full
+    /// scan stays due.
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        let b = &*self.base;
+        let compacted;
+        let b = if self.changed_count() == 0 {
+            &*self.base
+        } else {
+            compacted = self.compacted();
+            &compacted
+        };
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
         }
@@ -485,7 +495,8 @@ impl Index {
         let mut w = BufWriter::new(fs::File::create(&tmp)?);
         w.write_all(Self::MAGIC)?;
         w.write_all(&self.built_at.to_le_bytes())?;
-        for len in [self.base_len(), b.names.len(), b.lower.len()] {
+        w.write_all(&self.updated_at.to_le_bytes())?;
+        for len in [b.parents.len(), b.names.len(), b.lower.len()] {
             w.write_all(&(len as u64).to_le_bytes())?;
         }
         w.write_all(b.names.as_bytes())?;
@@ -510,10 +521,13 @@ impl Index {
         let bytes = fs::read(path)?;
         let bad = || io::Error::new(io::ErrorKind::InvalidData, "corrupt index");
         let mut r = Reader { bytes: &bytes, pos: 0 };
-        if r.take(8).ok_or_else(bad)? != Self::MAGIC {
-            return Err(bad());
-        }
+        let v1 = match r.take(8).ok_or_else(bad)? {
+            m if m == Self::MAGIC => false,
+            m if m == Self::MAGIC_V1 => true,
+            _ => return Err(bad()),
+        };
         let built_at = i64::from_le_bytes(r.array().ok_or_else(bad)?);
+        let updated_at = if v1 { built_at } else { i64::from_le_bytes(r.array().ok_or_else(bad)?) };
         let mut lens = [0usize; 3];
         for len in &mut lens {
             *len = u64::from_le_bytes(r.array().ok_or_else(bad)?) as usize;
@@ -542,7 +556,27 @@ impl Index {
             return Err(bad());
         }
         let base = Packed { names, name_ends, lower, lower_ends, parents, flags, sizes, mtimes };
-        Ok(Index { base: Arc::new(base), delta: Arc::default(), built_at, updated_at: built_at })
+        Ok(Index { base: Arc::new(base), delta: Arc::default(), built_at, updated_at })
+    }
+
+    /// The scan with the changes since merged in, re-sorted (new ids).
+    fn compacted(&self) -> Packed {
+        let mut new_id = vec![NO_PARENT; self.len()];
+        let mut flat = Flat::default();
+        for id in (0..self.len() as u32).filter(|&id| !self.is_removed(id)) {
+            new_id[id as usize] = flat.names.len() as u32;
+            flat.names.push(self.name(id).to_string());
+            flat.parents.push(self.parent(id).unwrap_or(NO_PARENT));
+            flat.flags.push(self.flags(id));
+            flat.sizes.push(self.size(id));
+            flat.mtimes.push(self.mtime(id));
+        }
+        for parent in &mut flat.parents {
+            if *parent != NO_PARENT {
+                *parent = new_id[*parent as usize];
+            }
+        }
+        flat.into_sorted()
     }
 
     /// `~/Library/Application Support/findest/index.bin`.
@@ -622,7 +656,12 @@ fn mtime_of(meta: &Option<fs::Metadata>) -> i64 {
 /// The folder's entries (not descended into), and which of them are
 /// folders to descend into.
 fn read_entries(dir: &Path, excludes: &Excludes, cancel: &AtomicBool) -> (Vec<Node>, Vec<usize>) {
-    let Ok(read) = fs::read_dir(dir) else { return Default::default() };
+    try_read_entries(dir, excludes, cancel).unwrap_or_default()
+}
+
+/// `read_entries`, or `None` if the folder can't be read.
+fn try_read_entries(dir: &Path, excludes: &Excludes, cancel: &AtomicBool) -> Option<(Vec<Node>, Vec<usize>)> {
+    let read = fs::read_dir(dir).ok()?;
     let mut nodes = Vec::new();
     let mut subdirs = Vec::new();
     for item in read.flatten() {
@@ -655,7 +694,7 @@ fn read_entries(dir: &Path, excludes: &Excludes, cancel: &AtomicBool) -> (Vec<No
         }
         nodes.push(Node { name, flags, size, mtime: mtime_of(&meta), children: Vec::new() });
     }
-    (nodes, subdirs)
+    Some((nodes, subdirs))
 }
 
 fn scan_children(dir: &Path, excludes: &Excludes, progress: &AtomicUsize, cancel: &AtomicBool) -> Vec<Node> {
@@ -916,7 +955,40 @@ pub(crate) mod tests {
             assert_eq!(loaded.path(id), index.path(id));
             assert_eq!(loaded.size(id), index.size(id));
         }
-        fs::write(&file, b"FNDIDX01garbage").unwrap();
+        fs::write(&file, b"FNDIDX02garbage").unwrap();
         assert!(Index::load(&file).is_err());
+    }
+
+    #[test]
+    fn saves_changes_since_the_scan() {
+        let tmp = sample_tree();
+        let r = tmp.path();
+        let ex = Excludes::new(&["**/node_modules".to_string()]);
+        let index = sample_index(r);
+        fs::write(r.join("Photos/new.txt"), "hi").unwrap();
+        fs::remove_dir_all(r.join("Projects/findest/src")).unwrap();
+        let updated = index.with_changes(&[r.join("Photos/new.txt"), r.join("Projects/findest/src")], &ex).unwrap();
+
+        let out = tempfile::tempdir().unwrap(); // not in the indexed tree
+        let file = out.path().join("index.bin");
+        updated.save(&file).unwrap();
+        let loaded = Index::load(&file).unwrap();
+        assert_eq!(comparable(&loaded), comparable(&updated));
+        assert_eq!(search_names(&loaded), search_names(&sample_index(r)), "saved sorted, like a fresh scan");
+        assert_eq!(loaded.changed_count(), 0);
+        assert_eq!((loaded.built_at, loaded.updated_at), (updated.built_at, updated.updated_at));
+    }
+
+    #[test]
+    fn unreadable_folders_keep_their_entries() {
+        let tmp = sample_tree();
+        let r = tmp.path();
+        let ex = Excludes::new(&["**/node_modules".to_string()]);
+        let index = sample_index(r);
+        let photos = r.join("Photos");
+        fs::set_permissions(&photos, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+        let updated = index.with_changes(&[photos.join("notes.txt")], &ex);
+        fs::set_permissions(&photos, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        assert!(updated.is_none(), "nothing removed");
     }
 }
