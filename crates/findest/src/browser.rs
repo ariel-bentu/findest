@@ -981,6 +981,14 @@ impl Browser {
         use Command::*;
         self.menu = None;
         self.syntax_help = None;
+        // The text preview takes copying and selecting while it's open.
+        if self.text_preview.is_some() {
+            match command {
+                Copy => return self.copy_preview_text(cx),
+                SelectAll => return self.select_all_preview_text(cx),
+                _ => {}
+            }
+        }
         if self.type_ahead.is_active() {
             match command {
                 // Backspace edits the query instead of trashing the match.
@@ -1076,6 +1084,7 @@ impl Browser {
                     Err(e) => self.set_error(format!("Couldn't save the setting: {e:#}"), cx),
                 }
             }
+            TogglePreviewSource => self.toggle_preview_source(cx),
             QuickLook => {
                 if !self.toggle_text_preview(cx) {
                     let selection = self.selection();

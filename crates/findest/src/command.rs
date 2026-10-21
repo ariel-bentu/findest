@@ -73,6 +73,8 @@ pub enum Command {
     ToggleInfo,
     /// Preview the selection in the Quick Look panel, or close it.
     QuickLook,
+    /// In the text preview of a Markdown file: formatted text or source.
+    TogglePreviewSource,
     ViewList,
     ViewTiles,
     /// Bigger / smaller tiles (tiles view).
@@ -147,6 +149,7 @@ impl FromStr for Command {
             "toggle_hidden" => ToggleHidden,
             "toggle_info" => ToggleInfo,
             "quick_look" => QuickLook,
+            "toggle_preview_source" => TogglePreviewSource,
             "view_list" => ViewList,
             "view_tiles" => ViewTiles,
             "zoom_in" => ZoomIn,

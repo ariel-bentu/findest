@@ -18,6 +18,7 @@ regex.workspace = true
 syntect.workspace = true
 memchr.workspace = true
 chrono.workspace = true
+pulldown-cmark.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

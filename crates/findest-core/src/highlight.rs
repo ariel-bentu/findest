@@ -10,8 +10,12 @@ use syntect::parsing::{SyntaxReference, SyntaxSet};
 
 /// Extensions previewed by Findest instead of Quick Look, which shows
 /// nothing for them out of the box.
-pub const OWN_PREVIEW_EXTENSIONS: &[&str] =
-    &["yaml", "yml", "toml", "ini", "cfg", "conf", "env", "properties", "tf", "hcl", "gradle", "proto", "json", "ndjson", "jsonl"];
+pub const OWN_PREVIEW_EXTENSIONS: &[&str] = &[
+    "yaml", "yml", "toml", "ini", "cfg", "conf", "env", "properties", "tf", "hcl", "gradle", "proto", "json", "ndjson", "jsonl",
+    "md", "markdown",
+];
+/// Shown formatted, with the source a toggle away.
+const MARKDOWN_EXTENSIONS: &[&str] = &["md", "markdown"];
 
 /// Files larger than this are cut, and the preview says so.
 const MAX_BYTES: usize = 4 * 1024 * 1024;
@@ -20,7 +24,7 @@ const MAX_LINES: usize = 20_000;
 /// can't be read anyway.
 const MAX_LINE_CHARS: usize = 20_000;
 
-static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
+pub(crate) static SYNTAXES: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 static THEMES: LazyLock<ThemeSet> = LazyLock::new(ThemeSet::load_defaults);
 
 /// A run of text in one color: a byte range of its line and an sRGB color.
@@ -29,6 +33,7 @@ pub struct Span {
     pub range: std::ops::Range<usize>,
     pub rgb: [u8; 3],
     pub bold: bool,
+    pub italic: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -46,24 +51,40 @@ pub struct Highlighted {
     pub notes: Vec<String>,
 }
 
-pub fn has_own_preview(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| OWN_PREVIEW_EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(e)))
+/// A file as the preview shows it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Preview {
+    pub source: Highlighted,
+    /// Markdown, formatted.
+    pub formatted: Option<Highlighted>,
 }
 
-/// Reads and highlights `path`. `dark` picks the color theme.
-pub fn highlight_file(path: &Path, dark: bool) -> std::io::Result<Highlighted> {
+pub fn has_own_preview(path: &Path) -> bool {
+    has_extension(path, OWN_PREVIEW_EXTENSIONS)
+}
+
+fn has_extension(path: &Path, extensions: &[&str]) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| extensions.iter().any(|x| x.eq_ignore_ascii_case(e)))
+}
+
+/// Reads `path` for the preview: highlighted, and formatted if it's
+/// Markdown. `dark` picks the color theme.
+pub fn preview_file(path: &Path, dark: bool) -> std::io::Result<Preview> {
     use std::io::Read;
     let mut bytes = Vec::new();
     let file = std::fs::File::open(path)?;
     let size = file.metadata()?.len();
     file.take(MAX_BYTES as u64).read_to_end(&mut bytes)?;
-    let mut highlighted = highlight(&String::from_utf8_lossy(&bytes), path, dark);
+    let text = String::from_utf8_lossy(&bytes);
+    let mut source = highlight(&text, path, dark);
+    let mut formatted = has_extension(path, MARKDOWN_EXTENSIONS).then(|| crate::markdown::render(&text, dark));
     if size > MAX_BYTES as u64 {
-        highlighted.notes.insert(0, format!("Showing the first {} MB of {}", MAX_BYTES / (1024 * 1024), crate::listing::format_size(size)));
+        let note = format!("Showing the first {} MB of {}", MAX_BYTES / (1024 * 1024), crate::listing::format_size(size));
+        for h in std::iter::once(&mut source).chain(formatted.as_mut()) {
+            h.notes.insert(0, note.clone());
+        }
     }
-    Ok(highlighted)
+    Ok(Preview { source, formatted })
 }
 
 pub fn highlight(text: &str, path: &Path, dark: bool) -> Highlighted {
@@ -128,7 +149,7 @@ fn json_spans(line: &str, dark: bool) -> Vec<Span> {
     };
     let bytes = line.as_bytes();
     let mut spans = Vec::new();
-    let mut push = |range: std::ops::Range<usize>, rgb| spans.push(Span { range, rgb, bold: false });
+    let mut push = |range: std::ops::Range<usize>, rgb| spans.push(Span { range, rgb, bold: false, italic: false });
     let mut i = 0;
     while i < bytes.len() {
         let start = i;
@@ -182,12 +203,20 @@ fn syntax_for(path: &Path, text: &str) -> &'static SyntaxReference {
         .unwrap_or_else(|| SYNTAXES.find_syntax_plain_text())
 }
 
-fn theme(dark: bool) -> &'static Theme {
+/// The grammar for a code block's language ("rust", "sh"...), or plain text.
+pub(crate) fn syntax_by_token(token: &str) -> &'static SyntaxReference {
+    Some(token)
+        .filter(|t| !t.is_empty())
+        .and_then(|t| SYNTAXES.find_syntax_by_token(t))
+        .unwrap_or_else(|| SYNTAXES.find_syntax_plain_text())
+}
+
+pub(crate) fn theme(dark: bool) -> &'static Theme {
     let name = if dark { "base16-ocean.dark" } else { "InspiredGitHub" };
     THEMES.themes.get(name).or_else(|| THEMES.themes.values().next()).expect("syntect ships themes")
 }
 
-fn spans(regions: &[(syntect::highlighting::Style, &str)], len: usize) -> Vec<Span> {
+pub(crate) fn spans(regions: &[(syntect::highlighting::Style, &str)], len: usize) -> Vec<Span> {
     let mut spans = Vec::new();
     let mut at = 0;
     for (style, piece) in regions {
@@ -195,7 +224,8 @@ fn spans(regions: &[(syntect::highlighting::Style, &str)], len: usize) -> Vec<Sp
         if end > at {
             let c = style.foreground;
             let bold = style.font_style.contains(syntect::highlighting::FontStyle::BOLD);
-            spans.push(Span { range: at..end, rgb: [c.r, c.g, c.b], bold });
+            let italic = style.font_style.contains(syntect::highlighting::FontStyle::ITALIC);
+            spans.push(Span { range: at..end, rgb: [c.r, c.g, c.b], bold, italic });
         }
         at += piece.len();
     }
