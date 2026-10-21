@@ -1,6 +1,6 @@
 # Sources
 
-A source shows a hierarchy that isn't on disk, such as cloud resources, a bucket or a wiki, in Findest's sidebar. You browse it like folders: list and tiles views, Quick Look, the info panel, Open in…, copy out. Sources are read-only.
+A source shows a hierarchy that isn't on disk, such as cloud resources, a bucket or a wiki, in Findest's sidebar. You browse it like folders: list and tiles views, Quick Look, the info panel, Open in…, copy out. Files can't be changed in a source, but the adapter can offer its own [actions](#actions) on items, such as Delete or Reconcile.
 
 Findest doesn't know about any particular system. You provide a small program, an **adapter**, that answers three questions: what's in this folder, what's in this file, and how to sign in. Optionally it answers a fourth: what's in this folder and below that matches a search. Any language works. Two examples in Python, standard library only:
 
@@ -31,6 +31,7 @@ Findest runs `command` followed by a verb and its arguments, one process per req
 | `read` | `<file-ref> <dest>` | writes the file's content to the path `dest` |
 | `login` | none | has signed the user in (it may open a browser) |
 | `search` (optional) | `<folder-ref> <hints-json> [<continue>]` | prints matching entries under the folder as JSON (see [Search](#search)) |
+| `action` (optional) | `<action-id> <ref>` | has done the action to the item; may print `{"message": "…"}` (see [Actions](#actions)) |
 
 Exit codes, for every verb:
 
@@ -64,6 +65,7 @@ $ static-source list /
 | `size` | no | Bytes. Left out, the Size column shows `--`. |
 | `modified` | no | RFC 3339 time, e.g. `"2026-10-01T12:00:00Z"`. |
 | `has_children` | no | Folders only. `false` hides the disclosure triangle. Default `true`. |
+| `actions` | no | What the user can do to this item from its right-click menu, e.g. `[{"id": "delete", "title": "Delete", "guarded": true}]`. See [Actions](#actions). |
 
 **Columns.** Next to `entries`, `"columns": [{"key": "status", "title": "Status"}]` shows those attributes as columns after Kind, in that order, while browsing the source. They can be resized and sorted like the others. Send them with every `list` and `search` response; Findest keeps every column a source has declared. Search matches any attribute, declared or not: `status:Ready` finds entries whose `status` is `Ready` (ignoring case; the whole value must match), and `!status:Ready` the rest. Avoid keys that are built-in search filters (`size`, `path`, `ext`, `dm`, `date`, `modified`, `content`, `text`, `file`, `folder`, `dir`, `hidden`, `case`, `nocase`, `regex`): those can't be searched as attributes.
 
@@ -116,12 +118,33 @@ Large result sets can be paged with `continue`, as for `list`. Findest follows u
 
 **Without `search`**, or when it exits 64, Findest walks the source with `list`, a level at a time with folders listed in parallel. It stops after 1,000 folders or 60 seconds, and only the first page of a paged folder is searched. Each limit it reaches is reported. Implement `search` when your backend can list a subtree in one call: for URM that's one recursive call instead of one call per folder.
 
+### Actions
+
+An entry can list actions, shown in its right-click menu after **Open** and **Open in…**:
+
+```json
+{"name": "x.yaml", "kind": "file", "ref": "…",
+ "actions": [{"id": "reconcile", "title": "Reconcile"},
+             {"id": "delete", "title": "Delete", "guarded": true, "danger": true}]}
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `id` | yes | Passed back to `action`. |
+| `title` | yes | The menu item. |
+| `guarded` | no | Ask first: "Are you sure you want to delete "x.yaml"?" with **Delete** and **Cancel**. The menu item ends in "…". |
+| `danger` | no | Shown in red, like Move to Trash. |
+
+Choosing one runs `action <id> <ref>` for each selected item (with several selected, the menu offers only the actions they all have). Exit 0 when it's done, or accepted. Findest shows the message you print, `{"message": "Reconciling x"}`, or "Reconcile: done for "x.yaml"" if you print nothing. Then it lists the folder again, so a deleted item disappears and a changed status shows. Failures work like any verb: the last line of stderr, or 77 to sign in. `action` is stopped after 2 minutes.
+
+Actions are per entry, so offer only what applies: a type that can't be deleted, or a user without permission, needn't see Delete.
+
 ### Limits
 
 - `list`, `read` and `search` are stopped after 60 seconds, `login` after 5 minutes. The user sees that it timed out.
 - A listing is cached for 60 seconds; ⌘R lists the folder again.
 - Problems with single entries (a bad name, an unknown `kind`, a duplicate name, an unreadable `modified`) skip or ignore that field, and they're reported in the status bar. They don't fail the listing.
-- A source never changes your files: copying, moving, renaming, deleting and dropping into a source are refused with "Sources are read-only".
+- A source never changes your files: copying, moving, renaming, deleting and dropping into a source are refused with "Sources are read-only". Changes to the source itself go through its [actions](#actions).
 
 ## Test an adapter by hand
 
@@ -167,6 +190,7 @@ Findest writes one JSON object per line. Each command has an `id` that the adapt
 | `search` | `folder`, `hints`, `continue` (optional) | Search under a folder |
 | `read` | `ref`, `dest` | Fetch a file to `dest` |
 | `preview` | `ref`, `dest`, `name` | Return an alternative preview (optional verb) |
+| `action` | `action`, `ref` | Do one of an entry's [actions](#actions) (optional verb) |
 | `login` | — | Sign in |
 | `exit` | — | Shut down (no response expected) |
 
@@ -259,6 +283,18 @@ The `preview` verb is optional. Findest sends it after `read` when it needs to d
 The adapter writes the alternate content to any path it chooses and returns it in `dest`. **The file must have the correct extension** (`.png`, `.pdf`, etc.) — Findest passes the path to Quick Look as-is, and Quick Look determines the format from the extension. The `mime_type` field is accepted but currently unused by Findest.
 
 If the adapter doesn't support `preview`, it can return `"error": "not_supported"` and Findest falls back to the file at `dest`.
+
+#### `action`
+
+```json
+{"id": "8", "verb": "action", "action": "reconcile", "ref": "x"}
+```
+
+```jsonl
+{"id":"8","message":"Reconciling x"}
+```
+
+Sentinel = done; `message` is optional. Entries declare their actions with `"actions"` as in v1.
 
 #### `login`
 

@@ -22,6 +22,8 @@ pub(crate) const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// Wall-clock limit for `login`.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Wall-clock limit for an entry's action.
+const ACTION_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 
 // ---- Wire types sent to the adapter -----------------------------------
 
@@ -41,6 +43,8 @@ struct Cmd {
     dest: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<String>,
 }
 
 // ---- Wire types received from the adapter -----------------------------
@@ -61,6 +65,10 @@ struct RawLine {
     mime_type: Option<String>,
     #[serde(default)]
     attributes: serde_json::Map<String, Value>,
+    #[serde(default)]
+    actions: Vec<crate::sources::SourceAction>,
+    /// On the sentinel of `action`: what to tell the user.
+    message: Option<String>,
     /// On the sentinel: attributes to show as columns.
     columns: Option<Vec<WireColumn>>,
     #[serde(rename = "continue")]
@@ -83,13 +91,14 @@ pub(crate) struct WireEntry {
     pub(crate) folder: Option<String>,
     pub(crate) mime_type: Option<String>,
     pub(crate) attributes: serde_json::Map<String, Value>,
+    pub(crate) actions: Vec<crate::sources::SourceAction>,
 }
 
 pub(crate) enum V2Line {
     Entry(Box<WireEntry>),
     Warning(String),
     /// End-of-stream sentinel; carries the continue token for paged list/search.
-    Done { continue_token: Option<String>, columns: Vec<WireColumn> },
+    Done { continue_token: Option<String>, columns: Vec<WireColumn>, message: Option<String> },
     Error(V2Error),
 }
 
@@ -205,6 +214,7 @@ impl V2Process {
             reference: None,
             dest: None,
             name: None,
+            action: None,
         })?;
         drain_stream(rx, source, "list", INACTIVITY_TIMEOUT, on_entry, on_warning)
     }
@@ -227,6 +237,7 @@ impl V2Process {
             reference: None,
             dest: None,
             name: None,
+            action: None,
         })?;
         drain_stream(rx, source, "search", INACTIVITY_TIMEOUT, on_entry, on_warning)
     }
@@ -241,6 +252,7 @@ impl V2Process {
             reference: Some(reference),
             dest: Some(dest),
             name: None,
+            action: None,
         })?;
         wait_done(rx, source, "read", READ_TIMEOUT)
     }
@@ -261,6 +273,7 @@ impl V2Process {
             reference: Some(reference),
             dest: Some(dest),
             name: Some(name),
+            action: None,
         })?;
         wait_preview(rx, source, READ_TIMEOUT)
     }
@@ -275,8 +288,40 @@ impl V2Process {
             reference: None,
             dest: None,
             name: None,
+            action: None,
         })?;
         wait_done(rx, source, "login", LOGIN_TIMEOUT)
+    }
+
+    /// Runs one of an entry's actions; returns the adapter's message, if any.
+    pub(crate) fn action(&self, source: &Source, action: String, reference: String) -> Result<Option<String>, SourceError> {
+        let rx = self.send(&Cmd {
+            id: self.next_id(),
+            verb: "action",
+            folder: None,
+            continue_token: None,
+            hints: None,
+            reference: Some(reference),
+            dest: None,
+            name: None,
+            action: Some(action),
+        })?;
+        loop {
+            match rx.recv_timeout(ACTION_TIMEOUT) {
+                Ok(V2Line::Done { message, .. }) => return Ok(message),
+                Ok(V2Line::Entry(_) | V2Line::Warning(_)) => {}
+                Ok(V2Line::Error(e)) => return Err(e.into_source_error(source, "action")),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(SourceError::Failed(format!(
+                        "{}: the action didn't finish within {ACTION_TIMEOUT:?} and was stopped",
+                        source.name
+                    )));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(SourceError::Failed(format!("{}: adapter exited unexpectedly", source.name)));
+                }
+            }
+        }
     }
 
     pub(crate) fn exit(&self) {
@@ -361,6 +406,7 @@ fn decode_line(raw: RawLine) -> (bool, V2Line) {
                 folder: raw.folder,
                 mime_type: raw.mime_type,
                 attributes: raw.attributes,
+                actions: raw.actions,
             })),
         );
     }
@@ -384,10 +430,11 @@ fn decode_line(raw: RawLine) -> (bool, V2Line) {
                 folder: None,
                 mime_type: Some(mt),
                 attributes: Default::default(),
+                actions: Vec::new(),
             })),
         );
     }
-    (true, V2Line::Done { continue_token: raw.continue_token, columns: raw.columns.unwrap_or_default() })
+    (true, V2Line::Done { continue_token: raw.continue_token, columns: raw.columns.unwrap_or_default(), message: raw.message })
 }
 
 // ---- Receive helpers -------------------------------------------------
@@ -404,7 +451,7 @@ fn drain_stream(
         match rx.recv_timeout(timeout) {
             Ok(V2Line::Entry(e)) => on_entry(*e),
             Ok(V2Line::Warning(w)) => on_warning(w),
-            Ok(V2Line::Done { continue_token, columns }) => return Ok((continue_token, columns)),
+            Ok(V2Line::Done { continue_token, columns, .. }) => return Ok((continue_token, columns)),
             Ok(V2Line::Error(e)) => return Err(e.into_source_error(source, verb)),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 return Err(SourceError::Failed(format!(
