@@ -6,6 +6,7 @@ pub mod index;
 pub mod live;
 pub mod query;
 pub mod run;
+pub mod saved;
 pub mod source;
 
 pub use index::{Excludes, Index};

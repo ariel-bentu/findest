@@ -12,6 +12,8 @@ pub enum Event {
     /// Changes were lost under this folder, or anywhere (`None`): only a
     /// rescan can catch up.
     Rescan(Option<PathBuf>),
+    /// Every change since the replayed event id has been delivered.
+    HistoryDone,
 }
 
 /// Stops the stream when dropped.
@@ -20,12 +22,18 @@ pub struct EventStream {
     queue: *mut c_void,
 }
 
-type Handler = Box<dyn Fn(Vec<Event>) + Send>;
+type Handler = Box<dyn Fn(Vec<Event>, u64) + Send>;
 
 impl EventStream {
     /// Watches `paths` recursively. With `since`, changes after that event
-    /// id are replayed first. `on_events` runs on a private serial queue.
-    pub fn start(paths: &[PathBuf], since: Option<u64>, latency_secs: f64, on_events: impl Fn(Vec<Event>) + Send + 'static) -> Option<EventStream> {
+    /// id are replayed first. `on_events` gets each batch with the id of its
+    /// last event, and runs on a private serial queue.
+    pub fn start(
+        paths: &[PathBuf],
+        since: Option<u64>,
+        latency_secs: f64,
+        on_events: impl Fn(Vec<Event>, u64) + Send + 'static,
+    ) -> Option<EventStream> {
         let handler: Box<Handler> = Box::new(Box::new(on_events));
         let context = Context {
             version: 0,
@@ -100,7 +108,7 @@ extern "C" fn on_raw_events(
     count: usize,
     paths: *mut c_void,
     flags: *const u32,
-    _ids: *const u64,
+    ids: *const u64,
 ) {
     let handler = unsafe { &*(info as *const Handler) };
     let paths = paths as *const *const c_char;
@@ -109,7 +117,7 @@ extern "C" fn on_raw_events(
             let (flag, path) = unsafe { (*flags.add(i), CStr::from_ptr(*paths.add(i))) };
             let path = PathBuf::from(OsStr::from_bytes(path.to_bytes()));
             if flag & EVENT_HISTORY_DONE != 0 {
-                None
+                Some(Event::HistoryDone)
             } else if flag & (EVENT_USER_DROPPED | EVENT_KERNEL_DROPPED | EVENT_IDS_WRAPPED | EVENT_ROOT_CHANGED) != 0 {
                 Some(Event::Rescan(None))
             } else if flag & EVENT_MUST_SCAN_SUBDIRS != 0 {
@@ -119,8 +127,10 @@ extern "C" fn on_raw_events(
             }
         })
         .collect();
+    // Events arrive in id order.
+    let last_id = if count == 0 { 0 } else { unsafe { *ids.add(count - 1) } };
     // Unwinding into CoreServices would abort; drop the batch instead.
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(events)));
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(events, last_id)));
 }
 
 extern "C" fn release_handler(info: *const c_void) {
@@ -211,7 +221,7 @@ mod tests {
 
     fn watch(dir: &Path, since: Option<u64>) -> (EventStream, mpsc::Receiver<PathBuf>) {
         let (tx, rx) = mpsc::channel();
-        let stream = EventStream::start(&[dir.to_path_buf()], since, 0.1, move |events| {
+        let stream = EventStream::start(&[dir.to_path_buf()], since, 0.1, move |events, _| {
             for event in events {
                 if let Event::Changed(path) = event {
                     let _ = tx.send(path);

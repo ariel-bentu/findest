@@ -1,8 +1,8 @@
 mod browser;
 mod browser_search;
+mod cli;
 mod command;
 mod default_viewer;
-mod fsevents;
 mod icons;
 mod install;
 mod native_drag;
@@ -179,6 +179,9 @@ fn initial_windows(start: Option<PathBuf>) -> Vec<BrowserInit> {
 }
 
 fn main() {
+    if let Some(code) = cli::handle_args() {
+        std::process::exit(code);
+    }
     if install::handoff_if_needed() {
         return;
     }

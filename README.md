@@ -48,6 +48,22 @@ Findest also appears in Finder's "Open With" menu for folders.
 
 To have "Show in Finder" / "Reveal in Finder" in other apps (browser downloads, editors) open Findest instead, choose **Findest › Use Findest as Default File Viewer**; **Use Finder as Default File Viewer** switches back. macOS doesn't let apps replace Finder for folders themselves, the Desktop, or the Dock. If you delete Findest without switching back, reveals fall back to Finder; `defaults delete -g NSFileViewer` removes the leftover setting.
 
+## Command line and AI agents
+
+`findest search` searches the same index from a terminal, so scripts and AI agents can find files anywhere in well under a second:
+
+```sh
+findest search 'ext:pdf invoice dm:2024' --in ~/Documents --limit 20
+findest search 'Cargo.toml' --json        # one JSON object per line
+findest search --help                     # options and the query language
+```
+
+It uses the index the app saves (once it has caught up after launch, then at most hourly). An index more than an hour old is first caught up with the changes since, from the FSEvents history; `--rescan` rebuilds it instead, and `--live` skips it. Folders outside the index are searched on disk.
+
+`findest skill install` installs a [Claude Code skill](skills/findest-search/SKILL.md) that teaches agents to use it (into `~/.claude/skills`, or a folder you name). `findest skill show` prints it, e.g. for an `AGENTS.md`.
+
+Search results include names from folders only Findest has access to (e.g. with Full Disk Access), so any terminal or agent running `findest search` can see them. Reading file contents (`content:`) still uses the terminal's own permissions.
+
 ## Develop
 
 ```
