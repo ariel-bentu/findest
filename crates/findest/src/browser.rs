@@ -14,7 +14,7 @@ use findest_core::locations::{self, Place};
 use findest_core::paths::{contract_tilde, display_name, home_dir};
 use findest_core::recents::Recents;
 use findest_core::session::{ColumnWidths, Session, WindowSession};
-use findest_core::sources::{self, SourceError};
+use findest_core::sources::{self, SourceAction, SourceError};
 use findest_core::{launch, ops};
 use futures::StreamExt;
 use gpui::{
@@ -241,6 +241,8 @@ pub enum MenuAction {
     SetColor(Option<listing::TagColor>),
     /// Create a folder (or file) inside `dir`, expand it and name the new item.
     NewIn { dir: PathBuf, folder: bool },
+    /// Run a source adapter's action on the selected items.
+    SourceAction(SourceAction),
 }
 
 /// Details of the single selected item, shown in the info panel.
@@ -1305,6 +1307,7 @@ impl Browser {
         match action {
             MenuAction::Command(command) => self.run(command, window, cx),
             MenuAction::NewIn { dir, folder } => self.new_in(dir, folder, cx),
+            MenuAction::SourceAction(action) => self.run_source_action(action, window, cx),
             MenuAction::SetColor(color) => self.set_folder_color(color, cx),
             MenuAction::RemoveFavorite(ix) => {
                 if ix < self.config.favorites.len() {
@@ -1818,6 +1821,37 @@ impl Browser {
         });
     }
 
+    /// Runs a source's action ("Reconcile") on the selection, asking first if
+    /// the adapter marked it guarded, then lists the folder again.
+    fn run_source_action(&mut self, action: SourceAction, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = self.selection();
+        if paths.is_empty() {
+            return;
+        }
+        let what = describe(&paths);
+        let question = format!("Are you sure you want to {} {what}?", action.title.to_lowercase());
+        let confirm = action.title.clone();
+        self.confirm_then(action.guarded, &question, None, &confirm, window, cx, move |this, cx| {
+            this.set_info(format!("{}: {what}…", action.title), cx);
+            let SourceAction { id, title, .. } = action;
+            this.run_op(
+                cx,
+                move || {
+                    let mut messages = Vec::new();
+                    for path in &paths {
+                        messages.extend(sources::global().run_action(path, &id).map_err(|e| anyhow::anyhow!("{e}"))?);
+                    }
+                    Ok(messages)
+                },
+                move |this, messages, cx| {
+                    let done = if messages.is_empty() { format!("{title}: done for {what}") } else { messages.join(" · ") };
+                    this.set_info(done, cx);
+                    this.reload(cx);
+                },
+            );
+        });
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn confirm_then(
         &mut self,
@@ -2163,9 +2197,21 @@ impl Browser {
                 self.entries.iter().filter(|e| self.selected.contains(&e.path)).cloned().collect();
             let single = selection.len() == 1;
             let all_dirs = selection.iter().all(|e| e.is_dir);
+            // Sources are read-only: what they offer instead are their own actions.
+            let in_source = selection.iter().any(|e| sources::global().contains(&e.path));
+            let paths: Vec<PathBuf> = selection.iter().map(|e| e.path.clone()).collect();
+            let actions = if in_source { sources::global().actions(&paths) } else { Vec::new() };
             entries.push(self.item("Open", Open, "open"));
             entries.extend(self.opener_items(all_dirs));
             entries.push(MenuEntry::Separator);
+            if !actions.is_empty() {
+                for action in actions {
+                    let label = if action.guarded { format!("{}…", action.title) } else { action.title.clone() };
+                    let danger = action.danger;
+                    entries.push(MenuEntry::Item { label, detail: None, action: MenuAction::SourceAction(action), danger });
+                }
+                entries.push(MenuEntry::Separator);
+            }
             if let [folder] = &selection[..]
                 && folder.is_dir
                 && !sources::global().contains(&folder.path)
@@ -2176,19 +2222,21 @@ impl Browser {
                 }
                 entries.push(MenuEntry::Separator);
             }
-            if single {
-                entries.push(self.item("Rename", Rename, "rename"));
+            if !in_source {
+                if single {
+                    entries.push(self.item("Rename", Rename, "rename"));
+                }
+                entries.push(self.item("Duplicate", Duplicate, "duplicate"));
+                let compress = match &selection[..] {
+                    [one] => format!("Compress “{}”", one.display_name()),
+                    many => format!("Compress {}", count_label(many.len())),
+                };
+                entries.push(self.item(compress, Compress, "compress"));
+                if selection.iter().any(|e| ops::is_zip(&e.path)) {
+                    entries.push(self.item("Uncompress", Extract, "extract"));
+                }
+                entries.push(self.item("Cut", Cut, "cut"));
             }
-            entries.push(self.item("Duplicate", Duplicate, "duplicate"));
-            let compress = match &selection[..] {
-                [one] => format!("Compress “{}”", one.display_name()),
-                many => format!("Compress {}", count_label(many.len())),
-            };
-            entries.push(self.item(compress, Compress, "compress"));
-            if selection.iter().any(|e| ops::is_zip(&e.path)) {
-                entries.push(self.item("Uncompress", Extract, "extract"));
-            }
-            entries.push(self.item("Cut", Cut, "cut"));
             entries.push(self.item("Copy", Copy, "copy"));
             if let Some(folder) = self.paste_destination().filter(|_| single && all_dirs && !self.file_clipboard.is_empty()) {
                 let (n, verb) = (count_label(self.file_clipboard.len()), if self.clipboard_cut { "Move" } else { "Paste" });
@@ -2205,20 +2253,22 @@ impl Browser {
             if selection.iter().any(|e| e.path.parent() != current.as_deref()) {
                 entries.push(self.item("Reveal in Findest", RevealInFindest, "reveal_in_findest"));
             }
-            if all_dirs {
+            if all_dirs && !in_source {
                 // Ring the color they share, if any.
                 let colors: HashSet<Option<listing::TagColor>> = selection.iter().map(|e| e.color).collect();
                 let current = if colors.len() == 1 { colors.into_iter().next().flatten() } else { None };
                 entries.push(MenuEntry::Separator);
                 entries.push(MenuEntry::Colors { current });
             }
-            entries.push(MenuEntry::Separator);
-            entries.push(MenuEntry::Item {
-                label: "Move to Trash".into(),
-                detail: command::shortcut_label(&self.keymap, "trash"),
-                action: MenuAction::Command(Trash),
-                danger: true,
-            });
+            if !in_source {
+                entries.push(MenuEntry::Separator);
+                entries.push(MenuEntry::Item {
+                    label: "Move to Trash".into(),
+                    detail: command::shortcut_label(&self.keymap, "trash"),
+                    action: MenuAction::Command(Trash),
+                    danger: true,
+                });
+            }
         } else {
             if in_dir {
                 entries.push(self.item("New Folder", NewFolder, "new_folder"));

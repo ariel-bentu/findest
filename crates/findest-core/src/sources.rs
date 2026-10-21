@@ -37,6 +37,8 @@ const FILE_TTL: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// `login` usually waits for the user in a browser.
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// An entry's action (delete, reconcile…) may take a while on the backend.
+const ACTION_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const MAX_TREE_DEPTH: usize = 32;
 /// File name of the "Load more…" row at the end of a paged folder.
 const MORE_NAME: &str = ".findest-load-more";
@@ -63,6 +65,28 @@ fn default_root() -> String {
 
 fn default_protocol_version() -> u8 {
     1
+}
+
+/// Something the adapter can do to an entry, offered when it's right-clicked
+/// ("Reconcile", "Delete").
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct SourceAction {
+    /// Passed back to the adapter's `action` verb.
+    pub id: String,
+    /// The menu item, e.g. "Reconcile".
+    pub title: String,
+    /// Ask "Are you sure…?" first.
+    #[serde(default)]
+    pub guarded: bool,
+    /// Shown in red, like Move to Trash.
+    #[serde(default)]
+    pub danger: bool,
+}
+
+/// What `action` may print on stdout (v1).
+#[derive(Deserialize)]
+struct WireActionResult {
+    message: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -121,6 +145,8 @@ pub(crate) struct WireEntry {
     mime_type: Option<String>,
     #[serde(default)]
     attributes: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)]
+    actions: Vec<SourceAction>,
 }
 
 impl From<crate::sources_v2::WireEntry> for WireEntry {
@@ -136,6 +162,7 @@ impl From<crate::sources_v2::WireEntry> for WireEntry {
             has_children: v.has_children,
             mime_type: v.mime_type,
             attributes: v.attributes,
+            actions: v.actions,
         }
     }
 }
@@ -159,6 +186,8 @@ struct State {
     refs: HashMap<PathBuf, String>,
     /// Listed files (as opposed to folders).
     files: HashSet<PathBuf>,
+    /// Each listed item's actions, by its path in the cache.
+    actions: HashMap<PathBuf, Vec<SourceAction>>,
     listings: HashMap<PathBuf, Listing>,
     fetched: HashMap<PathBuf, Instant>,
     /// Sources whose adapter last said "not signed in".
@@ -452,7 +481,8 @@ impl Sources {
         let mut rows = Vec::new();
         let mut refs = Vec::new();
         let mut files = Vec::new();
-        for wire in wires {
+        let mut actions = Vec::new();
+        for mut wire in wires {
             let dir = place(&wire);
             let problem = if wire.name.is_empty() || wire.name.contains('/') || wire.name == "." || wire.name == ".." || wire.name == MORE_NAME {
                 Some(format!("bad name {:?}", wire.name))
@@ -484,6 +514,12 @@ impl Sources {
             };
             let path = dir.unwrap().join(&name_with_ext);
             refs.push((path.clone(), wire.reference));
+            let (good, bad): (Vec<_>, Vec<_>) =
+                std::mem::take(&mut wire.actions).into_iter().partition(|a| !a.id.is_empty() && !a.title.trim().is_empty());
+            if !bad.is_empty() {
+                warnings.push(format!("{}: {:?}: ignored actions without an id or title", source.name, wire.name));
+            }
+            actions.push((path.clone(), good));
             if !is_dir {
                 files.push(path.clone());
             }
@@ -514,7 +550,43 @@ impl Sources {
         let mut state = self.state.lock().unwrap();
         state.refs.extend(refs);
         state.files.extend(files);
+        state.actions.extend(actions);
         rows
+    }
+
+    /// The actions every one of `paths` offers, in the order the first lists them.
+    pub fn actions(&self, paths: &[PathBuf]) -> Vec<SourceAction> {
+        let state = self.state.lock().unwrap();
+        let mut each = paths.iter().map(|p| state.actions.get(p).cloned().unwrap_or_default());
+        let Some(first) = each.next() else { return Vec::new() };
+        let rest: Vec<Vec<SourceAction>> = each.collect();
+        first.into_iter().filter(|a| rest.iter().all(|r| r.iter().any(|b| b.id == a.id))).collect()
+    }
+
+    /// Runs action `id` on the listed item at `path`, then drops the cached
+    /// listing it's in so it's listed again. Returns the adapter's message.
+    pub fn run_action(&self, path: &Path, id: &str) -> Result<Option<String>, SourceError> {
+        let source = self.source_for(path)?;
+        let name = crate::paths::display_name(path);
+        let reference = self.state.lock().unwrap().refs.get(path).cloned().ok_or_else(|| {
+            SourceError::Failed(format!("{name} isn't listed any more; refresh the folder (⌘R)"))
+        })?;
+        let message = if source.protocol_version == 2 {
+            self.v2_call(&source, |proc| proc.action(&source, id.to_string(), reference))?
+        } else {
+            let out = self.run(&source, "action", &[id.to_string(), reference], ACTION_TIMEOUT, None)?;
+            let text = String::from_utf8_lossy(&out);
+            match text.trim() {
+                "" => None,
+                json => serde_json::from_str::<WireActionResult>(json)
+                    .map_err(|e| SourceError::Failed(format!("{}: `action` printed something that isn't JSON: {e}", source.name)))?
+                    .message,
+            }
+        };
+        if let Some(parent) = path.parent() {
+            self.invalidate(parent);
+        }
+        Ok(message.filter(|m| !m.trim().is_empty()))
     }
 
     /// For search: a folder's listing as fetched so far.
@@ -1017,6 +1089,53 @@ esac
 
     fn names(tree: &SourceTree) -> Vec<(&str, usize)> {
         tree.rows.iter().map(|r| (r.entry.name.as_str(), r.depth)).collect()
+    }
+
+    #[test]
+    fn runs_entry_actions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("acting-source");
+        let log = tmp.path().join("log");
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+echo "$*" >> "{}"
+case "$1 $2 $3" in
+  "list / ") echo '{{"entries":[
+    {{"name":"a.yaml","kind":"file","ref":"A","actions":[{{"id":"reconcile","title":"Reconcile","guarded":true}},{{"id":"delete","title":"Delete","danger":true}}]}},
+    {{"name":"b","kind":"folder","ref":"/b","actions":[{{"id":"delete","title":"Delete"}},{{"id":"","title":"No id"}}]}},
+    {{"name":"c.yaml","kind":"file","ref":"C"}}]}}' ;;
+  "action reconcile A") echo '{{"message":"Reconciling a"}}' ;;
+  "action delete /b") ;;
+  "action delete A") echo "it's protected" >&2; exit 1 ;;
+  *) exit 64 ;;
+esac
+"#,
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let source = Source { id: "a".into(), name: "Acting".into(), command: vec![script.to_string_lossy().into()], root: "/".into(), protocol_version: 1 };
+        let (_tmp, sources, root) = mounted(&source);
+        let tree = sources.read_tree(&root, &HashSet::new(), false, ORDER).unwrap();
+        assert_eq!(tree.warnings.len(), 1, "the action without an id: {:?}", tree.warnings);
+        let (a, b, c) = (root.join("a.yaml"), root.join("b"), root.join("c.yaml"));
+
+        let ids = |paths: &[PathBuf]| sources.actions(paths).into_iter().map(|a| a.id).collect::<Vec<_>>();
+        assert_eq!(ids(&[a.clone()]), ["reconcile", "delete"]);
+        assert!(sources.actions(&[a.clone()])[0].guarded && sources.actions(&[a.clone()])[1].danger);
+        assert_eq!(ids(&[a.clone(), b.clone()]), ["delete"], "only what they all offer");
+        assert!(ids(&[a.clone(), c.clone()]).is_empty());
+
+        assert_eq!(sources.run_action(&a, "reconcile"), Ok(Some("Reconciling a".into())));
+        assert!(!sources.state.lock().unwrap().listings.contains_key(&root), "the folder is listed again");
+        assert_eq!(sources.run_action(&b, "delete"), Ok(None));
+        assert_eq!(sources.run_action(&a, "delete"), Err(SourceError::Failed("Acting: it's protected".into())));
+        assert!(matches!(sources.run_action(&c, "reconcile"), Err(SourceError::NotSupported { .. })));
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(calls.contains("action reconcile A\naction delete /b\n"), "{calls}");
     }
 
     #[test]
