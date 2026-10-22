@@ -1729,6 +1729,7 @@ dependencies = [
  "objc2-quick-look-ui",
  "objc2-uniform-type-identifiers",
  "raw-window-handle",
+ "regex",
  "schemars",
  "serde",
  "serde_json",

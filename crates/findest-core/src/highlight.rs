@@ -49,6 +49,8 @@ pub struct Highlighted {
     pub syntax: String,
     /// What was left out, if anything ("Showing the first 20,000 lines").
     pub notes: Vec<String>,
+    /// Foldable regions, by first line.
+    pub folds: Vec<crate::folds::Fold>,
 }
 
 /// A file as the preview shows it.
@@ -136,7 +138,11 @@ pub fn highlight(text: &str, path: &Path, dark: bool) -> Highlighted {
         ));
     }
     notes.extend(failed);
-    Highlighted { lines, syntax: syntax.name.clone(), notes }
+    let folds = match syntax.name.as_str() {
+        "Markdown" => crate::folds::by_headings(&crate::folds::markdown_headings(&lines), &lines),
+        name => crate::folds::by_indent(&lines, name == "YAML"),
+    };
+    Highlighted { lines, syntax: syntax.name.clone(), notes, folds }
 }
 
 /// JSON colored like a terminal JSON viewer: keys green, string values blue,

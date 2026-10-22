@@ -75,6 +75,9 @@ pub enum Command {
     QuickLook,
     /// In the text preview of a Markdown file: formatted text or source.
     TogglePreviewSource,
+    /// In the text preview's find bar: the next / previous match.
+    FindNext,
+    FindPrevious,
     ViewList,
     ViewTiles,
     /// Bigger / smaller tiles (tiles view).
@@ -152,6 +155,8 @@ impl FromStr for Command {
             "toggle_info" => ToggleInfo,
             "quick_look" => QuickLook,
             "toggle_preview_source" => TogglePreviewSource,
+            "find_next" => FindNext,
+            "find_previous" => FindPrevious,
             "view_list" => ViewList,
             "view_tiles" => ViewTiles,
             "zoom_in" => ZoomIn,

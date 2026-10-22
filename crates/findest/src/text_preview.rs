@@ -2,20 +2,28 @@
 //! TOML...): a syntax-highlighted panel over the file list. Space opens and
 //! closes it, like Quick Look; ↑/↓ follow the selection. Markdown shows
 //! formatted, with its source a toggle away. Text can be selected with the
-//! mouse and copied (⌘A, ⌘C).
+//! mouse and copied (⌘A, ⌘C), and searched (⌘F, then ⌘G or Enter for the
+//! next match). Blocks fold from chevrons by the line numbers.
 
+use std::collections::BTreeSet;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use findest_core::highlight::{self, Highlighted, Preview, Span};
 use gpui::{
-    ClipboardItem, Context, FontStyle, FontWeight, HighlightStyle, Hsla, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, Rgba, StatefulInteractiveElement, Styled, StyledImage,
-    StyledText, Task, TextLayout, UniformListScrollHandle, Window, div, img, ListHorizontalSizingBehavior,
-    prelude::FluentBuilder, px, uniform_list,
+    AppContext, ClipboardItem, Context, Entity, Focusable, FontStyle, FontWeight, HighlightStyle, Hsla,
+    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, Rgba,
+    ScrollStrategy, StatefulInteractiveElement, Styled, StyledImage, StyledText, Subscription, Task, TextLayout,
+    UniformListScrollHandle, Window, div, hsla, img, ListHorizontalSizingBehavior, prelude::FluentBuilder, px,
+    uniform_list,
 };
 
 use crate::browser::Browser;
+use crate::text_input::{TextInput, TextInputEvent};
+
+/// Matches counted at most; past this the count says "10,000+".
+const MAX_MATCHES: usize = 10_000;
 
 pub struct TextPreview {
     pub path: PathBuf,
@@ -27,7 +35,53 @@ pub struct TextPreview {
     /// The mouse button went down on the text and is still held.
     selecting: bool,
     scroll: UniformListScrollHandle,
+    find: Option<Find>,
+    /// First lines of the folds that are collapsed.
+    folded: BTreeSet<usize>,
+    /// The mouse is over the line numbers (fold chevrons show then).
+    gutter_hover: bool,
     _task: Task<()>,
+}
+
+/// The find bar (⌘F) and what it found in the text shown.
+struct Find {
+    input: Entity<TextInput>,
+    /// (line, bytes), in order.
+    matches: Vec<(usize, Range<usize>)>,
+    /// More matched than `MAX_MATCHES`.
+    capped: bool,
+    /// Index into `matches` of the one scrolled to.
+    current: usize,
+    _subscriptions: Vec<Subscription>,
+}
+
+/// Line `ix`'s matches, each with whether it's the `current` one.
+fn matches_in_line(matches: &[(usize, Range<usize>)], current: usize, ix: usize) -> Vec<(Range<usize>, bool)> {
+    let start = matches.partition_point(|(line, _)| *line < ix);
+    matches[start..]
+        .iter()
+        .take_while(|(line, _)| *line == ix)
+        .enumerate()
+        .map(|(i, (_, range))| (range.clone(), start + i == current))
+        .collect()
+}
+
+/// Where `query` occurs in `lines`, ignoring case; at most `MAX_MATCHES`
+/// (the bool says more were left out).
+fn find_matches(lines: &[findest_core::highlight::Line], query: &str) -> (Vec<(usize, Range<usize>)>, bool) {
+    let Ok(re) = regex::RegexBuilder::new(&regex::escape(query)).case_insensitive(true).build() else {
+        return (Vec::new(), false);
+    };
+    let mut matches = Vec::new();
+    for (ix, line) in lines.iter().enumerate() {
+        for m in re.find_iter(&line.text) {
+            if matches.len() == MAX_MATCHES {
+                return (matches, true);
+            }
+            matches.push((ix, m.range()));
+        }
+    }
+    (matches, false)
 }
 
 /// A spot in the text: a line, and a byte offset in it.
@@ -86,6 +140,48 @@ impl TextPreview {
     fn has_formatted(&self) -> bool {
         matches!(&self.content, Some(Ok(p)) if p.formatted.is_some())
     }
+
+    /// The last line hidden by the fold starting at `line`, if one does.
+    fn fold_at(&self, line: usize) -> Option<usize> {
+        let folds = &self.shown()?.folds;
+        folds.binary_search_by_key(&line, |f| f.0).ok().map(|i| folds[i].1)
+    }
+
+    /// The lines shown, in order, when some are folded away.
+    fn rows(&self) -> Option<Vec<usize>> {
+        if self.folded.is_empty() {
+            return None;
+        }
+        let count = self.shown()?.lines.len();
+        let mut rows = Vec::new();
+        let mut ix = 0;
+        while ix < count {
+            rows.push(ix);
+            ix = match self.fold_at(ix) {
+                Some(end) if self.folded.contains(&ix) => end + 1,
+                _ => ix + 1,
+            };
+        }
+        Some(rows)
+    }
+
+    /// Unfolds whatever hides `line`, and returns the row it's shown in.
+    fn reveal(&mut self, line: usize) -> usize {
+        let hiding: Vec<usize> =
+            self.folded.iter().copied().filter(|&start| start < line && self.fold_at(start).is_some_and(|end| line <= end)).collect();
+        for start in hiding {
+            self.folded.remove(&start);
+        }
+        self.rows().map_or(line, |rows| rows.partition_point(|&l| l < line))
+    }
+
+    fn toggle_fold(&mut self, line: usize) {
+        if !self.folded.remove(&line) {
+            self.folded.insert(line);
+            // A selection end out of sight would be copied unseen; drop it.
+            self.selection = None;
+        }
+    }
 }
 
 impl Browser {
@@ -125,16 +221,112 @@ impl Browser {
             this.update(cx, |this, cx| {
                 if let Some(preview) = this.text_preview.as_mut().filter(|p| p.path == path) {
                     preview.content = Some(result.map(Arc::new).map_err(|e| format!("Can't read {}: {e}", findest_core::paths::display_name(&path))));
+                    this.refresh_preview_find(cx);
                     cx.notify();
                 }
             })
             .ok();
         });
         let scroll = UniformListScrollHandle::new();
-        // Keep showing the source while moving between Markdown files.
+        // Keep showing the source, and searching, while moving between files.
         let show_source = self.text_preview.as_ref().is_some_and(|p| p.show_source);
-        self.text_preview =
-            Some(TextPreview { path: path.clone(), content: None, show_source, selection: None, selecting: false, scroll, _task: task });
+        let find = self.text_preview.as_mut().and_then(|p| p.find.take());
+        self.text_preview = Some(TextPreview {
+            path: path.clone(),
+            content: None,
+            show_source,
+            selection: None,
+            selecting: false,
+            scroll,
+            find,
+            folded: BTreeSet::new(),
+            gutter_hover: false,
+            _task: task,
+        });
+        cx.notify();
+    }
+
+    /// ⌘F in the preview: opens the find bar, or selects what's in it.
+    pub(crate) fn open_preview_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(preview) = &mut self.text_preview else { return };
+        if let Some(find) = &preview.find {
+            let input = find.input.clone();
+            input.update(cx, |input, cx| {
+                let len = input.text().len();
+                input.set_text(input.text().to_string(), 0..len, cx);
+            });
+            window.focus(&input.focus_handle(cx));
+            return;
+        }
+        let theme = self.theme.clone();
+        let input = cx.new(|cx| {
+            let mut input = TextInput::new(cx);
+            input.cursor_color = theme.accent;
+            input.selection_color = theme.accent.opacity(0.35);
+            input.placeholder_color = theme.text_muted;
+            input.emit_vertical = true;
+            input.set_placeholder("Find in file");
+            input
+        });
+        let subscriptions = vec![
+            cx.observe(&input, |this, _, cx| this.refresh_preview_find(cx)),
+            cx.subscribe_in(&input, window, |this, _, event, window, cx| match event {
+                TextInputEvent::Confirm | TextInputEvent::Down => this.step_preview_find(1, cx),
+                TextInputEvent::Up => this.step_preview_find(-1, cx),
+                TextInputEvent::Cancel => this.close_preview_find(window, cx),
+                TextInputEvent::Tab => {}
+            }),
+        ];
+        window.focus(&input.focus_handle(cx));
+        preview.find = Some(Find { input, matches: Vec::new(), capped: false, current: 0, _subscriptions: subscriptions });
+        cx.notify();
+    }
+
+    pub(crate) fn close_preview_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(preview) = &mut self.text_preview
+            && preview.find.take().is_some()
+        {
+            window.focus(&self.focus);
+            cx.notify();
+        }
+    }
+
+    /// The find field has the keyboard (so keys go to it, not to shortcuts).
+    pub(crate) fn preview_find_focused(&self, window: &Window, cx: &gpui::App) -> bool {
+        self.text_preview.as_ref().and_then(|p| p.find.as_ref()).is_some_and(|f| f.input.focus_handle(cx).is_focused(window))
+    }
+
+    /// Searches the text shown for what's in the find field, and scrolls to the first match.
+    fn refresh_preview_find(&mut self, cx: &mut Context<Self>) {
+        let Some(preview) = &mut self.text_preview else { return };
+        let Some(find) = &preview.find else { return };
+        let query = find.input.read(cx).text().to_string();
+        let (matches, capped) = match preview.shown() {
+            Some(shown) if !query.is_empty() => find_matches(&shown.lines, &query),
+            _ => (Vec::new(), false),
+        };
+        if let Some(&(line, _)) = matches.first() {
+            let row = preview.reveal(line);
+            preview.scroll.scroll_to_item(row, ScrollStrategy::Center);
+        }
+        if let Some(find) = &mut preview.find {
+            (find.matches, find.capped, find.current) = (matches, capped, 0);
+        }
+        cx.notify();
+    }
+
+    /// The next (`1`) or previous (`-1`) match, wrapping around.
+    pub(crate) fn step_preview_find(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(preview) = &mut self.text_preview else { return };
+        let Some(find) = &mut preview.find else { return };
+        if find.matches.is_empty() {
+            return;
+        }
+        let n = find.matches.len() as isize;
+        find.current = (find.current as isize + delta).rem_euclid(n) as usize;
+        let line = find.matches[find.current].0;
+        let row = preview.reveal(line);
+        preview.scroll.scroll_to_item(row, ScrollStrategy::Center);
         cx.notify();
     }
 
@@ -169,7 +361,9 @@ impl Browser {
         }
         preview.show_source = !preview.show_source;
         preview.selection = None;
+        preview.folded.clear();
         preview.scroll = UniformListScrollHandle::new();
+        self.refresh_preview_find(cx);
         cx.notify();
     }
 
@@ -195,6 +389,11 @@ impl Browser {
 
     fn preview_mouse_move(&mut self, ix: usize, layout: &TextLayout, event: &MouseMoveEvent, cx: &mut Context<Self>) {
         let Some(preview) = &mut self.text_preview else { return };
+        let in_gutter = event.position.x < layout.bounds().left();
+        if preview.gutter_hover != in_gutter {
+            preview.gutter_hover = in_gutter;
+            cx.notify();
+        }
         if !preview.selecting {
             return;
         }
@@ -274,8 +473,10 @@ impl Browser {
             .text_color(theme.text_muted)
             .hover(|s| s.bg(theme.hover))
             .tooltip(crate::render::tooltip("Close (Space or Esc)"))
-            .on_click(cx.listener(|this, _, _, cx| {
+            .on_click(cx.listener(|this, _, window, cx| {
                 this.text_preview = None;
+                // The find field may have had the keyboard.
+                window.focus(&this.focus);
                 cx.notify();
             }))
             .child(match close_icon {
@@ -297,30 +498,144 @@ impl Browser {
             .child(div().flex_1().text_color(theme.text_muted).text_size(px(font_size - 1.)).child(subtitle))
             .children(toggle);
 
+        let find_bar = preview.find.as_ref().map(|find| {
+            let count = match (find.matches.len(), find.capped) {
+                (0, _) if find.input.read(cx).text().is_empty() => String::new(),
+                (0, _) => "No matches".to_string(),
+                (n, true) => format!("{} of {}+", find.current + 1, findest_core::info::group_digits(n as u64)),
+                (n, false) => format!("{} of {}", find.current + 1, findest_core::info::group_digits(n as u64)),
+            };
+            let button = |id: &'static str, label: &'static str, tip: &'static str, delta: isize| {
+                div()
+                    .id(id)
+                    .px_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_color(theme.text_muted)
+                    .hover(|s| s.bg(theme.hover))
+                    .tooltip(crate::render::tooltip(tip))
+                    .on_click(cx.listener(move |this, _, _, cx| this.step_preview_find(delta, cx)))
+                    .child(label)
+            };
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_1()
+                .border_b_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .px_2()
+                        .py(px(2.))
+                        .rounded_md()
+                        .border_1()
+                        .border_color(theme.accent)
+                        .bg(theme.background)
+                        .child(find.input.clone()),
+                )
+                .child(div().flex_none().text_size(px(font_size - 1.)).text_color(theme.text_muted).child(count))
+                .child(button("text-preview-find-prev", "↑", "Previous match (⌘⇧G or ↑)", -1))
+                .child(button("text-preview-find-next", "↓", "Next match (⌘G, Enter or ↓)", 1))
+                .child(
+                    div()
+                        .id("text-preview-find-close")
+                        .px_2()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_color(theme.text_muted)
+                        .hover(|s| s.bg(theme.hover))
+                        .tooltip(crate::render::tooltip("Close the find bar (Esc)"))
+                        .on_click(cx.listener(|this, _, window, cx| this.close_preview_find(window, cx)))
+                        .child("✕"),
+                )
+        });
+
         let gutter = theme.text_muted;
-        let selected_bg = theme.selection.opacity(0.4);
+        let marks = Marks {
+            selected: theme.selection.opacity(0.4),
+            found: hsla(0.12, 0.95, 0.55, 0.3),
+            current: hsla(0.12, 0.95, 0.55, 0.75),
+        };
         let body = match &preview.content {
             None => div().p_4().text_color(theme.text_muted).child("Reading…").into_any_element(),
             Some(Err(message)) => div().p_4().text_color(theme.danger).child(message.clone()).into_any_element(),
             Some(Ok(_)) => {
                 let text = Arc::new(preview.shown().expect("read").clone());
                 let digits = text.lines.len().max(1).to_string().len();
-                let gutter_width = digits as f32 * font_size * 0.62 + 16.;
+                let gutter_width = digits as f32 * font_size * 0.62 + 8.;
+                let rows = preview.rows().map(Arc::new);
+                let count = rows.as_ref().map_or(text.lines.len(), |r| r.len());
                 // Long lines scroll sideways; the longest one sets the width.
-                let widest = text.lines.iter().enumerate().max_by_key(|(_, l)| l.text.chars().count()).map(|(ix, _)| ix);
+                let widest = (0..count)
+                    .max_by_key(|&row| text.lines[rows.as_ref().map_or(row, |r| r[row])].text.chars().count());
+                let fold_color = theme.text_muted;
+                let badge_bg = theme.hover;
                 uniform_list(
                     "text-preview-lines",
-                    text.lines.len(),
+                    count,
                     cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
-                        let selection = this.text_preview.as_ref().and_then(|p| p.selection);
+                        let Some(preview) = this.text_preview.as_ref() else { return Vec::new() };
+                        let selection = preview.selection;
+                        let find = preview.find.as_ref();
                         range
-                            .map(|ix| {
+                            .map(|row| {
+                                let ix = rows.as_ref().map_or(row, |r| r[row]);
                                 let line = &text.lines[ix];
                                 let selected = selection.and_then(|s| s.in_line(ix, line.text.len()));
+                                let found = find.map(|f| matches_in_line(&f.matches, f.current, ix)).unwrap_or_default();
                                 let styled = StyledText::new(line.text.clone())
-                                    .with_highlights(highlight_runs(&line.spans, selected, selected_bg));
+                                    .with_highlights(highlight_runs(&line.spans, selected, &found, &marks));
                                 let layout = styled.layout().clone();
                                 let move_layout = layout.clone();
+                                let folded = preview.folded.contains(&ix);
+                                let chevron = preview.fold_at(ix).map(|_| {
+                                    div()
+                                        .id(("fold", ix))
+                                        .size_full()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .when(!folded && !preview.gutter_hover, |d| d.invisible())
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                                cx.stop_propagation();
+                                                if let Some(preview) = &mut this.text_preview {
+                                                    preview.toggle_fold(ix);
+                                                    cx.notify();
+                                                }
+                                            }),
+                                        )
+                                        .child(if folded { "▸" } else { "▾" })
+                                });
+                                let badge = folded.then(|| {
+                                    div()
+                                        .id(("folded", ix))
+                                        .flex_none()
+                                        .ml_2()
+                                        .px_1()
+                                        .rounded_sm()
+                                        .bg(badge_bg)
+                                        .text_color(fold_color)
+                                        .cursor_pointer()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                                cx.stop_propagation();
+                                                if let Some(preview) = &mut this.text_preview {
+                                                    preview.toggle_fold(ix);
+                                                    cx.notify();
+                                                }
+                                            }),
+                                        )
+                                        .child("⋯")
+                                });
                                 div()
                                     .id(ix)
                                     .h(px(line_height))
@@ -341,13 +656,21 @@ impl Browser {
                                         div()
                                             .w(px(gutter_width))
                                             .flex_none()
-                                            .pr_3()
                                             .flex()
                                             .justify_end()
                                             .text_color(gutter)
                                             .child((ix + 1).to_string()),
                                     )
+                                    .child(
+                                        div()
+                                            .w(px(font_size * 1.4))
+                                            .flex_none()
+                                            .mr_1()
+                                            .text_color(fold_color)
+                                            .children(chevron),
+                                    )
                                     .child(styled)
+                                    .children(badge)
                                     .into_any_element()
                             })
                             .collect::<Vec<_>>()
@@ -380,6 +703,7 @@ impl Browser {
                 .shadow_lg()
                 .overflow_hidden()
                 .child(header)
+                .children(find_bar)
                 .when(!notes.is_empty(), |d| {
                     d.child(
                         div()
@@ -392,14 +716,44 @@ impl Browser {
                             .child(notes.join(" · ")),
                     )
                 })
-                .child(div().flex_1().min_h_0().font_family("Menlo").text_size(px(font_size - 1.)).child(body)),
+                .child(
+                    div()
+                        .id("text-preview-body")
+                        .flex_1()
+                        .min_h_0()
+                        .font_family("Menlo")
+                        .text_size(px(font_size - 1.))
+                        .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                            if let Some(preview) = &mut this.text_preview
+                                && !hovered
+                                && preview.gutter_hover
+                            {
+                                preview.gutter_hover = false;
+                                cx.notify();
+                            }
+                        }))
+                        .child(body),
+                ),
         )
     }
 }
 
-/// Colors and selection for one line, as the non-overlapping runs
-/// `StyledText` takes: the spans are cut where the selection starts and ends.
-fn highlight_runs(spans: &[Span], selected: Option<std::ops::Range<usize>>, selected_bg: Hsla) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
+/// Backgrounds for selected text and find matches.
+struct Marks {
+    selected: Hsla,
+    found: Hsla,
+    /// The match scrolled to.
+    current: Hsla,
+}
+
+/// Colors, selection and find matches for one line, as the non-overlapping
+/// runs `StyledText` takes: the spans are cut wherever a mark starts or ends.
+fn highlight_runs(
+    spans: &[Span],
+    selected: Option<Range<usize>>,
+    found: &[(Range<usize>, bool)],
+    marks: &Marks,
+) -> Vec<(Range<usize>, HighlightStyle)> {
     let style = |span: &Span| {
         let [r, g, b] = span.rgb;
         HighlightStyle {
@@ -409,25 +763,35 @@ fn highlight_runs(spans: &[Span], selected: Option<std::ops::Range<usize>>, sele
             ..Default::default()
         }
     };
-    let Some(sel) = selected else {
+    if selected.is_none() && found.is_empty() {
         return spans.iter().map(|s| (s.range.clone(), style(s))).collect();
-    };
-    let mut cuts: Vec<usize> = spans.iter().flat_map(|s| [s.range.start, s.range.end]).chain([sel.start, sel.end]).collect();
+    }
+    let within = |piece: &Range<usize>, r: &Range<usize>| r.start <= piece.start && piece.end <= r.end;
+    let mut cuts: Vec<usize> = spans
+        .iter()
+        .map(|s| &s.range)
+        .chain(selected.iter())
+        .chain(found.iter().map(|(r, _)| r))
+        .flat_map(|r| [r.start, r.end])
+        .collect();
     cuts.sort_unstable();
     cuts.dedup();
     cuts.windows(2)
         .filter_map(|w| {
             let piece = w[0]..w[1];
-            let inside = sel.start <= piece.start && piece.end <= sel.end;
-            let span = spans.iter().find(|s| s.range.start <= piece.start && piece.end <= s.range.end);
+            // The selection shows over matches, the current match over the others.
+            let background = if selected.as_ref().is_some_and(|r| within(&piece, r)) {
+                Some(marks.selected)
+            } else {
+                found.iter().find(|(r, _)| within(&piece, r)).map(|(_, current)| if *current { marks.current } else { marks.found })
+            };
+            let span = spans.iter().find(|s| within(&piece, &s.range));
             let mut style = match span {
                 Some(span) => style(span),
-                None if inside => HighlightStyle::default(),
+                None if background.is_some() => HighlightStyle::default(),
                 None => return None,
             };
-            if inside {
-                style.background_color = Some(selected_bg);
-            }
+            style.background_color = background;
             Some((piece, style))
         })
         .collect()
@@ -435,10 +799,19 @@ fn highlight_runs(spans: &[Span], selected: Option<std::ops::Range<usize>>, sele
 
 /// The byte of `line` nearest to `position` (a window position).
 fn byte_at(layout: &TextLayout, position: gpui::Point<gpui::Pixels>, line: &str) -> usize {
-    let byte = match layout.index_for_position(position) {
+    // Rows don't wrap, so only x matters; gpui reads a row's bottom edge as
+    // the start of the line, so ask at mid-height.
+    let y = layout.bounds().top() + layout.line_height() / 2.;
+    let byte = match layout.index_for_position(gpui::point(position.x, y)) {
         Ok(ix) | Err(ix) => ix.min(line.len()),
     };
-    (0..=byte).rev().find(|&b| line.is_char_boundary(b)).unwrap_or(0)
+    let byte = (0..=byte).rev().find(|&b| line.is_char_boundary(b)).unwrap_or(0);
+    // That's the character under the pointer; the caret goes on its nearer side.
+    let Some(next) = line[byte..].chars().next().map(|c| byte + c.len_utf8()) else { return byte };
+    match (layout.position_for_index(byte), layout.position_for_index(next)) {
+        (Some(start), Some(end)) if position.x - start.x > end.x - position.x => next,
+        _ => byte,
+    }
 }
 
 /// The word at `byte` (letters, digits and `_`), or the one character there.
@@ -486,16 +859,43 @@ mod tests {
         assert_eq!(down.in_line(3, 5), None);
     }
 
+    fn marks() -> Marks {
+        Marks { selected: hsla(0., 0., 0., 1.), found: hsla(0.1, 0., 0., 1.), current: hsla(0.2, 0., 0., 1.) }
+    }
+
     #[test]
     fn cuts_runs_at_the_selection() {
-        let bg = Hsla::default();
-        let runs = highlight_runs(&[span(0..4), span(6..10)], Some(2..8), bg);
+        let runs = highlight_runs(&[span(0..4), span(6..10)], Some(2..8), &[], &marks());
         let ranges: Vec<_> = runs.iter().map(|(r, s)| (r.clone(), s.background_color.is_some(), s.color.is_some())).collect();
         assert_eq!(
             ranges,
             [(0..2, false, true), (2..4, true, true), (4..6, true, false), (6..8, true, true), (8..10, false, true)]
         );
-        assert_eq!(highlight_runs(&[span(0..4)], None, bg).len(), 1);
+        assert_eq!(highlight_runs(&[span(0..4)], None, &[], &marks()).len(), 1);
+    }
+
+    #[test]
+    fn marks_matches_under_the_selection() {
+        let m = marks();
+        let runs = highlight_runs(&[span(0..10)], Some(0..2), &[(1..3, false), (5..7, true)], &m);
+        let backgrounds: Vec<_> = runs.iter().map(|(r, s)| (r.clone(), s.background_color)).collect();
+        assert_eq!(
+            backgrounds,
+            [(0..1, Some(m.selected)), (1..2, Some(m.selected)), (2..3, Some(m.found)), (3..5, None), (5..7, Some(m.current)), (7..10, None)]
+        );
+        let bare = highlight_runs(&[], None, &[(2..4, false)], &m);
+        assert_eq!(bare.iter().map(|(r, _)| r.clone()).collect::<Vec<_>>(), [2..4], "matches in uncolored text");
+    }
+
+    #[test]
+    fn finds_text_ignoring_case() {
+        let lines = [line("Hello hello", vec![]), line("nothing", vec![]), line("ÉCOLE école", vec![])];
+        assert_eq!(find_matches(&lines, "hello").0, [(0, 0..5), (0, 6..11)]);
+        assert_eq!(find_matches(&lines, "école").0, [(2, 0..6), (2, 7..13)], "non-ASCII, by byte");
+        assert_eq!(find_matches(&lines, "a.b").0, [], "taken literally");
+        let (matches, _) = find_matches(&lines, "hello");
+        assert_eq!(matches_in_line(&matches, 1, 0), [(0..5, false), (6..11, true)]);
+        assert_eq!(matches_in_line(&matches, 1, 1), []);
     }
 
     #[test]

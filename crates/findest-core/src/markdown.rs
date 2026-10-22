@@ -57,6 +57,8 @@ struct Writer {
     italic: usize,
     muted: usize,
     heading: Option<HeadingLevel>,
+    /// Lines that are headings, with their level.
+    headings: Vec<(usize, u8)>,
     links: Vec<String>,
     /// Counters of the open lists (`None`: bulleted).
     lists: Vec<Option<u64>>,
@@ -84,6 +86,7 @@ pub fn render(text: &str, dark: bool) -> Highlighted {
         italic: 0,
         muted: 0,
         heading: None,
+        headings: Vec::new(),
         links: Vec::new(),
         lists: Vec::new(),
         code: None,
@@ -93,7 +96,8 @@ pub fn render(text: &str, dark: bool) -> Highlighted {
         w.event(event);
     }
     w.end_line();
-    Highlighted { lines: w.lines, syntax: "Markdown".into(), notes: Vec::new() }
+    let folds = crate::folds::by_headings(&w.headings, &w.lines);
+    Highlighted { lines: w.lines, syntax: "Markdown".into(), notes: Vec::new(), folds }
 }
 
 fn empty_line() -> Line {
@@ -219,6 +223,9 @@ impl Writer {
             }
             TagEnd::Heading(level) => {
                 self.heading = None;
+                if self.started {
+                    self.headings.push((self.lines.len(), level as u8));
+                }
                 let width = self.line.text.chars().count();
                 self.end_line();
                 // Underlined like setext headings, to tell the levels apart.
