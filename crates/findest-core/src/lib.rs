@@ -2,6 +2,7 @@
 //! configuration, recents and external launchers. No UI code lives here.
 
 pub mod config;
+pub mod folds;
 pub mod fsevents;
 pub mod highlight;
 pub mod info;

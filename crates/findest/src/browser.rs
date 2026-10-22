@@ -941,7 +941,7 @@ impl Browser {
     /// Handles printable keys not claimed by a keybinding: jump-to-name.
     pub fn on_key_down(&mut self, event: &gpui::KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let m = event.keystroke.modifiers;
-        if self.edit.is_some() || self.search_focused(window, cx) || m.platform || m.control || m.alt || m.function {
+        if self.edit.is_some() || self.search_focused(window, cx) || self.preview_find_focused(window, cx) || m.platform || m.control || m.alt || m.function {
             return;
         }
         if let Some(ch) = event.keystroke.key_char.as_deref()
@@ -973,7 +973,15 @@ impl Browser {
             cx.propagate();
             return;
         }
-        match action.command.parse::<Command>() {
+        let command = action.command.parse::<Command>();
+        // The preview's find field keeps everything but ⌘G / ⌘⇧G and ⌘F.
+        if self.preview_find_focused(window, cx)
+            && !matches!(command, Ok(Command::FindNext | Command::FindPrevious | Command::Find))
+        {
+            cx.propagate();
+            return;
+        }
+        match command {
             Ok(command) => self.run(command, window, cx),
             Err(e) => self.set_error(e, cx),
         }
@@ -988,6 +996,9 @@ impl Browser {
             match command {
                 Copy => return self.copy_preview_text(cx),
                 SelectAll => return self.select_all_preview_text(cx),
+                Find => return self.open_preview_find(window, cx),
+                FindNext => return self.step_preview_find(1, cx),
+                FindPrevious => return self.step_preview_find(-1, cx),
                 _ => {}
             }
         }
@@ -1087,6 +1098,8 @@ impl Browser {
                 }
             }
             TogglePreviewSource => self.toggle_preview_source(cx),
+            // Only the preview's find bar has matches to step through.
+            FindNext | FindPrevious => {}
             QuickLook => {
                 if !self.toggle_text_preview(cx) {
                     let selection = self.selection();

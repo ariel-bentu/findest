@@ -52,6 +52,8 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str)] = &[
     ("space", "quick_look"),
     ("cmd-y", "quick_look"),
     ("cmd-shift-m", "toggle_preview_source"),
+    ("cmd-g", "find_next"),
+    ("cmd-shift-g", "find_previous"),
     ("cmd-1", "view_list"),
     ("cmd-2", "view_tiles"),
     ("cmd-=", "zoom_in"),
