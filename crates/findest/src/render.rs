@@ -11,7 +11,7 @@ use findest_core::paths::contract_tilde;
 use findest_core::config::ViewMode;
 use gpui::{
     Animation, AnimationExt, AnyElement, Bounds, Context, DispatchPhase, ElementId, ExternalPaths, FontWeight, Hsla, Image, MouseButton, MouseDownEvent,
-    CursorStyle, ListHorizontalSizingBehavior, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Point, SharedString, Window, anchored, canvas, deferred, div, img,
+    CursorStyle, ListHorizontalSizingBehavior, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Point, SharedString, TextRun, Window, anchored, canvas, deferred, div, font, img,
     prelude::*, px, uniform_list,
 };
 
@@ -20,11 +20,12 @@ use crate::browser::{
 };
 use crate::command::BROWSER_CONTEXT;
 
-const SIDEBAR_WIDTH: f32 = 200.0;
-const INFO_PANEL_WIDTH: f32 = 270.0;
+const TOP_BAR_HEIGHT: f32 = 44.0;
 /// Images up to this size are previewed in the info panel.
 const MAX_PREVIEW_BYTES: u64 = 64 * 1024 * 1024;
-const TOP_BAR_HEIGHT: f32 = 44.0;
+/// Horizontal space consumed by the sidebar item's margins (mx_2 * 2), padding (px_2 * 2),
+/// icon width, and gap between icon and label — all at the default 16px rem.
+const SIDEBAR_ITEM_LABEL_OVERHEAD: f32 = 8. + 8. + 8. + 8. + 18. + 8.;
 /// Where the Name column starts in a row: list padding, row padding,
 /// disclosure triangle and icon (the header starts its Name label there too).
 const NAME_START: f32 = 4.0 + 8.0 + TREE_GUTTER + 22.0;
@@ -70,10 +71,10 @@ impl Render for Browser {
             self.start_name_new(window, cx);
         }
         if self.view == ViewMode::Tiles {
-            // The list's width is what the sidebar and info panel leave (both fixed).
-            let mut width = window.viewport_size().width - px(SIDEBAR_WIDTH + 1. + 8.);
+            // The list's width is what the sidebar and info panel leave (both resizable).
+            let mut width = window.viewport_size().width - px(self.sidebar_width + 1. + 8.);
             if self.config.general.info_panel {
-                width -= px(INFO_PANEL_WIDTH + 1.);
+                width -= px(self.info_panel_width + 1.);
             }
             self.tile_columns = ((width / px(self.tile_cell_width())).floor() as usize).max(1);
         }
@@ -99,7 +100,7 @@ impl Render for Browser {
             .text_color(theme.text)
             .text_size(px(theme.font_size))
             // The sidebar runs full height; toolbar and status bar belong to the file pane.
-            .child(self.render_sidebar(cx))
+            .child(self.render_sidebar(window, cx))
             .child(
                 div()
                     .flex()
@@ -719,11 +720,18 @@ impl Browser {
         let mut push_location = |id: String, symbol, label: String, path: PathBuf| {
             places.push(SidebarPlace { section: "Locations", id, symbol, label, path, favorite: None, signed_out: None });
         };
-        push_location("loc-root".into(), "internaldrive", "Macintosh HD".into(), PathBuf::from("/"));
-        for (ix, v) in self.volumes.iter().enumerate() {
-            push_location(format!("loc-{ix}"), "externaldrive", v.label.clone(), v.path.clone());
+        let locs = &self.config.locations;
+        if locs.macintosh_hd {
+            push_location("loc-root".into(), "internaldrive", "Macintosh HD".into(), PathBuf::from("/"));
         }
-        push_location("loc-trash".into(), "trash", "Trash".into(), self.trash_dir());
+        if locs.volumes {
+            for (ix, v) in self.volumes.iter().enumerate() {
+                push_location(format!("loc-{ix}"), "externaldrive", v.label.clone(), v.path.clone());
+            }
+        }
+        if locs.trash {
+            push_location("loc-trash".into(), "trash", "Trash".into(), self.trash_dir());
+        }
         places
     }
 
@@ -761,19 +769,69 @@ impl Browser {
         }
     }
 
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_sidebar(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = &self.theme;
+        let sidebar_width = self.sidebar_width;
+        let dragging = self.sidebar_drag.is_some();
+        let this = cx.entity().downgrade();
+        let this2 = this.clone();
         div()
-            .flex()
-            .flex_col()
-            .w(px(SIDEBAR_WIDTH))
+            .relative()
             .flex_none()
             .h_full()
-            .bg(theme.sidebar)
-            .border_r_1()
-            .border_color(theme.border)
-            .child(self.render_places(cx))
-            .children(self.render_sources_teaser(cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w(px(sidebar_width))
+                    .flex_none()
+                    .h_full()
+                    .bg(theme.sidebar)
+                    .border_r_1()
+                    .border_color(theme.border)
+                    .child(self.render_places(window, cx))
+                    .children(self.render_sources_teaser(cx)),
+            )
+            .child(
+                div()
+                    .id("sidebar-resize-handle")
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(sidebar_width - COLUMN_HANDLE / 2.))
+                    .w(px(COLUMN_HANDLE))
+                    .flex()
+                    .justify_center()
+                    .cursor(CursorStyle::ResizeLeftRight)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.start_sidebar_drag(e.position.x);
+                        }),
+                    )
+                    .child(div().w(px(1.)).my_1().bg(theme.border).when(dragging, |d| d.bg(theme.text_muted))),
+            )
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |_, (), window, _| {
+                        let moved = this.clone();
+                        window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Bubble && e.pressed_button == Some(MouseButton::Left) {
+                                moved.update(cx, |b, cx| b.drag_sidebar(e.position.x, cx)).ok();
+                            }
+                        });
+                        window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                            if phase == DispatchPhase::Bubble {
+                                this2.update(cx, |b, cx| b.end_sidebar_drag(cx)).ok();
+                            }
+                        });
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
     }
 
     /// At the bottom of the sidebar while no sources are configured: a pointer
@@ -814,19 +872,22 @@ impl Browser {
         )
     }
 
-    fn render_places(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_places(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut list = div().id("sidebar").flex().flex_col().flex_1().min_h_0().overflow_y_scroll().py_2();
 
-        list = list.child(self.sidebar_item(
-            "recents".into(),
-            "clock",
-            "Recents".into(),
-            self.location == Location::Recents,
-            cx.listener(|this, _: &MouseDownEvent, _, cx| this.navigate(Location::Recents, true, cx)),
-            None,
-            None,
-            cx,
-        ));
+        if self.config.general.show_recents {
+            list = list.child(self.sidebar_item(
+                "recents".into(),
+                "clock",
+                "Recents".into(),
+                self.location == Location::Recents,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| this.navigate(Location::Recents, true, cx)),
+                None,
+                None,
+                window,
+                cx,
+            ));
+        }
 
         let mut section = "";
         for place in self.sidebar_places() {
@@ -846,6 +907,7 @@ impl Browser {
                 }),
                 Some((path, place.favorite)),
                 place.signed_out.map(|id| self.render_sign_in_badge(id, cx)),
+                window,
                 cx,
             ));
         }
@@ -873,9 +935,30 @@ impl Browser {
         on_click: impl Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
         menu_target: Option<(PathBuf, Option<usize>)>,
         badge: Option<AnyElement>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = &self.theme;
+        let label_id = SharedString::from(format!("{id}-label"));
+
+        // Measure the label's natural text width to determine if it will be truncated.
+        let font_family = if theme.font_family.as_ref().is_some_and(|f| !f.is_empty()) {
+            SharedString::from(theme.font_family.as_ref().unwrap().clone())
+        } else {
+            ".SystemUIFont".into()
+        };
+        let text_run = TextRun {
+            len: label.len(),
+            font: font(font_family),
+            color: Hsla::default(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let shaped = window.text_system().shape_line(label.clone(), px(theme.font_size), &[text_run], None);
+        let available_width = px(self.sidebar_width - SIDEBAR_ITEM_LABEL_OVERHEAD);
+        let is_truncated = shaped.width > available_width;
+
         div()
             .id(id)
             .mx_2()
@@ -907,7 +990,15 @@ impl Browser {
                     },
                 ),
             )
-            .child(div().flex_1().min_w_0().truncate().child(label))
+            .child(
+                div()
+                    .id(label_id)
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .when(is_truncated, |d| d.tooltip(tooltip(label.clone())))
+                    .child(label),
+            )
             .children(badge)
     }
 
@@ -1484,13 +1575,57 @@ impl Browser {
         if !self.config.general.info_panel {
             return None;
         }
+        let dragging = self.info_panel_drag.is_some();
+        let theme = &self.theme;
+        let this = cx.entity().downgrade();
+        let this2 = this.clone();
         Some(
             div()
                 .relative()
                 .flex_none()
                 .h_full()
                 .child(self.render_info_contents()?)
-                .child(self.info_close_button(cx)),
+                .child(self.info_close_button(cx))
+                .child(
+                    div()
+                        .id("info-panel-resize-handle")
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(-COLUMN_HANDLE / 2.))
+                        .w(px(COLUMN_HANDLE))
+                        .flex()
+                        .justify_center()
+                        .cursor(CursorStyle::ResizeLeftRight)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.start_info_panel_drag(e.position.x);
+                            }),
+                        )
+                        .child(div().w(px(1.)).my_1().bg(theme.border).when(dragging, |d| d.bg(theme.text_muted))),
+                )
+                .child(
+                    canvas(
+                        |_, _, _| (),
+                        move |_, (), window, _| {
+                            let moved = this.clone();
+                            window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+                                if phase == DispatchPhase::Bubble && e.pressed_button == Some(MouseButton::Left) {
+                                    moved.update(cx, |b, cx| b.drag_info_panel(e.position.x, cx)).ok();
+                                }
+                            });
+                            window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                                if phase == DispatchPhase::Bubble {
+                                    this2.update(cx, |b, cx| b.end_info_panel_drag(cx)).ok();
+                                }
+                            });
+                        },
+                    )
+                    .absolute()
+                    .size_full(),
+                ),
         )
     }
 
@@ -1498,7 +1633,7 @@ impl Browser {
         let theme = &self.theme;
         let panel = div()
             .id("info-panel")
-            .w(px(INFO_PANEL_WIDTH))
+            .w(px(self.info_panel_width))
             .flex_none()
             .h_full()
             .overflow_y_scroll()

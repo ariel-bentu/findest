@@ -74,6 +74,7 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str)] = &[
 pub struct Config {
     pub general: General,
     pub appearance: Appearance,
+    pub locations: Locations,
     pub favorites: Vec<Favorite>,
     pub openers: Vec<Opener>,
     pub sources: Vec<crate::sources::Source>,
@@ -94,6 +95,7 @@ impl Default for Config {
         Self {
             general: General::default(),
             appearance: Appearance::default(),
+            locations: Locations::default(),
             favorites: vec![fav("~"), fav("~/Desktop"), fav("~/Documents"), fav("~/Downloads"), fav("/Applications")],
             openers: vec![
                 opener("VS Code", "Visual Studio Code", "{path}", OpenerTarget::Any),
@@ -104,6 +106,21 @@ impl Default for Config {
             keybinding_overrides: BTreeMap::new(),
             search: SearchConfig::default(),
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Locations {
+    pub macintosh_hd: bool,
+    /// All mounted external drives.
+    pub volumes: bool,
+    pub trash: bool,
+}
+
+impl Default for Locations {
+    fn default() -> Self {
+        Self { macintosh_hd: true, volumes: true, trash: true }
     }
 }
 
@@ -160,6 +177,7 @@ pub struct General {
     pub sort_ascending: bool,
     pub confirm_trash: bool,
     pub max_recents: usize,
+    pub show_recents: bool,
 }
 
 impl Default for General {
@@ -176,6 +194,7 @@ impl Default for General {
             sort_ascending: true,
             confirm_trash: false,
             max_recents: 50,
+            show_recents: true,
         }
     }
 }
@@ -213,6 +232,14 @@ pub struct Appearance {
     pub row_height: f32,
     pub font_family: String,
     pub colors: BTreeMap<String, String>,
+    /// Minimum width of the left sidebar in points (default 120).
+    pub sidebar_min_width: f32,
+    /// Maximum width of the left sidebar in points (default 400).
+    pub sidebar_max_width: f32,
+    /// Minimum width of the right info panel in points (default 180).
+    pub info_panel_min_width: f32,
+    /// Maximum width of the right info panel in points (default 500).
+    pub info_panel_max_width: f32,
 }
 
 impl Default for Appearance {
@@ -223,6 +250,10 @@ impl Default for Appearance {
             row_height: 26.0,
             font_family: String::new(),
             colors: BTreeMap::new(),
+            sidebar_min_width: 120.0,
+            sidebar_max_width: 400.0,
+            info_panel_min_width: 180.0,
+            info_panel_max_width: 500.0,
         }
     }
 }
@@ -374,6 +405,49 @@ mod tests {
         assert!(cfg.general.folders_first);
         // A missing top-level section falls back to the full default config.
         assert_eq!(cfg.openers.len(), 3);
+    }
+
+    #[test]
+    fn empty_favorites_hides_section() {
+        // Absent [[favorites]] → serde default = 5 items (expected)
+        let absent: Config = toml::from_str("[general]\nstart_path = \"~\"\n").unwrap();
+        assert_eq!(absent.favorites.len(), 5);
+        // Explicit empty array → 0 items, so sidebar can hide the group
+        let empty: Config = toml::from_str("favorites = []\n").unwrap();
+        assert_eq!(empty.favorites.len(), 0);
+    }
+
+    #[test]
+    fn locations_config_parses() {
+        let cfg: Config = toml::from_str("[locations]\nmacintosh_hd = false\n").unwrap();
+        assert!(!cfg.locations.macintosh_hd);
+        assert!(cfg.locations.volumes);
+        assert!(cfg.locations.trash);
+    }
+
+    #[test]
+    fn locations_after_favorites_parses() {
+        let toml = "
+[general]
+start_path = \"~\"
+
+[[favorites]]
+path = \"~\"
+
+[locations]
+macintosh_hd = false
+volumes = true
+trash = false
+
+[[openers]]
+name = \"VS Code\"
+command = [\"open\", \"-a\", \"Visual Studio Code\", \"{path}\"]
+for = \"any\"
+";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(!cfg.locations.macintosh_hd);
+        assert!(cfg.locations.volumes);
+        assert!(!cfg.locations.trash);
     }
 
     #[test]
