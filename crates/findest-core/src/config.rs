@@ -242,6 +242,24 @@ pub struct Appearance {
     pub info_panel_max_width: f32,
 }
 
+impl Appearance {
+    pub fn clamp_sidebar(&self, width: f32) -> f32 {
+        clamp_width(width, self.sidebar_min_width, self.sidebar_max_width)
+    }
+
+    pub fn clamp_info_panel(&self, width: f32) -> f32 {
+        clamp_width(width, self.info_panel_min_width, self.info_panel_max_width)
+    }
+}
+
+/// Like `f32::clamp`, but a config with min > max (or NaN) can't panic:
+/// max wins, and a bad width falls back to min.
+fn clamp_width(width: f32, min: f32, max: f32) -> f32 {
+    let max = if max.is_finite() { max.max(0.0) } else { f32::MAX };
+    let min = if min.is_finite() { min.clamp(0.0, max) } else { 0.0 };
+    if width.is_finite() { width.clamp(min, max) } else { min }
+}
+
 impl Default for Appearance {
     fn default() -> Self {
         Self {
@@ -415,6 +433,16 @@ mod tests {
         // Explicit empty array → 0 items, so sidebar can hide the group
         let empty: Config = toml::from_str("favorites = []\n").unwrap();
         assert_eq!(empty.favorites.len(), 0);
+    }
+
+    #[test]
+    fn panel_widths_clamp_without_panicking() {
+        let mut a = Appearance::default();
+        assert_eq!(a.clamp_sidebar(1000.0), 400.0);
+        a.sidebar_min_width = 500.0;
+        assert_eq!(a.clamp_sidebar(200.0), 400.0);
+        a.sidebar_max_width = f32::NAN;
+        assert_eq!(a.clamp_sidebar(f32::NAN), 500.0);
     }
 
     #[test]

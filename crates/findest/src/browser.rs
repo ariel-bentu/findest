@@ -449,10 +449,8 @@ impl Browser {
         let restore_info_panel = init.info_panel;
         let view = init.view.unwrap_or(config.general.view);
         let tile_size = init.tile_size.unwrap_or(config.general.tile_size).clamp(MIN_TILE, MAX_TILE);
-        let sidebar_width = init.sidebar_width.unwrap_or(DEFAULT_SIDEBAR_WIDTH)
-            .clamp(config.appearance.sidebar_min_width, config.appearance.sidebar_max_width);
-        let info_panel_width = init.info_panel_width.unwrap_or(DEFAULT_INFO_PANEL_WIDTH)
-            .clamp(config.appearance.info_panel_min_width, config.appearance.info_panel_max_width);
+        let sidebar_width = config.appearance.clamp_sidebar(init.sidebar_width.unwrap_or(DEFAULT_SIDEBAR_WIDTH));
+        let info_panel_width = config.appearance.clamp_info_panel(init.info_panel_width.unwrap_or(DEFAULT_INFO_PANEL_WIDTH));
         let start = init.start.unwrap_or_else(|| config.start_path());
 
         let me = cx.weak_entity();
@@ -1262,8 +1260,8 @@ impl Browser {
             }
             CloseWindow => window.remove_window(),
             ResetLayout => {
-                self.sidebar_width = DEFAULT_SIDEBAR_WIDTH;
-                self.info_panel_width = DEFAULT_INFO_PANEL_WIDTH;
+                self.sidebar_width = self.config.appearance.clamp_sidebar(DEFAULT_SIDEBAR_WIDTH);
+                self.info_panel_width = self.config.appearance.clamp_info_panel(DEFAULT_INFO_PANEL_WIDTH);
                 self.save_session(cx);
                 cx.notify();
             }
@@ -2626,8 +2624,7 @@ impl Browser {
 
     pub fn drag_sidebar(&mut self, x: Pixels, cx: &mut Context<Self>) {
         let Some(drag) = &self.sidebar_drag else { return };
-        let (min, max) = (self.config.appearance.sidebar_min_width, self.config.appearance.sidebar_max_width);
-        self.sidebar_width = (drag.start_width + f32::from(x - drag.start_x)).clamp(min, max);
+        self.sidebar_width = self.config.appearance.clamp_sidebar(drag.start_width + f32::from(x - drag.start_x));
         cx.notify();
     }
 
@@ -2643,9 +2640,8 @@ impl Browser {
 
     pub fn drag_info_panel(&mut self, x: Pixels, cx: &mut Context<Self>) {
         let Some(drag) = &self.info_panel_drag else { return };
-        let (min, max) = (self.config.appearance.info_panel_min_width, self.config.appearance.info_panel_max_width);
         // Dragging left increases the panel width (the handle is on the left edge of the panel).
-        self.info_panel_width = (drag.start_width - f32::from(x - drag.start_x)).clamp(min, max);
+        self.info_panel_width = self.config.appearance.clamp_info_panel(drag.start_width - f32::from(x - drag.start_x));
         cx.notify();
     }
 
