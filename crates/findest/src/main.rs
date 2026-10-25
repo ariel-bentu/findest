@@ -6,6 +6,7 @@ mod default_viewer;
 mod icons;
 mod install;
 mod native_drag;
+mod pdf;
 mod quick_look;
 mod render;
 mod search_service;

@@ -1019,8 +1019,8 @@ impl Browser {
         use Command::*;
         self.menu = None;
         self.syntax_help = None;
-        // The text preview takes copying and selecting while it's open.
-        if self.text_preview.is_some() {
+        // The text preview takes copying and selecting while it's open (a PDF's doesn't).
+        if self.text_preview.as_ref().is_some_and(|p| !p.is_pdf()) {
             match command {
                 Copy => return self.copy_preview_text(cx),
                 SelectAll => return self.select_all_preview_text(cx),

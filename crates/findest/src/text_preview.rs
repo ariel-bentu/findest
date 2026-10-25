@@ -3,9 +3,10 @@
 //! closes it, like Quick Look; ↑/↓ follow the selection. Markdown shows
 //! formatted, with its source a toggle away. Text can be selected with the
 //! mouse and copied (⌘A, ⌘C), and searched (⌘F, then ⌘G or Enter for the
-//! next match). Blocks fold from chevrons by the line numbers.
+//! next match). Blocks fold from chevrons by the line numbers. PDFs show
+//! their pages, drawn by macOS as they scroll into view.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,10 +14,10 @@ use std::sync::Arc;
 use findest_core::highlight::{self, Highlighted, Preview, Span};
 use gpui::{
     AppContext, ClipboardItem, Context, Entity, Focusable, FontStyle, FontWeight, HighlightStyle, Hsla,
-    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, Rgba,
+    InteractiveElement, IntoElement, ListAlignment, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, Rgba,
     ScrollStrategy, StatefulInteractiveElement, Styled, StyledImage, StyledText, Subscription, Task, TextLayout,
-    UniformListScrollHandle, Window, div, hsla, img, ListHorizontalSizingBehavior, prelude::FluentBuilder, px,
-    uniform_list,
+    RenderImage, UniformListScrollHandle, Window, div, hsla, img, list, ListHorizontalSizingBehavior, prelude::FluentBuilder,
+    px, uniform_list,
 };
 
 use crate::browser::Browser;
@@ -24,6 +25,8 @@ use crate::text_input::{TextInput, TextInputEvent};
 
 /// Matches counted at most; past this the count says "10,000+".
 const MAX_MATCHES: usize = 10_000;
+/// Drawn PDF pages kept; the ones shown longest ago go first.
+const MAX_PDF_IMAGES: usize = 16;
 
 pub struct TextPreview {
     pub path: PathBuf,
@@ -40,7 +43,28 @@ pub struct TextPreview {
     folded: BTreeSet<usize>,
     /// The mouse is over the line numbers (fold chevrons show then).
     gutter_hover: bool,
+    /// A PDF's pages, once its page sizes are read.
+    pdf: Option<PdfPages>,
     _task: Task<()>,
+}
+
+/// A PDF's pages, drawn as they scroll into view.
+struct PdfPages {
+    /// Each page's size in points.
+    sizes: Vec<(f32, f32)>,
+    list: ListState,
+    /// Drawn pages: page, pixel width and image, the one shown last at the end.
+    images: Vec<(usize, u32, Arc<RenderImage>)>,
+    /// Pages being drawn (or that couldn't be).
+    drawing: HashSet<usize>,
+}
+
+impl Drop for PdfPages {
+    fn drop(&mut self) {
+        for (_, _, image) in self.images.drain(..) {
+            crate::pdf::retire(image);
+        }
+    }
 }
 
 /// The find bar (⌘F) and what it found in the text shown.
@@ -131,6 +155,10 @@ impl Selection {
 }
 
 impl TextPreview {
+    pub fn is_pdf(&self) -> bool {
+        crate::pdf::is_pdf(&self.path)
+    }
+
     /// The text shown: Markdown formatted unless its source is asked for.
     fn shown(&self) -> Option<&Highlighted> {
         let preview = self.content.as_ref()?.as_ref().ok()?;
@@ -213,9 +241,34 @@ impl Browser {
     pub(crate) fn open_text_preview(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let dark = self.theme.background.l < 0.5;
         let file = path.clone();
-        let read = cx.background_executor().spawn(async move { highlight::preview_file(&file, dark) });
         let opened = path.clone();
-        let task = cx.spawn(async move |this, cx| {
+        let task = if crate::pdf::is_pdf(&path) {
+            let read = cx.background_executor().spawn(async move { crate::pdf::page_sizes(&file) });
+            cx.spawn(async move |this, cx| {
+                let path = opened;
+                let result = read.await;
+                this.update(cx, |this, cx| {
+                    let Some(preview) = this.text_preview.as_mut().filter(|p| p.path == path) else { return };
+                    match result {
+                        Ok(sizes) => {
+                            let list = ListState::new(sizes.len(), ListAlignment::Top, px(1000.));
+                            preview.pdf = Some(PdfPages { sizes, list, images: Vec::new(), drawing: HashSet::new() });
+                        }
+                        Err(e) => preview.content = Some(Err(format!("Can't show {}: {e}", findest_core::paths::display_name(&path)))),
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+        } else {
+            self.open_text_task(file, opened, dark, cx)
+        };
+        self.install_text_preview(path, task, cx);
+    }
+
+    fn open_text_task(&mut self, file: PathBuf, opened: PathBuf, dark: bool, cx: &mut Context<Self>) -> Task<()> {
+        let read = cx.background_executor().spawn(async move { highlight::preview_file(&file, dark) });
+        cx.spawn(async move |this, cx| {
             let path = opened;
             let result = read.await;
             this.update(cx, |this, cx| {
@@ -226,7 +279,10 @@ impl Browser {
                 }
             })
             .ok();
-        });
+        })
+    }
+
+    fn install_text_preview(&mut self, path: PathBuf, task: Task<()>, cx: &mut Context<Self>) {
         let scroll = UniformListScrollHandle::new();
         // Keep showing the source, and searching, while moving between files.
         let show_source = self.text_preview.as_ref().is_some_and(|p| p.show_source);
@@ -241,6 +297,7 @@ impl Browser {
             find,
             folded: BTreeSet::new(),
             gutter_hover: false,
+            pdf: None,
             _task: task,
         });
         cx.notify();
@@ -248,7 +305,7 @@ impl Browser {
 
     /// ⌘F in the preview: opens the find bar, or selects what's in it.
     pub(crate) fn open_preview_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(preview) = &mut self.text_preview else { return };
+        let Some(preview) = self.text_preview.as_mut().filter(|p| !p.is_pdf()) else { return };
         if let Some(find) = &preview.find {
             let input = find.input.clone();
             input.update(cx, |input, cx| {
@@ -411,6 +468,81 @@ impl Browser {
         }
     }
 
+    /// Page `ix` of the open PDF, drawn about `width` pixels wide if it has
+    /// been; asks for it if not (or if it was drawn at another size).
+    fn pdf_page(&mut self, ix: usize, width: u32, cx: &mut Context<Self>) -> Option<Arc<RenderImage>> {
+        let preview = self.text_preview.as_mut()?;
+        let path = preview.path.clone();
+        let pages = preview.pdf.as_mut()?;
+        let image = pages.images.iter().position(|(page, ..)| *page == ix).map(|pos| {
+            let entry = pages.images.remove(pos);
+            pages.images.push(entry.clone());
+            entry
+        });
+        let stale = image.as_ref().is_none_or(|(_, drawn, _)| drawn.abs_diff(width) * 10 > width);
+        if stale && pages.drawing.insert(ix) {
+            let file = path.clone();
+            let draw = cx.background_executor().spawn(async move { crate::pdf::render_page(&file, ix, width) });
+            cx.spawn(async move |this, cx| {
+                let image = draw.await;
+                this.update(cx, |this, cx| {
+                    let Some(pages) = this.text_preview.as_mut().filter(|p| p.path == path).and_then(|p| p.pdf.as_mut()) else { return };
+                    // A page that can't be drawn stays in `drawing`, so it isn't asked for again.
+                    let Some(image) = image else { return };
+                    pages.drawing.remove(&ix);
+                    if let Some(pos) = pages.images.iter().position(|(page, ..)| *page == ix) {
+                        crate::pdf::retire(pages.images.remove(pos).2);
+                    }
+                    pages.images.push((ix, width, Arc::new(image)));
+                    while pages.images.len() > MAX_PDF_IMAGES {
+                        crate::pdf::retire(pages.images.remove(0).2);
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+        image.map(|(_, _, image)| image)
+    }
+
+    fn render_pdf_pages(&self, pages: &PdfPages, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let sizes = Arc::new(pages.sizes.clone());
+        let last = sizes.len().saturating_sub(1);
+        let paper = gpui::white();
+        list(
+            pages.list.clone(),
+            cx.processor(move |this, ix: usize, window, cx| {
+                // The panel is inset 48pt from the window's sides; pages get its
+                // width less a margin, up to twice their own size.
+                let room = f32::from(window.viewport_size().width) - 2. * 48. - 2. - 32.;
+                let (pw, ph) = sizes[ix];
+                let width = room.min(pw * 2.).max(48.);
+                let height = width * ph / pw;
+                let pixels = (width * window.scale_factor()).round() as u32;
+                let image = this.pdf_page(ix, pixels, cx);
+                div()
+                    .w_full()
+                    .flex()
+                    .justify_center()
+                    .pt_4()
+                    .when(ix == last, |d| d.pb_4())
+                    .child(
+                        div()
+                            .w(px(width))
+                            .h(px(height))
+                            .flex_none()
+                            .bg(paper)
+                            .shadow_md()
+                            .children(image.map(|image| img(image).size_full())),
+                    )
+                    .into_any_element()
+            }),
+        )
+        .size_full()
+        .into_any_element()
+    }
+
     /// Keeps the open preview on the selection (called each frame). Moving to
     /// a file it doesn't handle hands over to Quick Look.
     pub(crate) fn follow_text_preview(&mut self, fetched: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -441,6 +573,9 @@ impl Browser {
         if let Some(text) = preview.shown() {
             subtitle = format!("{} · {} lines", text.syntax, text.lines.len());
             notes = text.notes.clone();
+        } else if let Some(pages) = &preview.pdf {
+            let n = pages.sizes.len();
+            subtitle = format!("PDF · {n} {}", if n == 1 { "page" } else { "pages" });
         }
         let toggle = preview.has_formatted().then(|| {
             let label = if preview.show_source { "Formatted" } else { "Source" };
@@ -562,6 +697,7 @@ impl Browser {
             current: hsla(0.12, 0.95, 0.55, 0.75),
         };
         let body = match &preview.content {
+            None if let Some(pages) = &preview.pdf => self.render_pdf_pages(pages, cx),
             None => div().p_4().text_color(theme.text_muted).child("Reading…").into_any_element(),
             Some(Err(message)) => div().p_4().text_color(theme.danger).child(message.clone()).into_any_element(),
             Some(Ok(_)) => {
@@ -828,9 +964,9 @@ fn word_at(line: &str, byte: usize) -> (usize, usize) {
     (start, end)
 }
 
-/// True if `path` gets Findest's text preview instead of Quick Look.
+/// True if `path` gets Findest's preview instead of Quick Look.
 pub fn handles(path: &Path) -> bool {
-    highlight::has_own_preview(path) && !path.is_dir()
+    (highlight::has_own_preview(path) || crate::pdf::is_pdf(path)) && !path.is_dir()
 }
 
 #[cfg(test)]

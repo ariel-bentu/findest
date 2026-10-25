@@ -39,6 +39,7 @@ const TREE_INDENT: f32 = 16.0;
 
 impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::pdf::drop_retired(window, cx);
         self.load_sidebar_icons(cx);
         self.sync_info(cx);
         let selection = self.selection();

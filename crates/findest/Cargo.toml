@@ -26,4 +26,6 @@ objc2-foundation.workspace = true
 objc2-app-kit.workspace = true
 objc2-uniform-type-identifiers.workspace = true
 objc2-quick-look-ui.workspace = true
+objc2-core-graphics.workspace = true
+objc2-core-foundation.workspace = true
 raw-window-handle.workspace = true

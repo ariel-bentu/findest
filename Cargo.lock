@@ -1725,6 +1725,8 @@ dependencies = [
  "notify",
  "objc2",
  "objc2-app-kit",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
  "objc2-foundation",
  "objc2-quick-look-ui",
  "objc2-uniform-type-identifiers",
