@@ -70,6 +70,8 @@ pub enum Command {
     MoveHere,
     CopyPath,
     ToggleHidden,
+    /// Folders before files, or mixed in with them by the sort.
+    ToggleFoldersFirst,
     ToggleInfo,
     /// Preview the selection in the Quick Look panel, or close it.
     QuickLook,
@@ -150,6 +152,7 @@ impl FromStr for Command {
             "move_here" => MoveHere,
             "copy_path" => CopyPath,
             "toggle_hidden" => ToggleHidden,
+            "toggle_folders_first" => ToggleFoldersFirst,
             "toggle_info" => ToggleInfo,
             "quick_look" => QuickLook,
             "toggle_preview_source" => TogglePreviewSource,

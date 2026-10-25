@@ -1240,6 +1240,13 @@ impl Browser {
                 self.config.general.show_hidden = !self.config.general.show_hidden;
                 self.reload(cx);
             }
+            ToggleFoldersFirst => {
+                self.config.general.folders_first = !self.config.general.folders_first;
+                if self.location != Location::Recents {
+                    self.reload(cx);
+                }
+                cx.notify();
+            }
             Refresh => {
                 if let Some(dir) = self.current_dir() {
                     sources::global().invalidate(&dir);
@@ -2267,6 +2274,8 @@ impl Browser {
             }
             let hidden = if self.config.general.show_hidden { "Hide Hidden Files" } else { "Show Hidden Files" };
             entries.push(self.item(hidden, ToggleHidden, "toggle_hidden"));
+            let folders = if self.config.general.folders_first { "Mix Folders with Files" } else { "Folders First" };
+            entries.push(self.item(folders, ToggleFoldersFirst, "toggle_folders_first"));
             entries.push(self.item("Refresh", Refresh, "refresh"));
             if self.current_dir() == Some(self.trash_dir()) {
                 entries.push(MenuEntry::Separator);

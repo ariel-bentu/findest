@@ -87,7 +87,7 @@ GPUI is built with `runtime_shaders`, so you don't need Xcode's separately downl
 On first launch Findest writes a commented config to `~/.config/findest/config.toml` (override it with `$FINDEST_CONFIG`).
 Changes apply as soon as you save the file. Open it with **⌘,**.
 
-- `[general]`: start folder, session restore, info panel, default view and tile size, hidden files, sort order, Trash confirmation, recents size
+- `[general]`: start folder, session restore, info panel, default view and tile size, hidden files, sort order and folders first (also View ▸ Folders First On/Off or the right-click menu), Trash confirmation, recents size
 - `[appearance]`: `dark` / `light` / `system` theme, font, row height, per-color overrides
 - `[[favorites]]`: sidebar folders (you can also add them from the app with ⌃⌘T)
 - `[[openers]]`: "Open in …" targets, e.g. VS Code and Terminal, with `{path}` / `{dir}` placeholders

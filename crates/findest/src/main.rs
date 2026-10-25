@@ -102,6 +102,7 @@ fn menus() -> Vec<Menu> {
                 item("Quick Look", "quick_look"),
                 item("Show/Hide Info Panel", "toggle_info"),
                 item("Show/Hide Hidden Files", "toggle_hidden"),
+                item("Folders First On/Off", "toggle_folders_first"),
                 item("Refresh", "refresh"),
             ],
         },
