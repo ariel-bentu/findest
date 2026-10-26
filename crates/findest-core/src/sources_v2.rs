@@ -148,15 +148,16 @@ impl V2Process {
         let Some((program, own_args)) = source.command.split_first() else {
             return Err(SourceError::Failed(format!("{}: no command configured", source.name)));
         };
-        let mut child = Command::new(crate::paths::expand_tilde(program))
-            .env("PATH", crate::sources::adapter_path())
-            .args(own_args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()
-            .map_err(|e| SourceError::Failed(format!("{}: can't run {program}: {e}", source.name)))?;
+        let mut child = crate::sources::spawn_adapter(
+            Command::new(crate::paths::expand_tilde(program))
+                .env("PATH", crate::sources::adapter_path())
+                .args(own_args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .process_group(0),
+        )
+        .map_err(|e| SourceError::Failed(format!("{}: can't run {program}: {e}", source.name)))?;
 
         let child_stdin = child.stdin.take().unwrap();
         let child_stdout = child.stdout.take().unwrap();

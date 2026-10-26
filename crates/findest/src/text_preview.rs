@@ -590,7 +590,11 @@ impl Browser {
                 .cursor_pointer()
                 .text_size(px(font_size - 1.))
                 .hover(|s| s.bg(theme.hover))
-                .tooltip(crate::render::tooltip("Show the formatted text or its source (⌘⇧M)"))
+                .tooltip(crate::render::tooltip(if cfg!(target_os = "macos") {
+                    "Show the formatted text or its source (⌘⇧M)"
+                } else {
+                    "Show the formatted text or its source (Ctrl+Shift+M)"
+                }))
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_preview_source(cx)))
                 .child(label)
         });
@@ -674,8 +678,18 @@ impl Browser {
                         .child(find.input.clone()),
                 )
                 .child(div().flex_none().text_size(px(font_size - 1.)).text_color(theme.text_muted).child(count))
-                .child(button("text-preview-find-prev", "↑", "Previous match (⌘⇧G or ↑)", -1))
-                .child(button("text-preview-find-next", "↓", "Next match (⌘G, Enter or ↓)", 1))
+                .child(button(
+                    "text-preview-find-prev",
+                    "↑",
+                    if cfg!(target_os = "macos") { "Previous match (⌘⇧G or ↑)" } else { "Previous match (Ctrl+Shift+G or ↑)" },
+                    -1,
+                ))
+                .child(button(
+                    "text-preview-find-next",
+                    "↓",
+                    if cfg!(target_os = "macos") { "Next match (⌘G, Enter or ↓)" } else { "Next match (Ctrl+G, Enter or ↓)" },
+                    1,
+                ))
                 .child(
                     div()
                         .id("text-preview-find-close")

@@ -2,14 +2,16 @@
 //! Preview uses). Safe to call from a background thread: each call opens
 //! the document itself.
 
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+#[cfg(target_os = "macos")]
+mod mac {
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
 
-use gpui::{App, RenderImage, Window};
-use objc2_core_foundation::{CFURL, CGPoint, CGRect, CGSize};
-use objc2_core_graphics::{
-    CGBitmapContextCreate, CGColorSpace, CGContext, CGImageAlphaInfo, CGImageByteOrderInfo, CGPDFBox, CGPDFDocument, CGPDFPage,
-};
+    use gpui::{App, RenderImage, Window};
+    use objc2_core_foundation::{CFURL, CGPoint, CGRect, CGSize};
+    use objc2_core_graphics::{
+        CGBitmapContextCreate, CGColorSpace, CGContext, CGImageAlphaInfo, CGImageByteOrderInfo, CGPDFBox, CGPDFDocument, CGPDFPage,
+    };
 
 /// Pages get at most this many pixels on their longer side.
 const MAX_PIXELS: f64 = 4096.0;
@@ -132,3 +134,34 @@ mod tests {
         assert!(page_sizes(&tmp.path().join("missing.pdf")).is_err());
     }
 }
+}
+
+#[cfg(target_os = "macos")]
+pub use mac::*;
+
+#[cfg(not(target_os = "macos"))]
+mod imp {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use gpui::{App, RenderImage, Window};
+
+    pub fn is_pdf(_path: &Path) -> bool {
+        false
+    }
+
+    pub fn page_sizes(_path: &Path) -> Result<Vec<(f32, f32)>, String> {
+        Err("PDF preview is only supported on macOS".into())
+    }
+
+    pub fn render_page(_path: &Path, _index: usize, _width: u32) -> Option<RenderImage> {
+        None
+    }
+
+    pub fn retire(_image: Arc<RenderImage>) {}
+
+    pub fn drop_retired(_window: &mut Window, _cx: &mut App) {}
+}
+
+#[cfg(not(target_os = "macos"))]
+pub use imp::*;

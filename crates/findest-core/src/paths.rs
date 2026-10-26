@@ -60,7 +60,7 @@ pub fn parse_user_path(text: &str) -> Option<PathBuf> {
     Some(expand_tilde(&unescaped))
 }
 
-/// Converts a `file://` URL (as macOS sends when opening documents) to a path.
+/// Converts a `file://` URL (as desktop environments send when opening documents) to a path.
 pub fn path_from_file_url(url: &str) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
     let rest = url.strip_prefix("file://")?;
