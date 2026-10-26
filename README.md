@@ -5,7 +5,7 @@ A fast, keyboard-friendly file browser for macOS and Linux, written in Rust on [
 ## Features
 
 - **List or tiles:** a tree list that expands folders in place, with resizable columns, or a tiles grid with image thumbnails and adjustable size (⌘1 / ⌘2, ⌘= / ⌘- on macOS; Ctrl+1 / Ctrl+2, Ctrl+= / Ctrl+- on Linux).
-- **Quick Look:** Space previews the selection in the macOS Quick Look panel (images, PDFs, text, video and anything else macOS can preview). On Linux, or for JSON, NDJSON, YAML, TOML and other config files, Findest opens its own syntax-highlighted viewer, and Markdown shows formatted there (⌘⇧M / Ctrl+Shift+M or the Source button for the source). PDFs show there too on macOS, drawn page by page as you scroll. Select text with the mouse (double-click a word, triple-click a line, ⌘A / Ctrl+A) and copy it with ⌘C / Ctrl+C. ⌘F / Ctrl+F finds text in the file (⌘G / ⌘⇧G on macOS, Ctrl+G / Ctrl+Shift+G on Linux, or Enter / ↑↓ for the next and previous match). Nested blocks and Markdown sections fold: hover the line numbers and click a chevron. ↑/↓ move through files while it's open.
+- **Quick Look:** Space previews the selection in the macOS Quick Look panel (images, PDFs, text, video and anything else macOS can preview). On Linux, or for JSON, NDJSON, YAML, TOML and other config files, Findest opens its own syntax-highlighted viewer (handling text, source code, Markdown, images, and PDFs via `pdfinfo`/`pdftoppm`, and delegating other files to `gnome-sushi` over D-Bus when installed), and Markdown shows formatted there (⌘⇧M / Ctrl+Shift+M or the Source button for the source). PDFs show there too on macOS, drawn page by page as you scroll. Select text with the mouse (double-click a word, triple-click a line, ⌘A / Ctrl+A) and copy it with ⌘C / Ctrl+C. ⌘F / Ctrl+F finds text in the file (⌘G / ⌘⇧G on macOS, Ctrl+G / Ctrl+Shift+G on Linux, or Enter / ↑↓ for the next and previous match). Nested blocks and Markdown sections fold: hover the line numbers and click a chevron. ↑/↓ move through files while it's open.
 - **Info panel (⌘I / Ctrl+I):** a preview plus size (folder totals computed in the background), dates, dimensions, location and permissions.
 - **Fast search (⌘F / Ctrl+F):** an in-memory index of file names with a query language (wildcards, `ext:`, `size:`, `dm:`, `content:`, regex…), or **Live** search straight from the disk. See [Search](#search-f--ctrlf).
 - **Type to jump:** start typing a name to select it; repeat a letter to cycle through matches.
@@ -13,13 +13,13 @@ A fast, keyboard-friendly file browser for macOS and Linux, written in Rust on [
 - **Undo (⌘Z / Ctrl+Z)** for the last paste, drop, duplicate, compress or uncompress.
 - **Drag and drop** between Findest windows, Finder/file managers and other apps (on macOS), with auto-scroll near the list's edges.
 - **Compress and uncompress** zip files; opening a .zip unpacks it next to it, in Findest.
-- **Folder colors (macOS):** right-click folders to pick a color. They're Finder's color tags, so Finder and Spotlight see them too.
-- **Sidebar:** Recents, Favorites, cloud drives (iCloud Drive on macOS; Dropbox, OneDrive, Google Drive on Linux), system disk (Macintosh HD / Filesystem), external volumes and the Trash.
+- **Folder colors:** right-click folders to pick a color. On macOS they're Finder's color tags, so Finder and Spotlight see them too; on Linux they're stored in `user.findest.color` extended attributes.
+- **Sidebar:** Recents, Favorites, cloud drives (iCloud Drive on macOS; Dropbox, OneDrive, Google Drive, Nextcloud, Proton Drive, pCloud, MEGA, Insync, Syncthing, ownCloud, Box, Keybase and GVFS cloud mounts on Linux), system disk (Macintosh HD / Filesystem), external volumes and the Trash.
 - **Toolbar and path bar:** back/forward with history, the current folder's name (click for the folders above), a Go to bar that accepts pasted paths and completes them with Tab, a ⋯ menu of folder actions, and a clickable path bar at the bottom.
 - **Multiple windows (⌘N / Ctrl+N)**, each restored at launch with its folder, expanded folders, view and column widths.
 - **New folders and files start unnamed:** type a name, or press Esc to remove the item.
 - **Open in…:** VS Code, Terminal or any app you configure, from the menu or a shortcut.
-- **Default file viewer (macOS):** "Show in Finder" in other apps can open Findest instead (see [Install](#install)).
+- **Default file viewer:** "Show in Finder" / "Show in File Manager" in other apps can open Findest instead (see [Install](#install)).
 - **Sources:** browse things that aren't on disk (cloud resources, buckets, wikis) as folders, through a small program you plug in, e.g. a Kubernetes cluster. See [Sources](docs/sources.md).
 - **Configurable:** theme, colors, fonts, favorites and every shortcut, in a commented TOML file that applies as soon as you save it.
 

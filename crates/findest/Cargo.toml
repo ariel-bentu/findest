@@ -33,5 +33,5 @@ objc2-core-foundation.workspace = true
 raw-window-handle.workspace = true
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-image.workspace = true
+image = { workspace = true, features = ["bmp", "gif", "ico", "jpeg", "tiff", "webp"] }
 libc.workspace = true

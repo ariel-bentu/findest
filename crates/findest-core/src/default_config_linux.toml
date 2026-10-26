@@ -81,8 +81,21 @@ name = "File Manager"
 command = ["xdg-open", "{dir}"]
 for = "any"
 
+# Sources: folders and files listed by a program you provide (an adapter),
+# shown in the sidebar and browsed like folders (read-only). Findest runs
+# `command` plus a verb (`list`, `read`, `login`). How to write an adapter:
+# https://github.com/ariel-bentu/findest/blob/main/docs/sources.md
+# [[sources]]
+# id = "urm-canary"
+# name = "URM canary"
+# command = ["~/claude/findest-sources/uctl-source", "--server", "https://canary.resource.api.sap"]
+# root = "/sap/my-org"
+
 # Search (Ctrl+F). Findest keeps an index of file names for instant results.
 [search]
+# Keep a search index. Set to false to turn search indexing off (search then
+# has nothing to search).
+indexing = true
 # Folders searched by "Everywhere".
 roots = ["~"]
 # Paths to skip, or "**/name" to skip a folder name anywhere.

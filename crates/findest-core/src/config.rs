@@ -9,7 +9,7 @@ use crate::listing::{SortKey, SortOrder};
 use crate::paths::expand_tilde;
 
 #[cfg(target_os = "macos")]
-pub const DEFAULT_CONFIG: &str = include_str!("default_config_macos.toml");
+pub const DEFAULT_CONFIG: &str = include_str!("default_config.toml");
 #[cfg(not(target_os = "macos"))]
 pub const DEFAULT_CONFIG: &str = include_str!("default_config_linux.toml");
 
@@ -41,6 +41,7 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str)] = &[
     ("secondary-d", "duplicate"),
     ("secondary-backspace", "trash"),
     ("backspace", "trash_confirm"),
+    ("shift-backspace", "trash_now"),
     ("secondary-alt-backspace", "delete_permanently"),
     ("secondary-shift-backspace", "empty_trash"),
     ("secondary-c", "copy"),
@@ -62,6 +63,9 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str)] = &[
     ("secondary-=", "zoom_in"),
     ("secondary--", "zoom_out"),
     ("secondary-r", "refresh"),
+    #[cfg(target_os = "macos")]
+    ("ctrl-cmd-t", "add_favorite"),
+    #[cfg(not(target_os = "macos"))]
     ("secondary-shift-t", "add_favorite"),
     ("secondary-shift-r", "show_recents"),
     ("secondary-alt-r", "reveal_in_finder"),
@@ -398,10 +402,15 @@ impl Config {
     }
 
     /// Default keybindings merged with user overrides; "none" removes a binding.
+    /// Treats `cmd-` and `secondary-` as equivalent so existing `cmd-*` user
+    /// overrides continue to match `secondary-*` defaults.
     pub fn keybindings(&self) -> BTreeMap<String, String> {
         let mut map: BTreeMap<String, String> =
             DEFAULT_KEYBINDINGS.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         for (key, command) in &self.keybinding_overrides {
+            if let Some(alt) = alternate_secondary_cmd(key) {
+                map.remove(&alt);
+            }
             if command == "none" {
                 map.remove(key);
             } else {
@@ -441,6 +450,28 @@ impl Config {
         doc.insert("favorites", toml_edit::Item::ArrayOfTables(array));
         fs::write(path, doc.to_string()).with_context(|| format!("writing {}", path.display()))
     }
+}
+
+fn alternate_secondary_cmd(key: &str) -> Option<String> {
+    let parts: Vec<&str> = key.split('-').collect();
+    let (last, mods) = match parts.split_last()? {
+        // "cmd--" style bindings for the minus key end with an empty part.
+        (&"", rest) if !rest.is_empty() => ("-", &rest[..rest.len() - 1]),
+        (last, rest) => (*last, rest),
+    };
+    if !mods.iter().any(|&m| m == "cmd" || m == "secondary") {
+        return None;
+    }
+    let mut out: Vec<&str> = mods
+        .iter()
+        .map(|&m| match m {
+            "cmd" => "secondary",
+            "secondary" => "cmd",
+            other => other,
+        })
+        .collect();
+    out.push(last);
+    Some(out.join("-"))
 }
 
 #[cfg(test)]
@@ -542,6 +573,20 @@ for = \"any\"
         assert!(!keys.contains_key("secondary-d"));
         assert_eq!(keys.get("secondary-j").unwrap(), "open_with:VS Code");
         assert_eq!(keys.get("secondary-up").unwrap(), "go_up");
+    }
+
+    #[test]
+    fn old_style_cmd_overrides_merge() {
+        let cfg: Config = toml::from_str(
+            "[keybindings]\n\"cmd-d\" = \"none\"\n\"cmd-o\" = \"rename\"\n\"cmd--\" = \"none\"\n\"cmd-j\" = \"open_with:VS Code\"\n",
+        )
+        .unwrap();
+        let keys = cfg.keybindings();
+        assert!(!keys.contains_key("cmd-d") && !keys.contains_key("secondary-d"), "\"cmd-d\" = \"none\" removes secondary-d");
+        assert!(!keys.contains_key("cmd--") && !keys.contains_key("secondary--"), "\"cmd--\" = \"none\" removes secondary--");
+        assert!(!keys.contains_key("secondary-o"), "\"cmd-o\" override replaces secondary-o");
+        assert_eq!(keys.get("cmd-o").unwrap(), "rename");
+        assert_eq!(keys.get("cmd-j").unwrap(), "open_with:VS Code");
     }
 
     #[test]
