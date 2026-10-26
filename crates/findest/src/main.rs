@@ -31,11 +31,12 @@ use crate::command::{Quit, Run};
 
 /// Keys that work regardless of config (re-applied whenever the keymap reloads).
 pub fn bind_global_keys(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+    cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
 }
 
 fn menus() -> Vec<Menu> {
     let item = |label: &str, command: &str| MenuItem::action(label.to_string(), Run::new(command));
+    let reveal_label = if cfg!(target_os = "macos") { "Reveal in Finder" } else { "Open Containing Folder" };
     vec![
         Menu {
             name: "Findest".into(),
@@ -69,7 +70,7 @@ fn menus() -> Vec<Menu> {
                 item("Uncompress", "extract"),
                 MenuItem::separator(),
                 item("Add to Favorites", "add_favorite"),
-                item("Reveal in Finder", "reveal_in_finder"),
+                item(reveal_label, "reveal_in_finder"),
                 MenuItem::separator(),
                 item("Move to Trash", "trash"),
                 item("Delete Permanently…", "delete_permanently"),
@@ -131,14 +132,20 @@ pub fn open_browser_window(init: BrowserInit, cx: &mut App) -> Option<WindowHand
     let mut bounds = Bounds::centered(None, size(px(1100.), px(700.)), cx);
     bounds.origin.x += offset;
     bounds.origin.y += offset;
+    let mut options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar: Some(TitlebarOptions { title: Some("Findest".into()), ..Default::default() }),
+        window_min_size: Some(size(px(600.), px(360.))),
+        app_id: Some("dev.findest.Findest".into()),
+        ..Default::default()
+    };
+    #[cfg(not(target_os = "macos"))]
+    {
+        options.window_decorations = Some(preferred_linux_decorations());
+    }
     let window = cx
         .open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions { title: Some("Findest".into()), ..Default::default() }),
-                window_min_size: Some(size(px(600.), px(360.))),
-                ..Default::default()
-            },
+            options,
             |window, cx| cx.new(|cx| Browser::new(init, window, cx)),
         )
         .ok()?;
@@ -149,6 +156,24 @@ pub fn open_browser_window(init: BrowserInit, cx: &mut App) -> Option<WindowHand
         })
         .ok();
     Some(window)
+}
+
+/// Uses client-side window decorations by default on Linux so Findest renders a
+/// consistent headerbar (with integrated menu bar, draggable title, minimize/
+/// maximize/close vector buttons, rounded frame, drop shadow, and 8-way resize
+/// handles) across Wayland (GNOME/Mutter, KDE, Sway, Hyprland) and X11.
+/// Set `FINDEST_WINDOW_DECORATIONS=server` to request server-side decorations.
+#[cfg(not(target_os = "macos"))]
+fn preferred_linux_decorations() -> gpui::WindowDecorations {
+    if let Ok(mode) = std::env::var("FINDEST_WINDOW_DECORATIONS") {
+        if mode.eq_ignore_ascii_case("server") {
+            return gpui::WindowDecorations::Server;
+        }
+        if mode.eq_ignore_ascii_case("client") {
+            return gpui::WindowDecorations::Client;
+        }
+    }
+    gpui::WindowDecorations::Client
 }
 
 /// Windows to open at launch: an explicit path, else the last session's windows.

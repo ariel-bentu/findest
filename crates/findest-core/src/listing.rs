@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::fs;
 use std::io;
+#[cfg(target_os = "macos")]
 use std::os::macos::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -8,6 +9,7 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 /// BSD `UF_HIDDEN` file flag (hidden from GUI listings, e.g. `~/Library`).
+#[cfg(target_os = "macos")]
 const UF_HIDDEN: u32 = 0x8000;
 
 /// Directory extensions that macOS presents as single opaque files.
@@ -90,17 +92,34 @@ impl TagColor {
 /// The item's color label, from its Finder info (one small read; Finder
 /// keeps it in step with the first color tag).
 pub fn read_color(path: &Path) -> Option<TagColor> {
-    use std::os::unix::ffi::OsStrExt;
-    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut info = [0u8; 32];
-    // SAFETY: valid C string and a buffer of the given size.
-    let n = unsafe {
-        libc::getxattr(path.as_ptr(), c"com.apple.FinderInfo".as_ptr(), info.as_mut_ptr().cast(), info.len(), 0, 0)
-    };
-    if n != 32 {
-        return None;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+        let mut info = [0u8; 32];
+        // SAFETY: valid C string and a buffer of the given size.
+        let n = unsafe {
+            libc::getxattr(path.as_ptr(), c"com.apple.FinderInfo".as_ptr(), info.as_mut_ptr().cast(), info.len(), 0, 0)
+        };
+        if n != 32 {
+            return None;
+        }
+        TagColor::from_label((info[9] >> 1) & 7)
     }
-    TagColor::from_label((info[9] >> 1) & 7)
+    #[cfg(not(target_os = "macos"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+        let mut buf = [0u8; 4];
+        // SAFETY: valid C strings and buffer of the given size.
+        let n = unsafe {
+            libc::getxattr(path.as_ptr(), c"user.findest.color".as_ptr(), buf.as_mut_ptr().cast(), buf.len())
+        };
+        if n < 1 {
+            return None;
+        }
+        TagColor::from_label(buf[0])
+    }
 }
 
 impl Entry {
@@ -115,7 +134,7 @@ impl Entry {
         let is_dir = raw_dir && !is_package;
         Ok(Entry {
             color: if is_dir { read_color(path) } else { None },
-            is_hidden: name.starts_with('.') || link_meta.st_flags() & UF_HIDDEN != 0,
+            is_hidden: name.starts_with('.') || has_hidden_flag(&link_meta),
             is_dir,
             is_package,
             is_symlink,
@@ -173,6 +192,19 @@ fn is_package_name(name: &str) -> bool {
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| PACKAGE_EXTENSIONS.iter().any(|p| p.eq_ignore_ascii_case(e)))
+}
+
+/// Whether the platform marks this entry as hidden independently of its name.
+fn has_hidden_flag(meta: &fs::Metadata) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        meta.st_flags() & UF_HIDDEN != 0
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = meta;
+        false
+    }
 }
 
 /// Lists a directory. Entries that vanish or can't be stat'ed mid-listing are skipped.

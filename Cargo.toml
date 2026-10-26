@@ -45,3 +45,9 @@ tempfile = "3"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# gpui 0.2.2 transitively depends on zed-async-tar 0.5.0-zed -> xattr 0.2.3,
+# which references `libc::ENOATTR` on Linux (removed in libc 0.2.172). Bumping
+# zed-async-tar's xattr dependency to 1.x fixes the Linux build.
+[patch.crates-io]
+zed-async-tar = { path = "crates/vendor/zed-async-tar" }

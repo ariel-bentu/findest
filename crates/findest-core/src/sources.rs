@@ -925,6 +925,21 @@ fn more_row(dir: &Path) -> Entry {
     }
 }
 
+pub(crate) fn spawn_adapter(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    let mut tries = 0;
+    loop {
+        match cmd.spawn() {
+            // On Linux, a concurrent fork() in another thread can briefly hold a
+            // newly written adapter script's file descriptor open until execve.
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 10 => {
+                tries += 1;
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            res => return res,
+        }
+    }
+}
+
 /// Runs `command… verb args…` and returns its stdout. Stopped after
 /// `timeout`, or when `cancel` is set; stopping kills everything the adapter
 /// started (it runs in its own process group), e.g. a `uctl login`.
@@ -933,17 +948,18 @@ fn run(source: &Source, verb: &str, args: &[String], timeout: Duration, cancel: 
     let Some((program, own_args)) = source.command.split_first() else {
         return Err(SourceError::Failed(format!("{}: no command configured", source.name)));
     };
-    let mut child = Command::new(crate::paths::expand_tilde(program))
-        .env("PATH", adapter_path())
-        .args(own_args)
-        .arg(verb)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .map_err(|e| SourceError::Failed(format!("{}: can't run {program}: {e}", source.name)))?;
+    let mut child = spawn_adapter(
+        Command::new(crate::paths::expand_tilde(program))
+            .env("PATH", adapter_path())
+            .args(own_args)
+            .arg(verb)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0),
+    )
+    .map_err(|e| SourceError::Failed(format!("{}: can't run {program}: {e}", source.name)))?;
     // Read both pipes while waiting, so a chatty adapter can't block on a full pipe.
     let drain = |pipe: Option<Box<dyn Read + Send>>| {
         std::thread::spawn(move || {
@@ -1265,8 +1281,10 @@ esac
         // What the adapter started was stopped too.
         let pid: i32 = std::fs::read_to_string(tmp.path().join("login.pid")).unwrap().trim().parse().unwrap();
         std::thread::sleep(Duration::from_millis(100));
-        // SAFETY: signal 0 only checks whether the process exists.
-        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "the adapter's child is gone");
+        // SAFETY: signal 0 only checks whether the process exists (or is an unreaped zombie in a container).
+        let gone = unsafe { libc::kill(pid, 0) } != 0
+            || std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| s.contains(") Z "));
+        assert!(gone, "the adapter's child is gone");
     }
 
     #[test]

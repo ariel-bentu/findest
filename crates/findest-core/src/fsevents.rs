@@ -1,11 +1,10 @@
-//! A minimal FSEvents stream that can replay history. Given an event id
-//! saved earlier, macOS first delivers every change made since then (even
-//! while findest wasn't running), then live changes. `notify` doesn't expose
 //! that, so this talks to CoreServices directly.
 
-use std::ffi::{CStr, OsStr, c_char, c_void};
-use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+mod mac {
+    use std::ffi::{CStr, OsStr, c_char, c_void};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::{Path, PathBuf};
 
 pub enum Event {
     Changed(PathBuf),
@@ -251,3 +250,44 @@ mod tests {
         assert!(wait_for(&rx, &dir.join("offline.txt")), "change made while not watching is replayed");
     }
 }
+}
+
+#[cfg(target_os = "macos")]
+pub use mac::*;
+
+#[cfg(not(target_os = "macos"))]
+mod imp {
+    use std::path::{Path, PathBuf};
+
+    #[derive(Clone, Debug)]
+    #[allow(dead_code)]
+    pub enum Event {
+        Changed(PathBuf),
+        Rescan(Option<PathBuf>),
+        HistoryDone,
+    }
+
+    pub struct EventStream;
+
+    impl EventStream {
+        pub fn start(
+            _paths: &[PathBuf],
+            _since: Option<u64>,
+            _latency_secs: f64,
+            _on_events: impl Fn(Vec<Event>, u64) + Send + 'static,
+        ) -> Option<EventStream> {
+            None
+        }
+    }
+
+    pub fn current_event_id() -> u64 {
+        0
+    }
+
+    pub fn history_id(_path: &Path) -> Option<String> {
+        None
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub use imp::*;

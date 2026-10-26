@@ -1,5 +1,8 @@
-//! Native Finder icons via `NSWorkspace`, rendered to PNG off the UI thread
-//! and cached by [`IconKey`] so a folder of 10k `.txt` files costs one lookup.
+//! File icons. macOS renders Finder/AppKit icons; other platforms fall back to
+//! the Unicode icons in `render.rs`.
+//!
+//! The cache is shared by every icon source so a folder of 10k `.txt` files
+//! costs one lookup.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -8,13 +11,19 @@ use std::time::SystemTime;
 
 use findest_core::listing::{Entry, TagColor};
 use gpui::{Image, ImageFormat};
+
+#[cfg(target_os = "macos")]
 use objc2::{AllocAnyThread, Message};
+#[cfg(target_os = "macos")]
 use objc2::rc::autoreleasepool;
+#[cfg(target_os = "macos")]
 use objc2_app_kit::{
     NSBitmapImageFileType, NSBitmapImageRep, NSColor, NSFontWeightMedium, NSImage, NSImageSymbolConfiguration,
     NSWorkspace,
 };
+#[cfg(target_os = "macos")]
 use objc2_foundation::{NSDictionary, NSPoint, NSRect, NSSize, NSString};
+#[cfg(target_os = "macos")]
 use objc2_uniform_type_identifiers::{UTType, UTTypeData, UTTypeFolder};
 
 /// Rendered icon edge in pixels: sharp on Retina both in rows (~18pt) and
@@ -73,40 +82,171 @@ impl IconKey {
 
     fn load_at(&self, pixels: f64) -> Option<Vec<u8>> {
         match self {
+            #[cfg(target_os = "macos")]
             IconKey::Symbol { name, rgb } => return render_symbol(name, *rgb),
+            #[cfg(not(target_os = "macos"))]
+            IconKey::Symbol { .. } => return None,
             IconKey::Large(inner) => return inner.load_at(LARGE_ICON_PIXELS),
             IconKey::Tinted(inner, color) => return tint_png(&inner.load_at(pixels)?, color.rgb()),
             IconKey::Thumbnail { path, pixels, .. } => return crate::system::image_preview_png(path, *pixels as f64),
             _ => {}
         }
-        autoreleasepool(|_| {
-            let workspace = NSWorkspace::sharedWorkspace();
-            let image = match self {
-                IconKey::Path(path) => workspace.iconForFile(&NSString::from_str(path.to_str()?)),
-                IconKey::Extension(ext) => {
-                    let ty = UTType::typeWithFilenameExtension(&NSString::from_str(ext));
-                    // SAFETY: UTTypeData is an immutable framework constant.
-                    let ty = ty.unwrap_or_else(|| unsafe { UTTypeData }.retain());
-                    workspace.iconForContentType(&ty)
+        #[cfg(target_os = "macos")]
+        {
+            autoreleasepool(|_| {
+                let workspace = NSWorkspace::sharedWorkspace();
+                let image = match self {
+                    IconKey::Path(path) => workspace.iconForFile(&NSString::from_str(path.to_str()?)),
+                    IconKey::Extension(ext) => {
+                        let ty = UTType::typeWithFilenameExtension(&NSString::from_str(ext));
+                        // SAFETY: UTTypeData is an immutable framework constant.
+                        let ty = ty.unwrap_or_else(|| unsafe { UTTypeData }.retain());
+                        workspace.iconForContentType(&ty)
+                    }
+                    // SAFETY: immutable framework constants.
+                    IconKey::Folder => workspace.iconForContentType(unsafe { UTTypeFolder }),
+                    IconKey::File => workspace.iconForContentType(unsafe { UTTypeData }),
+                    IconKey::Symbol { .. } | IconKey::Large(_) | IconKey::Tinted(..) | IconKey::Thumbnail { .. } => {
+                        unreachable!("handled above")
+                    }
+                };
+                let size = NSSize::new(pixels, pixels);
+                image.setSize(size);
+                let mut rect = NSRect::new(NSPoint::new(0.0, 0.0), size);
+                // SAFETY: `rect` is a valid pointer for the duration of the call.
+                let cg_image = unsafe { image.CGImageForProposedRect_context_hints(&mut rect, None, None) }?;
+                let rep = NSBitmapImageRep::initWithCGImage(NSBitmapImageRep::alloc(), &cg_image);
+                // SAFETY: an empty properties dictionary is valid.
+                let png = unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new()) }?;
+                Some(png.to_vec())
+            })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let size = pixels.round().max(16.0) as u32;
+            match self {
+                IconKey::Folder => render_linux_folder_png(size),
+                IconKey::Path(path) if path.is_dir() || path.extension().is_none() => render_linux_folder_png(size),
+                IconKey::Path(path) => {
+                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    render_linux_file_png(size, ext)
                 }
-                // SAFETY: immutable framework constants.
-                IconKey::Folder => workspace.iconForContentType(unsafe { UTTypeFolder }),
-                IconKey::File => workspace.iconForContentType(unsafe { UTTypeData }),
+                IconKey::Extension(ext) => render_linux_file_png(size, ext),
+                IconKey::File => render_linux_file_png(size, ""),
                 IconKey::Symbol { .. } | IconKey::Large(_) | IconKey::Tinted(..) | IconKey::Thumbnail { .. } => {
                     unreachable!("handled above")
                 }
-            };
-            let size = NSSize::new(pixels, pixels);
-            image.setSize(size);
-            let mut rect = NSRect::new(NSPoint::new(0.0, 0.0), size);
-            // SAFETY: `rect` is a valid pointer for the duration of the call.
-            let cg_image = unsafe { image.CGImageForProposedRect_context_hints(&mut rect, None, None) }?;
-            let rep = NSBitmapImageRep::initWithCGImage(NSBitmapImageRep::alloc(), &cg_image);
-            // SAFETY: an empty properties dictionary is valid.
-            let png = unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &NSDictionary::new()) }?;
-            Some(png.to_vec())
-        })
+            }
+        }
     }
+}
+
+/// Renders a shaded macOS/Adwaita-style blue folder icon at `size × size` so
+/// folders look crisp at any DPI and [`IconKey::Tinted`] can recolor them for
+/// folder color tags.
+#[cfg(not(target_os = "macos"))]
+fn render_linux_folder_png(size: u32) -> Option<Vec<u8>> {
+    let mut img = image::RgbaImage::new(size, size);
+    let s = size as f32;
+    let left = s * 0.08;
+    let right = s * 0.92;
+    let tab_top = s * 0.16;
+    let body_top = s * 0.26;
+    let bottom = s * 0.86;
+    let tab_right = s * 0.44;
+    let radius = (s * 0.06).max(2.0);
+
+    let in_rounded_rect = |x: f32, y: f32, x0: f32, y0: f32, x1: f32, y1: f32, r: f32| -> f32 {
+        let qx = (x - (x0 + x1) * 0.5).abs() - ((x1 - x0) * 0.5 - r);
+        let qy = (y - (y0 + y1) * 0.5).abs() - ((y1 - y0) * 0.5 - r);
+        let dist = (qx.max(0.0).hypot(qy.max(0.0)) + qx.min(qy).min(0.0)) - r;
+        (0.5 - dist).clamp(0.0, 1.0)
+    };
+
+    for (py, px_row) in img.enumerate_rows_mut() {
+        let y = py as f32 + 0.5;
+        for (px, _, pixel) in px_row {
+            let x = px as f32 + 0.5;
+            let body_a = in_rounded_rect(x, y, left, body_top, right, bottom, radius);
+            let tab_a = in_rounded_rect(x, y, left, tab_top, tab_right, body_top + radius * 1.5, radius * 0.8);
+            let a = body_a.max(tab_a);
+            if a <= 0.0 {
+                continue;
+            }
+            let (r, g, b) = if body_a >= tab_a && y >= body_top {
+                let t = ((y - body_top) / (bottom - body_top)).clamp(0.0, 1.0);
+                // Top highlight ridge
+                if (y - body_top) < (s * 0.025).max(1.5) {
+                    (135u8, 212u8, 248u8)
+                } else {
+                    // Shaded around [89, 189, 235] (luma ~0.64) so tint_pixel maps it accurately.
+                    let shade = 1.06 - 0.14 * t;
+                    (
+                        (89.0 * shade).clamp(0.0, 255.0) as u8,
+                        (189.0 * shade).clamp(0.0, 255.0) as u8,
+                        (235.0 * shade).clamp(0.0, 255.0) as u8,
+                    )
+                }
+            } else {
+                // Darker back tab
+                (68u8, 158u8, 208u8)
+            };
+            *pixel = image::Rgba([r, g, b, (a * 255.0).round() as u8]);
+        }
+    }
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut out, image::ImageFormat::Png).ok()?;
+    Some(out.into_inner())
+}
+
+/// Renders a clean document page icon with a folded corner and extension accent.
+#[cfg(not(target_os = "macos"))]
+fn render_linux_file_png(size: u32, ext: &str) -> Option<Vec<u8>> {
+    let mut img = image::RgbaImage::new(size, size);
+    let s = size as f32;
+    let left = s * 0.18;
+    let right = s * 0.82;
+    let top = s * 0.10;
+    let bottom = s * 0.90;
+    let fold = s * 0.22;
+    let accent: [u8; 3] = match ext.to_ascii_lowercase().as_str() {
+        "pdf" => [225, 65, 55],
+        "rs" | "toml" | "json" | "yaml" | "yml" => [230, 140, 45],
+        "py" | "js" | "ts" | "tsx" | "go" | "c" | "cpp" | "h" | "sh" => [65, 145, 225],
+        "zip" | "gz" | "tgz" | "xz" | "7z" | "rar" | "tar" => [190, 145, 85],
+        "mp3" | "wav" | "flac" | "mp4" | "mkv" | "mov" => [165, 95, 215],
+        _ => [140, 150, 165],
+    };
+
+    for (py, px_row) in img.enumerate_rows_mut() {
+        let y = py as f32 + 0.5;
+        for (px, _, pixel) in px_row {
+            let x = px as f32 + 0.5;
+            if x < left || x > right || y < top || y > bottom {
+                continue;
+            }
+            // Top-right corner cut
+            if (x - (right - fold)) + (top + fold - y) > fold {
+                continue;
+            }
+            let in_fold = x >= (right - fold) && y <= (top + fold);
+            let border = x - left < 1.5 || right - x < 1.5 || y - top < 1.5 || bottom - y < 1.5;
+            let stripe = y >= bottom - s * 0.18 && y <= bottom - s * 0.07 && x >= left + s * 0.08 && x <= right - s * 0.08;
+            let [r, g, b] = if in_fold {
+                [200, 206, 214]
+            } else if border {
+                [185, 192, 202]
+            } else if stripe {
+                accent
+            } else {
+                [242, 245, 249]
+            };
+            *pixel = image::Rgba([r, g, b, 255]);
+        }
+    }
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut out, image::ImageFormat::Png).ok()?;
+    Some(out.into_inner())
 }
 
 /// Recolors an icon (a PNG) with `rgb`, keeping its shading.
@@ -139,6 +279,7 @@ fn tint_pixel([r, g, b, a]: [u8; 4], rgb: [u8; 3]) -> [u8; 4] {
 }
 
 /// Renders an SF Symbol at Retina resolution, keeping its aspect ratio.
+#[cfg(target_os = "macos")]
 fn render_symbol(name: &str, rgb: u32) -> Option<Vec<u8>> {
     autoreleasepool(|_| {
         let c = |shift: u32| ((rgb >> shift) & 0xff) as f64 / 255.0;
@@ -274,6 +415,7 @@ mod tests {
         assert!(load_icon(&IconKey::Symbol { name: "no.such.symbol.xyz", rgb: 0 }).is_none());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn renders_icons_off_main_thread() {
         let keys = [
@@ -292,5 +434,22 @@ mod tests {
         ];
         let handle = std::thread::spawn(move || keys.iter().map(|k| load_icon(k).map(|b| is_png(&b))).collect::<Vec<_>>());
         assert!(handle.join().unwrap().iter().all(|r| *r == Some(true)));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn renders_linux_folder_and_file_icons() {
+        assert!(load_icon(&IconKey::Folder).is_some_and(|b| is_png(&b)));
+        assert!(load_icon(&IconKey::File).is_some_and(|b| is_png(&b)));
+        assert!(load_icon(&IconKey::Extension("rs".into())).is_some_and(|b| is_png(&b)));
+        assert!(load_icon(&IconKey::Symbol { name: "folder", rgb: 0 }).is_none());
+    }
+
+    #[test]
+    fn thumbnail_icon_loads() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/AppIcon.png");
+        let key = IconKey::Thumbnail { path, modified: None, pixels: 128 };
+        let bytes = load_icon(&key).unwrap();
+        assert!(bytes.starts_with(b"\x89PNG"));
     }
 }

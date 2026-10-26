@@ -45,7 +45,14 @@ pub struct TextPreview {
     gutter_hover: bool,
     /// A PDF's pages, once its page sizes are read.
     pdf: Option<PdfPages>,
+    /// An image preview (used on platforms without a native Quick Look panel).
+    image: Option<ImagePreview>,
     _task: Task<()>,
+}
+
+struct ImagePreview {
+    image: Arc<gpui::Image>,
+    dimensions: (u32, u32),
 }
 
 /// A PDF's pages, drawn as they scroll into view.
@@ -260,6 +267,25 @@ impl Browser {
                 })
                 .ok();
             })
+        } else if is_image(&path) {
+            let read = cx.background_executor().spawn(async move {
+                let dims = crate::system::image_dimensions(&file).ok_or_else(|| "not a readable image".to_string())?;
+                let png = crate::system::image_preview_png(&file, 2048.0).ok_or_else(|| "can't decode image".to_string())?;
+                Ok::<_, String>((Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, png)), dims))
+            });
+            cx.spawn(async move |this, cx| {
+                let path = opened;
+                let result = read.await;
+                this.update(cx, |this, cx| {
+                    let Some(preview) = this.text_preview.as_mut().filter(|p| p.path == path) else { return };
+                    match result {
+                        Ok((image, dimensions)) => preview.image = Some(ImagePreview { image, dimensions }),
+                        Err(e) => preview.content = Some(Err(format!("Can't show {}: {e}", findest_core::paths::display_name(&path)))),
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
         } else {
             self.open_text_task(file, opened, dark, cx)
         };
@@ -298,6 +324,7 @@ impl Browser {
             folded: BTreeSet::new(),
             gutter_hover: false,
             pdf: None,
+            image: None,
             _task: task,
         });
         cx.notify();
@@ -305,7 +332,7 @@ impl Browser {
 
     /// ⌘F in the preview: opens the find bar, or selects what's in it.
     pub(crate) fn open_preview_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(preview) = self.text_preview.as_mut().filter(|p| !p.is_pdf()) else { return };
+        let Some(preview) = self.text_preview.as_mut().filter(|p| !p.is_pdf() && p.image.is_none()) else { return };
         if let Some(find) = &preview.find {
             let input = find.input.clone();
             input.update(cx, |input, cx| {
@@ -576,6 +603,8 @@ impl Browser {
         } else if let Some(pages) = &preview.pdf {
             let n = pages.sizes.len();
             subtitle = format!("PDF · {n} {}", if n == 1 { "page" } else { "pages" });
+        } else if let Some(img_prev) = &preview.image {
+            subtitle = format!("Image · {} × {}", img_prev.dimensions.0, img_prev.dimensions.1);
         }
         let toggle = preview.has_formatted().then(|| {
             let label = if preview.show_source { "Formatted" } else { "Source" };
@@ -590,7 +619,11 @@ impl Browser {
                 .cursor_pointer()
                 .text_size(px(font_size - 1.))
                 .hover(|s| s.bg(theme.hover))
-                .tooltip(crate::render::tooltip("Show the formatted text or its source (⌘⇧M)"))
+                .tooltip(crate::render::tooltip(if cfg!(target_os = "macos") {
+                    "Show the formatted text or its source (⌘⇧M)"
+                } else {
+                    "Show the formatted text or its source (Ctrl+Shift+M)"
+                }))
                 .on_click(cx.listener(|this, _, _, cx| this.toggle_preview_source(cx)))
                 .child(label)
         });
@@ -674,8 +707,18 @@ impl Browser {
                         .child(find.input.clone()),
                 )
                 .child(div().flex_none().text_size(px(font_size - 1.)).text_color(theme.text_muted).child(count))
-                .child(button("text-preview-find-prev", "↑", "Previous match (⌘⇧G or ↑)", -1))
-                .child(button("text-preview-find-next", "↓", "Next match (⌘G, Enter or ↓)", 1))
+                .child(button(
+                    "text-preview-find-prev",
+                    "↑",
+                    if cfg!(target_os = "macos") { "Previous match (⌘⇧G or ↑)" } else { "Previous match (Ctrl+Shift+G or ↑)" },
+                    -1,
+                ))
+                .child(button(
+                    "text-preview-find-next",
+                    "↓",
+                    if cfg!(target_os = "macos") { "Next match (⌘G, Enter or ↓)" } else { "Next match (Ctrl+G, Enter or ↓)" },
+                    1,
+                ))
                 .child(
                     div()
                         .id("text-preview-find-close")
@@ -698,6 +741,14 @@ impl Browser {
         };
         let body = match &preview.content {
             None if let Some(pages) = &preview.pdf => self.render_pdf_pages(pages, cx),
+            None if let Some(img_prev) = &preview.image => div()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_4()
+                .child(img(img_prev.image.clone()).max_w_full().max_h_full().object_fit(ObjectFit::Contain))
+                .into_any_element(),
             None => div().p_4().text_color(theme.text_muted).child("Reading…").into_any_element(),
             Some(Err(message)) => div().p_4().text_color(theme.danger).child(message.clone()).into_any_element(),
             Some(Ok(_)) => {
@@ -857,7 +908,7 @@ impl Browser {
                         .id("text-preview-body")
                         .flex_1()
                         .min_h_0()
-                        .font_family("Menlo")
+                        .font_family(crate::render::monospace_font())
                         .text_size(px(font_size - 1.))
                         .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                             if let Some(preview) = &mut this.text_preview
@@ -964,9 +1015,29 @@ fn word_at(line: &str, byte: usize) -> (usize, usize) {
     (start, end)
 }
 
+/// Whether `path` is an image handled by Findest's built-in viewer (on platforms
+/// without a native Quick Look panel).
+pub fn is_image(path: &Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = path;
+        false
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        const IMAGE_EXTENSIONS: &[&str] = &[
+            "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tiff", "tif", "pnm", "pbm", "pgm", "ppm", "tga",
+            "dds", "qoi", "farbfeld", "exr", "hdr",
+        ];
+        path.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| IMAGE_EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(e)))
+    }
+}
+
 /// True if `path` gets Findest's preview instead of Quick Look.
 pub fn handles(path: &Path) -> bool {
-    (highlight::has_own_preview(path) || crate::pdf::is_pdf(path)) && !path.is_dir()
+    (highlight::has_own_preview(path) || crate::pdf::is_pdf(path) || is_image(path)) && !path.is_dir()
 }
 
 #[cfg(test)]

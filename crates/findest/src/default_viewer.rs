@@ -9,11 +9,13 @@
 //! If Findest is deleted without switching back, reveals fall back to Finder
 //! (macOS ignores a viewer that isn't installed), but the setting lingers.
 
-use std::ffi::{CStr, c_char, c_void};
+#[cfg(target_os = "macos")]
+mod mac {
+    use std::ffi::{CStr, c_char, c_void};
 
-use anyhow::{Result, bail};
+    use anyhow::{Result, bail};
 
-use crate::install::BUNDLE_ID;
+    use crate::install::BUNDLE_ID;
 
 const FILE_VIEWER_KEY: &str = "NSFileViewer";
 
@@ -151,5 +153,150 @@ mod tests {
         let copy = unsafe { CFStringCreateWithBytes(std::ptr::null(), "x".as_ptr(), 1, UTF8, 0) };
         assert_eq!(unsafe { CfString::take(copy) }.as_deref(), Some("x"));
         drop(s);
+    }
+}
+}
+
+#[cfg(target_os = "macos")]
+pub use mac::*;
+
+#[cfg(not(target_os = "macos"))]
+mod imp {
+    use anyhow::{Context, Result, bail};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    const DESKTOP_ID: &str = "dev.findest.Findest.desktop";
+
+    pub fn is_default() -> bool {
+        current_default_desktop().as_deref() == Some(DESKTOP_ID)
+    }
+
+    pub fn use_findest() -> Result<()> {
+        let exe = std::env::current_exe().context("locating current executable")?;
+        let apps_dir = dirs_data_home().join("applications");
+        std::fs::create_dir_all(&apps_dir)
+            .with_context(|| format!("creating {}", apps_dir.display()))?;
+        let desktop_path = apps_dir.join(DESKTOP_ID);
+        std::fs::write(&desktop_path, desktop_entry(&exe))
+            .with_context(|| format!("writing {}", desktop_path.display()))?;
+
+        if let Some(prev) = current_default_desktop()
+            && prev != DESKTOP_ID
+        {
+            let state_dir = dirs_data_home().join("findest");
+            let _ = std::fs::create_dir_all(&state_dir);
+            let _ = std::fs::write(state_dir.join("previous_file_manager"), &prev);
+        }
+
+        let status = Command::new("xdg-mime")
+            .args(["default", DESKTOP_ID, "inode/directory"])
+            .status()
+            .context("running xdg-mime")?;
+        if !status.success() {
+            bail!("xdg-mime exited with {status}");
+        }
+        Ok(())
+    }
+
+    pub fn use_finder() -> Result<()> {
+        let prev_file = dirs_data_home().join("findest/previous_file_manager");
+        let target = std::fs::read_to_string(&prev_file)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && s != DESKTOP_ID)
+            .or_else(detect_system_file_manager)
+            .context("No system file manager .desktop entry found to restore")?;
+
+        let status = Command::new("xdg-mime")
+            .args(["default", &target, "inode/directory"])
+            .status()
+            .context("running xdg-mime")?;
+        if !status.success() {
+            bail!("xdg-mime exited with {status}");
+        }
+        Ok(())
+    }
+
+    pub fn reveal_in_finder(path: &Path) -> Result<()> {
+        findest_core::launch::reveal_in_finder(path)
+    }
+
+    pub(crate) fn desktop_entry(exe: &Path) -> String {
+        let exec = exe.display();
+        format!(
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=Findest\n\
+             Comment=Fast, keyboard-first file manager\n\
+             Exec=\"{exec}\" %U\n\
+             Icon=system-file-manager\n\
+             Terminal=false\n\
+             StartupWMClass=dev.findest.Findest\n\
+             Categories=System;FileTools;FileManager;Utility;\n\
+             MimeType=inode/directory;\n"
+        )
+    }
+
+    fn current_default_desktop() -> Option<String> {
+        let out = Command::new("xdg-mime")
+            .args(["query", "default", "inode/directory"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (!s.is_empty()).then_some(s)
+    }
+
+    fn detect_system_file_manager() -> Option<String> {
+        const CANDIDATES: &[&str] = &[
+            "org.gnome.Nautilus.desktop",
+            "org.kde.dolphin.desktop",
+            "thunar.desktop",
+            "nemo.desktop",
+            "caja.desktop",
+            "pcmanfm.desktop",
+            "pcmanfm-qt.desktop",
+            "io.elementary.files.desktop",
+        ];
+        let search_dirs = [
+            dirs_data_home().join("applications"),
+            PathBuf::from("/usr/local/share/applications"),
+            PathBuf::from("/usr/share/applications"),
+        ];
+        for candidate in CANDIDATES {
+            if search_dirs.iter().any(|dir| dir.join(candidate).is_file()) {
+                return Some((*candidate).to_string());
+            }
+        }
+        None
+    }
+
+    fn dirs_data_home() -> PathBuf {
+        if let Some(dir) = std::env::var_os("XDG_DATA_HOME").filter(|s| !s.is_empty()) {
+            return PathBuf::from(dir);
+        }
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"));
+        home.join(".local/share")
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub use imp::*;
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn generates_valid_desktop_entry() {
+        let entry = imp::desktop_entry(Path::new("/usr/local/bin/findest"));
+        assert!(entry.contains("[Desktop Entry]"));
+        assert!(entry.contains("Exec=\"/usr/local/bin/findest\" %U"));
+        assert!(entry.contains("MimeType=inode/directory;"));
+        assert!(entry.contains("StartupWMClass=dev.findest.Findest"));
     }
 }

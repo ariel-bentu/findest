@@ -243,6 +243,8 @@ pub enum MenuAction {
     NewIn { dir: PathBuf, folder: bool },
     /// Run a source adapter's action on the selected items.
     SourceAction(SourceAction),
+    /// Quit the application.
+    QuitApp,
 }
 
 /// Details of the single selected item, shown in the info panel.
@@ -1359,6 +1361,11 @@ impl Browser {
                 let result = crate::default_viewer::reveal_in_finder(&path);
                 self.report(result, cx);
             }
+            MenuAction::QuitApp => {
+                cx.set_global(Quitting(true));
+                findest_core::sources::global().shutdown();
+                cx.quit();
+            }
         }
         cx.notify();
     }
@@ -2206,6 +2213,91 @@ impl Browser {
         cx.notify();
     }
 
+    /// Top-level application menus ("Findest", "File", "Edit", "View", "Go") for
+    /// platforms without a global system menu bar.
+    pub fn open_app_menu(&mut self, menu_name: &str, position: Point<Pixels>, cx: &mut Context<Self>) {
+        use Command::*;
+        let reveal_label = if cfg!(target_os = "macos") { "Reveal in Finder" } else { "Open Containing Folder" };
+        let entries = match menu_name {
+            "Findest" => vec![
+                self.item("Settings…", OpenConfig, "open_config"),
+                MenuEntry::Separator,
+                self.item("Pause Search Indexing", PauseIndexing, "pause_indexing"),
+                self.item("Resume Search Indexing", ResumeIndexing, "resume_indexing"),
+                self.item("Rebuild Search Index", RebuildIndex, "rebuild_index"),
+                self.item("Turn Search Indexing On/Off", ToggleIndexing, "toggle_indexing"),
+                MenuEntry::Separator,
+                self.item("Use Findest as Default File Viewer", UseFindestAsDefault, "use_findest_as_default"),
+                self.item("Use System File Manager as Default", UseFinderAsDefault, "use_finder_as_default"),
+                MenuEntry::Separator,
+                MenuEntry::Item {
+                    label: "Quit Findest".into(),
+                    detail: Some(if cfg!(target_os = "macos") { "⌘Q".into() } else { "Ctrl+Q".into() }),
+                    action: MenuAction::QuitApp,
+                    danger: false,
+                },
+            ],
+            "File" => vec![
+                self.item("New Window", NewWindow, "new_window"),
+                self.item("New Folder", NewFolder, "new_folder"),
+                self.item("New File", NewFile, "new_file"),
+                MenuEntry::Separator,
+                self.item("Open", Open, "open"),
+                self.item("Rename", Rename, "rename"),
+                self.item("Duplicate", Duplicate, "duplicate"),
+                self.item("Compress", Compress, "compress"),
+                self.item("Uncompress", Extract, "extract"),
+                MenuEntry::Separator,
+                self.item("Add to Favorites", AddFavorite, "add_favorite"),
+                self.item(reveal_label, RevealInFinder, "reveal_in_finder"),
+                MenuEntry::Separator,
+                self.item("Move to Trash", Trash, "trash"),
+                self.item("Delete Permanently…", DeletePermanently, "delete_permanently"),
+                self.item("Empty Trash…", EmptyTrash, "empty_trash"),
+                MenuEntry::Separator,
+                self.item("Close Window", CloseWindow, "close_window"),
+            ],
+            "Edit" => vec![
+                self.item("Undo", Undo, "undo"),
+                MenuEntry::Separator,
+                self.item("Cut", Cut, "cut"),
+                self.item("Copy", Copy, "copy"),
+                self.item("Paste", Paste, "paste"),
+                self.item("Move Here", MoveHere, "move_here"),
+                self.item("Copy Path", CopyPath, "copy_path"),
+                MenuEntry::Separator,
+                self.item("Select All", SelectAll, "select_all"),
+            ],
+            "View" => vec![
+                self.item("as List", ViewList, "view_list"),
+                self.item("as Tiles", ViewTiles, "view_tiles"),
+                self.item("Bigger Tiles", ZoomIn, "zoom_in"),
+                self.item("Smaller Tiles", ZoomOut, "zoom_out"),
+                MenuEntry::Separator,
+                self.item("Quick Look", QuickLook, "quick_look"),
+                self.item("Reset Layout", ResetLayout, "reset_layout"),
+                self.item("Show/Hide Info Panel", ToggleInfo, "toggle_info"),
+                self.item("Show/Hide Hidden Files", ToggleHidden, "toggle_hidden"),
+                self.item("Folders First On/Off", ToggleFoldersFirst, "toggle_folders_first"),
+                self.item("Refresh", Refresh, "refresh"),
+            ],
+            "Go" => vec![
+                self.item("Back", GoBack, "go_back"),
+                self.item("Forward", GoForward, "go_forward"),
+                self.item("Enclosing Folder", GoUp, "go_up"),
+                MenuEntry::Separator,
+                self.item("Recents", ShowRecents, "show_recents"),
+                self.item("Home", GoHome, "go_home"),
+                self.item("Go to Folder…", GoToFolder, "go_to_folder"),
+                MenuEntry::Separator,
+                self.item("Find…", Find, "find"),
+            ],
+            _ => return,
+        };
+        self.menu = Some(ContextMenu { position, entries });
+        cx.notify();
+    }
+
     pub fn open_list_menu(&mut self, position: Point<Pixels>, on_item: bool, cx: &mut Context<Self>) {
         use Command::*;
         let mut entries = Vec::new();
@@ -2343,7 +2435,8 @@ impl Browser {
         if !self.config.favorites.iter().any(|f| f.resolved_path() == path) {
             entries.push(item("Add to Favorites", MenuAction::AddFavoritePath(path.clone())));
         }
-        entries.push(item("Reveal in Finder", MenuAction::RevealPath(path)));
+        let reveal_label = if cfg!(target_os = "macos") { "Reveal in Finder" } else { "Open Containing Folder" };
+        entries.push(item(reveal_label, MenuAction::RevealPath(path)));
         self.menu = Some(ContextMenu { position, entries });
         cx.notify();
     }
@@ -2362,8 +2455,9 @@ impl Browser {
             })
             .collect();
         let is_trash = path == self.trash_dir();
+        let reveal_label = if cfg!(target_os = "macos") { "Reveal in Finder" } else { "Open Containing Folder" };
         entries.push(MenuEntry::Item {
-            label: "Reveal in Finder".into(),
+            label: reveal_label.into(),
             detail: None,
             action: MenuAction::RevealPath(path),
             danger: false,
@@ -3227,7 +3321,7 @@ pub fn is_image_path(path: &Path) -> bool {
 
 /// Formats gpui can decode itself; the info panel shows the file directly.
 pub fn gpui_decodes(path: &Path) -> bool {
-    has_extension(path, &["png", "jpg", "jpeg", "gif", "webp", "bmp"])
+    has_extension(path, &["png", "jpg", "jpeg", "gif", "webp", "bmp", "svg"])
 }
 
 fn is_pdf(path: &Path) -> bool {

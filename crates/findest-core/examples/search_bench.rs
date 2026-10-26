@@ -10,8 +10,8 @@ fn main() {
         return live(root.into(), pattern);
     }
     let home = findest_core::paths::home_dir();
-    let roots = vec![home.clone(), "/Applications".into()];
-    let ex = Excludes::new(&["~/Library".into(), "~/.Trash".into(), "**/node_modules".into(), "**/.git".into()]);
+    let roots = vec![home.clone()];
+    let ex = Excludes::new(&["**/node_modules".into(), "**/.git".into()]);
     let t = Instant::now();
     let index = Index::build(&roots, &ex, &AtomicUsize::new(0), &AtomicBool::new(false));
     println!("built {} entries in {:?}", index.len(), t.elapsed());

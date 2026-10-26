@@ -8,9 +8,13 @@ use serde::{Deserialize, Serialize};
 use crate::listing::{SortKey, SortOrder};
 use crate::paths::expand_tilde;
 
+#[cfg(target_os = "macos")]
 pub const DEFAULT_CONFIG: &str = include_str!("default_config.toml");
+#[cfg(not(target_os = "macos"))]
+pub const DEFAULT_CONFIG: &str = include_str!("default_config_linux.toml");
 
-/// Built-in shortcuts. User `[keybindings]` entries are layered on top.
+/// Built-in shortcuts. `secondary` is Command on macOS and Control elsewhere.
+/// User `[keybindings]` entries are layered on top.
 pub const DEFAULT_KEYBINDINGS: &[(&str, &str)] = &[
     ("up", "select_prev"),
     ("down", "select_next"),
@@ -20,53 +24,56 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str)] = &[
     ("alt-down", "select_last"),
     ("home", "select_first"),
     ("end", "select_last"),
-    ("cmd-a", "select_all"),
+    ("secondary-a", "select_all"),
     ("escape", "clear_selection"),
     ("right", "expand"),
     ("left", "collapse"),
-    ("cmd-down", "open"),
-    ("cmd-o", "open"),
+    ("secondary-down", "open"),
+    ("secondary-o", "open"),
     ("enter", "rename"),
-    ("cmd-up", "go_up"),
-    ("cmd-[", "go_back"),
-    ("cmd-]", "go_forward"),
-    ("cmd-shift-h", "go_home"),
-    ("cmd-shift-g", "go_to_folder"),
-    ("cmd-shift-n", "new_folder"),
-    ("cmd-alt-n", "new_file"),
-    ("cmd-d", "duplicate"),
-    ("cmd-backspace", "trash"),
+    ("secondary-up", "go_up"),
+    ("secondary-[", "go_back"),
+    ("secondary-]", "go_forward"),
+    ("secondary-shift-h", "go_home"),
+    ("secondary-shift-g", "go_to_folder"),
+    ("secondary-shift-n", "new_folder"),
+    ("secondary-alt-n", "new_file"),
+    ("secondary-d", "duplicate"),
+    ("secondary-backspace", "trash"),
     ("backspace", "trash_confirm"),
     ("shift-backspace", "trash_now"),
-    ("cmd-alt-backspace", "delete_permanently"),
-    ("cmd-shift-backspace", "empty_trash"),
-    ("cmd-c", "copy"),
-    ("cmd-x", "cut"),
-    ("cmd-z", "undo"),
-    ("cmd-v", "paste"),
-    ("cmd-alt-v", "move_here"),
-    ("cmd-alt-c", "copy_path"),
-    ("cmd-shift-.", "toggle_hidden"),
-    ("cmd-f", "find"),
-    ("cmd-i", "toggle_info"),
+    ("secondary-alt-backspace", "delete_permanently"),
+    ("secondary-shift-backspace", "empty_trash"),
+    ("secondary-c", "copy"),
+    ("secondary-x", "cut"),
+    ("secondary-z", "undo"),
+    ("secondary-v", "paste"),
+    ("secondary-alt-v", "move_here"),
+    ("secondary-alt-c", "copy_path"),
+    ("secondary-shift-.", "toggle_hidden"),
+    ("secondary-f", "find"),
+    ("secondary-i", "toggle_info"),
     ("space", "quick_look"),
-    ("cmd-y", "quick_look"),
-    ("cmd-shift-m", "toggle_preview_source"),
-    ("cmd-g", "find_next"),
-    ("cmd-shift-g", "find_previous"),
-    ("cmd-1", "view_list"),
-    ("cmd-2", "view_tiles"),
-    ("cmd-=", "zoom_in"),
-    ("cmd--", "zoom_out"),
-    ("cmd-r", "refresh"),
+    ("secondary-y", "quick_look"),
+    ("secondary-shift-m", "toggle_preview_source"),
+    ("secondary-g", "find_next"),
+    ("secondary-shift-g", "find_previous"),
+    ("secondary-1", "view_list"),
+    ("secondary-2", "view_tiles"),
+    ("secondary-=", "zoom_in"),
+    ("secondary--", "zoom_out"),
+    ("secondary-r", "refresh"),
+    #[cfg(target_os = "macos")]
     ("ctrl-cmd-t", "add_favorite"),
-    ("cmd-shift-r", "show_recents"),
-    ("cmd-alt-r", "reveal_in_finder"),
-    ("cmd-,", "open_config"),
-    ("cmd-n", "new_window"),
-    ("cmd-w", "close_window"),
-    ("cmd-e", "open_with:VS Code"),
-    ("cmd-alt-t", "open_with:Terminal"),
+    #[cfg(not(target_os = "macos"))]
+    ("secondary-shift-t", "add_favorite"),
+    ("secondary-shift-r", "show_recents"),
+    ("secondary-alt-r", "reveal_in_finder"),
+    ("secondary-,", "open_config"),
+    ("secondary-n", "new_window"),
+    ("secondary-w", "close_window"),
+    ("secondary-e", "open_with:VS Code"),
+    ("secondary-alt-t", "open_with:Terminal"),
 ];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -86,27 +93,64 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        let fav = |path: &str| Favorite { path: path.into(), name: None };
-        let opener = |name: &str, app: &str, arg: &str, target| Opener {
-            name: name.into(),
-            command: vec!["open".into(), "-a".into(), app.into(), arg.into()],
-            target,
-        };
         Self {
             general: General::default(),
             appearance: Appearance::default(),
             locations: Locations::default(),
-            favorites: vec![fav("~"), fav("~/Desktop"), fav("~/Documents"), fav("~/Downloads"), fav("/Applications")],
-            openers: vec![
-                opener("VS Code", "Visual Studio Code", "{path}", OpenerTarget::Any),
-                opener("Terminal", "Terminal", "{dir}", OpenerTarget::Any),
-                opener("Preview", "Preview", "{path}", OpenerTarget::Files),
-            ],
+            favorites: default_favorites(),
+            openers: default_openers(),
             sources: Vec::new(),
             keybinding_overrides: BTreeMap::new(),
             search: SearchConfig::default(),
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn default_favorites() -> Vec<Favorite> {
+    let fav = |path: &str| Favorite { path: path.into(), name: None };
+    vec![fav("~"), fav("~/Desktop"), fav("~/Documents"), fav("~/Downloads"), fav("/Applications")]
+}
+
+#[cfg(not(target_os = "macos"))]
+fn default_favorites() -> Vec<Favorite> {
+    let fav = |path: &str| Favorite { path: path.into(), name: None };
+    vec![fav("~"), fav("~/Desktop"), fav("~/Documents"), fav("~/Downloads")]
+}
+
+#[cfg(target_os = "macos")]
+fn default_openers() -> Vec<Opener> {
+    let opener = |name: &str, app: &str, arg: &str, target| Opener {
+        name: name.into(),
+        command: vec!["open".into(), "-a".into(), app.into(), arg.into()],
+        target,
+    };
+    vec![
+        opener("VS Code", "Visual Studio Code", "{path}", OpenerTarget::Any),
+        opener("Terminal", "Terminal", "{dir}", OpenerTarget::Any),
+        opener("Preview", "Preview", "{path}", OpenerTarget::Files),
+    ]
+}
+
+#[cfg(not(target_os = "macos"))]
+fn default_openers() -> Vec<Opener> {
+    vec![
+        Opener {
+            name: "VS Code".into(),
+            command: vec!["code".into(), "{path}".into()],
+            target: OpenerTarget::Any,
+        },
+        Opener {
+            name: "Terminal".into(),
+            command: vec!["x-terminal-emulator".into(), "{dir}".into()],
+            target: OpenerTarget::Any,
+        },
+        Opener {
+            name: "File Manager".into(),
+            command: vec!["xdg-open".into(), "{dir}".into()],
+            target: OpenerTarget::Any,
+        },
+    ]
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -143,12 +187,25 @@ pub struct SearchConfig {
 impl Default for SearchConfig {
     fn default() -> Self {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect();
-        Self {
-            indexing: true,
-            roots: s(&["~", "/Applications", "~/Library/Mobile Documents/com~apple~CloudDocs", "~/Library/CloudStorage"]),
-            exclude: s(&["~/Library", "~/.Trash", "**/node_modules", "**/.git"]),
-            max_results: 10_000,
-            content_max_mb: 20,
+        #[cfg(target_os = "macos")]
+        {
+            Self {
+                indexing: true,
+                roots: s(&["~", "/Applications", "~/Library/Mobile Documents/com~apple~CloudDocs", "~/Library/CloudStorage"]),
+                exclude: s(&["~/Library", "~/.Trash", "**/node_modules", "**/.git"]),
+                max_results: 10_000,
+                content_max_mb: 20,
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Self {
+                indexing: true,
+                roots: s(&["~"]),
+                exclude: s(&["~/.cache", "~/.local/share/Trash", "**/node_modules", "**/.git", "**/target"]),
+                max_results: 10_000,
+                content_max_mb: 20,
+            }
         }
     }
 }
@@ -345,10 +402,15 @@ impl Config {
     }
 
     /// Default keybindings merged with user overrides; "none" removes a binding.
+    /// Treats `cmd-` and `secondary-` as equivalent so existing `cmd-*` user
+    /// overrides continue to match `secondary-*` defaults.
     pub fn keybindings(&self) -> BTreeMap<String, String> {
         let mut map: BTreeMap<String, String> =
             DEFAULT_KEYBINDINGS.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         for (key, command) in &self.keybinding_overrides {
+            if let Some(alt) = alternate_secondary_cmd(key) {
+                map.remove(&alt);
+            }
             if command == "none" {
                 map.remove(key);
             } else {
@@ -390,6 +452,28 @@ impl Config {
     }
 }
 
+fn alternate_secondary_cmd(key: &str) -> Option<String> {
+    let parts: Vec<&str> = key.split('-').collect();
+    let (last, mods) = match parts.split_last()? {
+        // "cmd--" style bindings for the minus key end with an empty part.
+        (&"", rest) if !rest.is_empty() => ("-", &rest[..rest.len() - 1]),
+        (last, rest) => (*last, rest),
+    };
+    if !mods.iter().any(|&m| m == "cmd" || m == "secondary") {
+        return None;
+    }
+    let mut out: Vec<&str> = mods
+        .iter()
+        .map(|&m| match m {
+            "cmd" => "secondary",
+            "secondary" => "cmd",
+            other => other,
+        })
+        .collect();
+    out.push(last);
+    Some(out.join("-"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,9 +511,9 @@ mod tests {
 
     #[test]
     fn empty_favorites_hides_section() {
-        // Absent [[favorites]] → serde default = 5 items (expected)
+        // Absent [[favorites]] → serde default
         let absent: Config = toml::from_str("[general]\nstart_path = \"~\"\n").unwrap();
-        assert_eq!(absent.favorites.len(), 5);
+        assert_eq!(absent.favorites.len(), default_favorites().len());
         // Explicit empty array → 0 items, so sidebar can hide the group
         let empty: Config = toml::from_str("favorites = []\n").unwrap();
         assert_eq!(empty.favorites.len(), 0);
@@ -481,14 +565,28 @@ for = \"any\"
     #[test]
     fn keybinding_overrides_merge() {
         let cfg: Config = toml::from_str(
-            "[keybindings]\n\"cmd-d\" = \"none\"\n\"enter\" = \"open\"\n\"cmd-j\" = \"open_with:VS Code\"\n",
+            "[keybindings]\n\"secondary-d\" = \"none\"\n\"enter\" = \"open\"\n\"secondary-j\" = \"open_with:VS Code\"\n",
         )
         .unwrap();
         let keys = cfg.keybindings();
         assert_eq!(keys.get("enter").unwrap(), "open");
-        assert!(!keys.contains_key("cmd-d"));
+        assert!(!keys.contains_key("secondary-d"));
+        assert_eq!(keys.get("secondary-j").unwrap(), "open_with:VS Code");
+        assert_eq!(keys.get("secondary-up").unwrap(), "go_up");
+    }
+
+    #[test]
+    fn old_style_cmd_overrides_merge() {
+        let cfg: Config = toml::from_str(
+            "[keybindings]\n\"cmd-d\" = \"none\"\n\"cmd-o\" = \"rename\"\n\"cmd--\" = \"none\"\n\"cmd-j\" = \"open_with:VS Code\"\n",
+        )
+        .unwrap();
+        let keys = cfg.keybindings();
+        assert!(!keys.contains_key("cmd-d") && !keys.contains_key("secondary-d"), "\"cmd-d\" = \"none\" removes secondary-d");
+        assert!(!keys.contains_key("cmd--") && !keys.contains_key("secondary--"), "\"cmd--\" = \"none\" removes secondary--");
+        assert!(!keys.contains_key("secondary-o"), "\"cmd-o\" override replaces secondary-o");
+        assert_eq!(keys.get("cmd-o").unwrap(), "rename");
         assert_eq!(keys.get("cmd-j").unwrap(), "open_with:VS Code");
-        assert_eq!(keys.get("cmd-up").unwrap(), "go_up");
     }
 
     #[test]

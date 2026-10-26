@@ -60,7 +60,22 @@ pub fn parse_user_path(text: &str) -> Option<PathBuf> {
     Some(expand_tilde(&unescaped))
 }
 
-/// Converts a `file://` URL (as macOS sends when opening documents) to a path.
+/// Converts a path to a percent-encoded `file://` URL.
+pub fn file_url(path: &Path) -> String {
+    use std::fmt::Write;
+    use std::os::unix::ffi::OsStrExt;
+    let mut url = String::from("file://");
+    for &b in path.as_os_str().as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.' | b'~') {
+            url.push(b as char);
+        } else {
+            let _ = write!(&mut url, "%{b:02X}");
+        }
+    }
+    url
+}
+
+/// Converts a `file://` URL (as desktop environments send when opening documents) to a path.
 pub fn path_from_file_url(url: &str) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
     let rest = url.strip_prefix("file://")?;
