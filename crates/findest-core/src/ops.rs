@@ -494,6 +494,7 @@ fn copy_recursive(src: &Path, dst: &Path, chunked: bool, resume: bool, progress:
             copy_recursive(&item.path(), &dst.join(item.file_name()), chunked, resume, progress)?;
         }
         fs::set_permissions(dst, meta.permissions())?;
+        copy_metadata(src, dst, &meta);
     } else {
         copy_file(src, dst, &meta, chunked, resume, progress)?;
     }
@@ -517,9 +518,15 @@ fn copy_file(src: &Path, dst: &Path, meta: &fs::Metadata, chunked: bool, resume:
         Err(e) => return Err(e).with_context(|| format!("reading {}", src.display())),
     };
     if !chunked {
+        #[cfg(target_os = "linux")]
+        if try_ficlone(&input, dst, meta) {
+            copy_metadata(src, dst, meta);
+            return progress.file_done(len);
+        }
         // std uses clonefile/fcopyfile on macOS, so this is cheap on APFS.
         drop(input);
         fs::copy(src, dst).with_context(|| format!("copying {}", src.display()))?;
+        copy_metadata(src, dst, meta);
         return progress.file_done(len);
     }
 
@@ -547,6 +554,23 @@ fn copy_file(src: &Path, dst: &Path, meta: &fs::Metadata, chunked: bool, resume:
     progress.file_done(0)
 }
 
+#[cfg(target_os = "linux")]
+fn try_ficlone(src_file: &fs::File, dst: &Path, meta: &fs::Metadata) -> bool {
+    use std::os::fd::AsRawFd;
+    let Ok(dst_file) = fs::File::create(dst) else {
+        return false;
+    };
+    let rc = unsafe { libc::ioctl(dst_file.as_raw_fd(), libc::FICLONE as _, src_file.as_raw_fd()) };
+    if rc == 0 {
+        let _ = dst_file.set_permissions(meta.permissions());
+        true
+    } else {
+        drop(dst_file);
+        let _ = fs::remove_file(dst);
+        false
+    }
+}
+
 /// Permissions, extended attributes (tags, Finder info) and dates, like
 /// Finder keeps them. The date goes last: it marks the file complete.
 fn copy_metadata(src: &Path, dst: &Path, meta: &fs::Metadata) {
@@ -559,7 +583,33 @@ fn copy_metadata(src: &Path, dst: &Path, meta: &fs::Metadata) {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = src;
+        use std::os::unix::ffi::OsStrExt;
+        const COLOR_XATTR: &[u8] = b"user.findest.color\0";
+        if let (Ok(from), Ok(to)) = (
+            std::ffi::CString::new(src.as_os_str().as_bytes()),
+            std::ffi::CString::new(dst.as_os_str().as_bytes()),
+        ) {
+            let mut buf = [0u8; 32];
+            let n = unsafe {
+                libc::getxattr(
+                    from.as_ptr(),
+                    COLOR_XATTR.as_ptr().cast(),
+                    buf.as_mut_ptr().cast(),
+                    buf.len(),
+                )
+            };
+            if n > 0 && (n as usize) <= buf.len() {
+                unsafe {
+                    libc::setxattr(
+                        to.as_ptr(),
+                        COLOR_XATTR.as_ptr().cast(),
+                        buf.as_ptr().cast(),
+                        n as usize,
+                        0,
+                    );
+                }
+            }
+        }
         let _ = fs::set_permissions(dst, meta.permissions());
     }
     if let (Ok(file), Ok(modified)) = (fs::OpenOptions::new().write(true).open(dst), meta.modified()) {

@@ -87,7 +87,30 @@ mod imp {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    pub fn set_color(_path: &Path, _color: Option<findest_core::listing::TagColor>) -> anyhow::Result<()> {
+    pub fn set_color(path: &Path, color: Option<findest_core::listing::TagColor>) -> anyhow::Result<()> {
+        let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| anyhow::anyhow!("unusual path"))?;
+        match color {
+            Some(c) => {
+                let val = [c.label()];
+                // SAFETY: valid C strings and 1-byte buffer.
+                let rc = unsafe {
+                    libc::setxattr(c_path.as_ptr(), c"user.findest.color".as_ptr(), val.as_ptr().cast(), val.len(), 0)
+                };
+                if rc != 0 {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+            }
+            None => {
+                // SAFETY: valid C strings.
+                let rc = unsafe { libc::removexattr(c_path.as_ptr(), c"user.findest.color".as_ptr()) };
+                if rc != 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::ENODATA) {
+                        return Err(err.into());
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -128,10 +151,8 @@ pub use imp::{image_dimensions, image_preview_png, set_color, volume_capacity};
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(target_os = "macos")]
     use findest_core::listing::{Entry, TagColor, read_color};
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn sets_reads_and_clears_folder_colors() {
         let tmp = tempfile::tempdir().unwrap();
@@ -151,7 +172,6 @@ mod tests {
         assert_eq!(read_color(&dir), None);
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn files_have_no_color_in_listings() {
         let tmp = tempfile::tempdir().unwrap();
@@ -182,13 +202,5 @@ mod tests {
         let (available, total) = volume_capacity(Path::new("/")).unwrap();
         assert!(total > 0 && available <= total);
         assert!(volume_capacity(Path::new("/no/such/place")).is_none_or(|(a, t)| a <= t));
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn linux_color_stubs() {
-        let tmp = tempfile::tempdir().unwrap();
-        assert_eq!(findest_core::listing::read_color(tmp.path()), None);
-        assert!(set_color(tmp.path(), Some(findest_core::listing::TagColor::Red)).is_ok());
     }
 }

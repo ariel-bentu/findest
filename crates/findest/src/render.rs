@@ -33,7 +33,9 @@ const NAME_START: f32 = 4.0 + 8.0 + TREE_GUTTER + 22.0;
 const COLUMN_HANDLE: f32 = 8.0;
 /// How to write a source adapter.
 const SOURCES_DOCS_URL: &str = "https://github.com/ariel-bentu/findest/blob/main/docs/sources.md";
-const TITLEBAR_HEIGHT: f32 = 32.0;
+const TITLEBAR_HEIGHT: f32 = 38.0;
+const CSD_SHADOW_SIZE: f32 = 8.0;
+const CSD_CORNER_RADIUS: f32 = 10.0;
 /// Width of the disclosure-triangle column, and the indent per tree level.
 const TREE_GUTTER: f32 = 14.0;
 const TREE_INDENT: f32 = 16.0;
@@ -72,9 +74,27 @@ impl Render for Browser {
         if std::mem::take(&mut self.pending_name_new) {
             self.start_name_new(window, cx);
         }
+        let decorations = window.window_decorations();
+        let maximized_or_full = window.is_maximized() || window.is_fullscreen();
+        let csd_tiling = match decorations {
+            gpui::Decorations::Client { tiling } => {
+                window.set_client_inset(if maximized_or_full { px(0.) } else { px(CSD_SHADOW_SIZE) });
+                Some(tiling)
+            }
+            gpui::Decorations::Server => None,
+        };
+
         if self.view == ViewMode::Tiles {
             // The list's width is what the sidebar and info panel leave (both resizable).
             let mut width = window.viewport_size().width - px(self.sidebar_width + 1. + 8.);
+            if let Some(tiling) = csd_tiling && !maximized_or_full {
+                if !tiling.left {
+                    width -= px(CSD_SHADOW_SIZE);
+                }
+                if !tiling.right {
+                    width -= px(CSD_SHADOW_SIZE);
+                }
+            }
             if self.config.general.info_panel {
                 width -= px(self.info_panel_width + 1.);
             }
@@ -124,12 +144,33 @@ impl Render for Browser {
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::on_run))
             .on_key_down(cx.listener(Self::on_key_down))
+            .relative()
             .size_full()
             .flex()
             .flex_col()
             .bg(theme.background)
             .text_color(theme.text)
             .text_size(px(theme.font_size))
+            .map(|d| match csd_tiling {
+                Some(tiling) if !maximized_or_full => d
+                    .overflow_hidden()
+                    .when(!tiling.top && !tiling.left, |d| d.rounded_tl(px(CSD_CORNER_RADIUS)))
+                    .when(!tiling.top && !tiling.right, |d| d.rounded_tr(px(CSD_CORNER_RADIUS)))
+                    .when(!tiling.bottom && !tiling.left, |d| d.rounded_bl(px(CSD_CORNER_RADIUS)))
+                    .when(!tiling.bottom && !tiling.right, |d| d.rounded_br(px(CSD_CORNER_RADIUS)))
+                    .when(!tiling.top, |d| d.border_t_1())
+                    .when(!tiling.bottom, |d| d.border_b_1())
+                    .when(!tiling.left, |d| d.border_l_1())
+                    .when(!tiling.right, |d| d.border_r_1())
+                    .border_color(theme.border)
+                    .shadow(vec![gpui::BoxShadow {
+                        color: gpui::hsla(0., 0., 0., 0.45),
+                        offset: gpui::point(px(0.), px(2.)),
+                        blur_radius: px(6.),
+                        spread_radius: px(0.),
+                    }]),
+                _ => d,
+            })
             .children(self.render_window_titlebar(window, cx))
             .child(main_area)
             .children(self.render_text_preview(cx))
@@ -138,56 +179,222 @@ impl Render for Browser {
         if let Some(family) = &theme.font_family {
             root = root.font_family(SharedString::from(family.clone()));
         }
-        root
+
+        div()
+            .id("csd-backdrop")
+            .relative()
+            .size_full()
+            .bg(gpui::transparent_black())
+            .map(|d| match csd_tiling {
+                Some(tiling) if !maximized_or_full => d
+                    .when(!tiling.top, |d| d.pt(px(CSD_SHADOW_SIZE)))
+                    .when(!tiling.bottom, |d| d.pb(px(CSD_SHADOW_SIZE)))
+                    .when(!tiling.left, |d| d.pl(px(CSD_SHADOW_SIZE)))
+                    .when(!tiling.right, |d| d.pr(px(CSD_SHADOW_SIZE))),
+                _ => d,
+            })
+            .child(root)
+            .children(self.render_resize_handles(window, cx))
     }
 }
 
+#[derive(Clone, Copy)]
+enum WindowControlIcon {
+    Minimize,
+    Maximize,
+    Restore,
+    Close,
+}
+
+fn render_window_control_icon(kind: WindowControlIcon, color: Hsla) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, (), window, _| {
+            let x0 = bounds.origin.x;
+            let y0 = bounds.origin.y;
+            let w = bounds.size.width;
+            let h = bounds.size.height;
+            let mut builder = gpui::PathBuilder::stroke(px(1.5));
+            match kind {
+                WindowControlIcon::Minimize => {
+                    let y = y0 + h * 0.55;
+                    builder.move_to(gpui::point(x0 + px(1.5), y));
+                    builder.line_to(gpui::point(x0 + w - px(1.5), y));
+                }
+                WindowControlIcon::Maximize => {
+                    let p0 = gpui::point(x0 + px(1.5), y0 + px(1.5));
+                    let p1 = gpui::point(x0 + w - px(1.5), y0 + px(1.5));
+                    let p2 = gpui::point(x0 + w - px(1.5), y0 + h - px(1.5));
+                    let p3 = gpui::point(x0 + px(1.5), y0 + h - px(1.5));
+                    builder.move_to(p0);
+                    builder.line_to(p1);
+                    builder.line_to(p2);
+                    builder.line_to(p3);
+                    builder.close();
+                }
+                WindowControlIcon::Restore => {
+                    let fx0 = x0 + px(1.5);
+                    let fy0 = y0 + px(3.5);
+                    let fx1 = x0 + w - px(3.5);
+                    let fy1 = y0 + h - px(1.5);
+                    builder.move_to(gpui::point(fx0, fy0));
+                    builder.line_to(gpui::point(fx1, fy0));
+                    builder.line_to(gpui::point(fx1, fy1));
+                    builder.line_to(gpui::point(fx0, fy1));
+                    builder.close();
+
+                    let bx0 = x0 + px(3.5);
+                    let by0 = y0 + px(1.5);
+                    let bx1 = x0 + w - px(1.5);
+                    let by1 = y0 + h - px(3.5);
+                    builder.move_to(gpui::point(bx0, fy0));
+                    builder.line_to(gpui::point(bx0, by0));
+                    builder.line_to(gpui::point(bx1, by0));
+                    builder.line_to(gpui::point(bx1, by1));
+                    builder.line_to(gpui::point(fx1, by1));
+                }
+                WindowControlIcon::Close => {
+                    builder.move_to(gpui::point(x0 + px(2.0), y0 + px(2.0)));
+                    builder.line_to(gpui::point(x0 + w - px(2.0), y0 + h - px(2.0)));
+                    builder.move_to(gpui::point(x0 + w - px(2.0), y0 + px(2.0)));
+                    builder.line_to(gpui::point(x0 + px(2.0), y0 + h - px(2.0)));
+                }
+            }
+            if let Ok(path) = builder.build() {
+                window.paint_path(path, color);
+            }
+        },
+    )
+    .size(px(12.))
+}
+
 impl Browser {
-    /// Renders client-side titlebar when the window manager doesn't provide decorations
-    /// (e.g. Wayland on GNOME, or when Client decorations are active).
+    /// Renders client-side titlebar and/or menu bar on platforms without a
+    /// global system menu bar (Linux). When server-side decorations are active
+    /// on Linux, only the menu strip is shown; when client-side decorations are
+    /// active, it also renders the draggable headerbar and window controls.
     fn render_window_titlebar(&self, window: &Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        if matches!(window.window_decorations(), gpui::Decorations::Server) {
+        let decorations = window.window_decorations();
+        let client_decorated = matches!(decorations, gpui::Decorations::Client { .. });
+        if cfg!(target_os = "macos") && !client_decorated {
             return None;
         }
         let theme = &self.theme;
-        let title = format!("Findest — {}", self.location_label());
+        let title = format!("{} — Findest", self.location_label());
         let maximized = window.is_maximized();
+        let maximized_or_full = maximized || window.is_fullscreen();
+        let top_inset = match decorations {
+            gpui::Decorations::Client { tiling } if !maximized_or_full && !tiling.top => CSD_SHADOW_SIZE,
+            _ => 0.0,
+        };
+        let controls = window.window_controls();
+        let is_dark = theme.background.l < 0.5;
+        let header_bg: Hsla = if is_dark {
+            gpui::rgb(0x303238).into()
+        } else {
+            gpui::rgb(0xe6e7ec).into()
+        };
+        let header_border: Hsla = if is_dark {
+            gpui::rgb(0x454852).into()
+        } else {
+            gpui::rgb(0xc8cad0).into()
+        };
+        let btn_bg: Hsla = if is_dark {
+            gpui::rgb(0x42454e).into()
+        } else {
+            gpui::rgb(0xd4d6dd).into()
+        };
+        let btn_hover_bg: Hsla = if is_dark {
+            gpui::rgb(0x525662).into()
+        } else {
+            gpui::rgb(0xc2c5ce).into()
+        };
+
+        let mut menu_bar = div().flex().flex_row().items_center().gap_0p5().pl_2p5().h_full().flex_none();
+        for menu_name in ["Findest", "File", "Edit", "View", "Go"] {
+            menu_bar = menu_bar.child(
+                div()
+                    .id(SharedString::from(format!("menubar-{menu_name}")))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_size(px(theme.font_size - 1.))
+                    .text_color(theme.text)
+                    .hover(move |s| s.bg(btn_hover_bg))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.syntax_help = None;
+                            this.commit_edit(window, cx);
+                            let bar_h = if client_decorated { TITLEBAR_HEIGHT } else { 28.0 };
+                            let pos = Point { x: event.position.x - px(8.), y: px(top_inset + bar_h + 2.) };
+                            this.open_app_menu(menu_name, pos, cx);
+                        }),
+                    )
+                    .child(menu_name),
+            );
+        }
+
+        if !client_decorated {
+            return Some(
+                div()
+                    .id("window-titlebar")
+                    .h(px(28.))
+                    .w_full()
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .bg(header_bg)
+                    .border_b_1()
+                    .border_color(header_border)
+                    .child(menu_bar),
+            );
+        }
 
         type Action = fn(&mut Window, &mut Context<Browser>);
-        let button = |id: &'static str, label: &'static str, hover_bg: Hsla, on_click: Action| {
+        let icon_color = theme.text;
+        let button = |id: &'static str, icon: WindowControlIcon, hover_bg: Hsla, on_click: Action| {
             div()
                 .id(id)
-                .w(px(38.))
-                .h_full()
+                .size(px(26.))
+                .rounded_full()
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_size(px(11.))
-                .text_color(theme.text_muted)
-                .hover(move |s| s.bg(hover_bg).text_color(theme.text))
+                .cursor_pointer()
+                .bg(btn_bg)
+                .hover(move |s| s.bg(hover_bg))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(cx.listener(move |_, _, window, cx| on_click(window, cx)))
-                .child(label)
+                .child(render_window_control_icon(icon, icon_color))
         };
 
-        let min_btn = button(
-            "win-min",
-            "─",
-            theme.hover,
-            |window, _| window.minimize_window(),
-        );
-        let max_btn = button(
-            "win-max",
-            if maximized { "❐" } else { "□" },
-            theme.hover,
-            |window, _| window.zoom_window(),
-        );
-        let close_btn = button(
+        let mut win_buttons = div().flex().flex_row().items_center().gap_1p5().pr_2p5().h_full().flex_none();
+        if controls.minimize {
+            win_buttons = win_buttons.child(button(
+                "win-min",
+                WindowControlIcon::Minimize,
+                btn_hover_bg,
+                |window, _| window.minimize_window(),
+            ));
+        }
+        if controls.maximize {
+            win_buttons = win_buttons.child(button(
+                "win-max",
+                if maximized { WindowControlIcon::Restore } else { WindowControlIcon::Maximize },
+                btn_hover_bg,
+                |window, _| window.zoom_window(),
+            ));
+        }
+        win_buttons = win_buttons.child(button(
             "win-close",
-            "✕",
+            WindowControlIcon::Close,
             theme.danger,
             |window, _| window.remove_window(),
-        );
+        ));
 
         Some(
             div()
@@ -198,9 +405,9 @@ impl Browser {
                 .flex()
                 .flex_row()
                 .items_center()
-                .bg(theme.sidebar)
+                .bg(header_bg)
                 .border_b_1()
-                .border_color(theme.border)
+                .border_color(header_border)
                 // Right-click opens the window manager menu (Move, Resize, Close...).
                 .on_mouse_down(
                     MouseButton::Right,
@@ -209,20 +416,27 @@ impl Browser {
                         window.show_window_menu(event.position);
                     }),
                 )
+                .child(menu_bar)
                 .child(
-                    // Draggable area covering the full titlebar width except the controls.
+                    // Draggable area covering the titlebar width between menu bar and window controls.
                     div()
                         .id("titlebar-drag")
                         .flex_1()
+                        .min_w_0()
                         .h_full()
                         .flex()
                         .items_center()
+                        .justify_center()
                         .px_3()
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|_, event: &MouseDownEvent, window, _| {
                                 if event.click_count >= 2 {
-                                    window.titlebar_double_click();
+                                    if cfg!(target_os = "macos") {
+                                        window.titlebar_double_click();
+                                    } else {
+                                        window.zoom_window();
+                                    }
                                 } else {
                                     window.start_window_move();
                                 }
@@ -230,25 +444,137 @@ impl Browser {
                         )
                         .child(
                             div()
-                                .flex_1()
-                                .text_size(px(theme.font_size - 1.))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme.text_muted)
+                                .text_size(px(theme.font_size))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme.text)
                                 .truncate()
                                 .child(title),
                         ),
                 )
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .h_full()
-                        .flex_none()
-                        .child(min_btn)
-                        .child(max_btn)
-                        .child(close_btn),
-                ),
+                .child(win_buttons),
         )
+    }
+
+    /// Interactive 8-way resize edges and corners when client-side window
+    /// decorations are active (e.g. GNOME Wayland).
+    fn render_resize_handles(&self, window: &Window, cx: &mut Context<Self>) -> Vec<gpui::Stateful<gpui::Div>> {
+        let gpui::Decorations::Client { tiling } = window.window_decorations() else {
+            return Vec::new();
+        };
+        if window.is_maximized() || window.is_fullscreen() {
+            return Vec::new();
+        }
+        let edge_px = px(CSD_SHADOW_SIZE + 4.);
+        let corner_px = px(CSD_SHADOW_SIZE + 10.);
+        let start = |edge: gpui::ResizeEdge| {
+            cx.listener(move |_, _: &MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                window.start_window_resize(edge);
+            })
+        };
+
+        let mut handles = Vec::with_capacity(8);
+        if !tiling.top {
+            handles.push(
+                div()
+                    .id("resize-top")
+                    .absolute()
+                    .top_0()
+                    .left(corner_px)
+                    .right(corner_px)
+                    .h(edge_px)
+                    .cursor(CursorStyle::ResizeUpDown)
+                    .on_mouse_down(MouseButton::Left, start(gpui::ResizeEdge::Top)),
+            );
+        }
+        if !tiling.bottom {
+            handles.push(
+                div()
+                    .id("resize-bottom")
+                    .absolute()
+                    .bottom_0()
+                    .left(corner_px)
+                    .right(corner_px)
+                    .h(edge_px)
+                    .cursor(CursorStyle::ResizeUpDown)
+                    .on_mouse_down(MouseButton::Left, start(gpui::ResizeEdge::Bottom)),
+            );
+        }
+        if !tiling.left {
+            handles.push(
+                div()
+                    .id("resize-left")
+                    .absolute()
+                    .left_0()
+                    .top(corner_px)
+                    .bottom(corner_px)
+                    .w(edge_px)
+                    .cursor(CursorStyle::ResizeLeftRight)
+                    .on_mouse_down(MouseButton::Left, start(gpui::ResizeEdge::Left)),
+            );
+        }
+        if !tiling.right {
+            handles.push(
+                div()
+                    .id("resize-right")
+                    .absolute()
+                    .right_0()
+                    .top(corner_px)
+                    .bottom(corner_px)
+                    .w(edge_px)
+                    .cursor(CursorStyle::ResizeLeftRight)
+                    .on_mouse_down(MouseButton::Left, start(gpui::ResizeEdge::Right)),
+            );
+        }
+        if !tiling.top && !tiling.left {
+            handles.push(
+                div()
+                    .id("resize-top-left")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size(corner_px)
+                    .cursor(CursorStyle::ResizeUpLeftDownRight)
+                    .on_mouse_down(MouseButton::Left, start(gpui::ResizeEdge::TopLeft)),
+            );
+        }
+        if !tiling.top && !tiling.right {
+            handles.push(
+                div()
+                    .id("resize-top-right")
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .size(corner_px)
+                    .cursor(CursorStyle::ResizeUpRightDownLeft)
+                    .on_mouse_down(MouseButton::Left, start(gpui::ResizeEdge::TopRight)),
+            );
+        }
+        if !tiling.bottom && !tiling.left {
+            handles.push(
+                div()
+                    .id("resize-bottom-left")
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .size(corner_px)
+                    .cursor(CursorStyle::ResizeUpRightDownLeft)
+                    .on_mouse_down(MouseButton::Left, start(gpui::ResizeEdge::BottomLeft)),
+            );
+        }
+        if !tiling.bottom && !tiling.right {
+            handles.push(
+                div()
+                    .id("resize-bottom-right")
+                    .absolute()
+                    .bottom_0()
+                    .right_0()
+                    .size(corner_px)
+                    .cursor(CursorStyle::ResizeUpLeftDownRight)
+                    .on_mouse_down(MouseButton::Left, start(gpui::ResizeEdge::BottomRight)),
+            );
+        }
+        handles
     }
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -528,7 +854,7 @@ impl Browser {
                         div()
                             .w(px(170.))
                             .flex_none()
-                            .font_family("Menlo")
+                            .font_family(monospace_font())
                             .text_size(px(theme.font_size - 1.))
                             .text_color(theme.accent)
                             .child(*query),
@@ -1828,7 +2154,7 @@ impl Browser {
                 .bg(theme.background)
                 .border_1()
                 .border_color(theme.border)
-                .font_family("Menlo")
+                .font_family(monospace_font())
                 .text_size(px(theme.font_size - 2.))
                 .line_height(px(theme.font_size + 3.))
                 .child(text)
@@ -2549,6 +2875,10 @@ fn search_placeholder() -> &'static str {
 
 fn root_volume_name() -> &'static str {
     if cfg!(target_os = "macos") { "Macintosh HD" } else { "Filesystem" }
+}
+
+pub(crate) fn monospace_font() -> &'static str {
+    if cfg!(target_os = "macos") { "Menlo" } else { "DejaVu Sans Mono" }
 }
 
 /// "15 October 2026 at 14:03".

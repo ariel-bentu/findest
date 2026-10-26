@@ -72,13 +72,63 @@ pub fn dir_size(dir: &Path, cancel: &AtomicBool) -> Option<(u64, u64)> {
 }
 
 /// Extensions previewed as text without sniffing their contents.
-const TEXT_EXTENSIONS: &[&str] = &[
+pub const TEXT_EXTENSIONS: &[&str] = &[
     "txt", "md", "markdown", "rst", "log", "csv", "tsv", "json", "jsonc", "toml", "yaml", "yml", "xml", "ini",
     "cfg", "conf", "env", "properties", "rs", "py", "js", "mjs", "cjs", "ts", "tsx", "jsx", "go", "java", "kt",
     "swift", "c", "h", "cc", "cpp", "hpp", "m", "mm", "rb", "php", "sh", "bash", "zsh", "fish", "ps1", "sql",
     "html", "htm", "css", "scss", "less", "vue", "svelte", "lua", "pl", "r", "scala", "dart", "gradle", "tf",
-    "proto", "graphql", "lock", "gitignore", "dockerignore", "editorconfig", "plist", "srt", "tex",
+    "proto", "graphql", "lock", "gitignore", "dockerignore", "editorconfig", "plist", "srt", "tex", "svg",
 ];
+
+/// Whether `path` is a readable text file (by extension or by sniffing the first 8 KB).
+pub fn is_text_file(path: &Path) -> bool {
+    use std::io::Read;
+    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
+    if ext.as_deref() == Some("pdf") {
+        return false;
+    }
+    let known = ext.as_deref().is_some_and(|e| TEXT_EXTENSIONS.contains(&e))
+        || path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+            (n.starts_with('.') && !n[1..].contains('.'))
+                || matches!(
+                    n.to_ascii_lowercase().as_str(),
+                    "makefile"
+                        | "dockerfile"
+                        | "containerfile"
+                        | "justfile"
+                        | "vagrantfile"
+                        | "gemfile"
+                        | "rakefile"
+                        | "procfile"
+                        | "license"
+                        | "copying"
+                        | "readme"
+                        | "changelog"
+                        | "authors"
+                        | "codeowners"
+                )
+        });
+    let Ok(meta) = fs::metadata(path) else {
+        return known;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    let mut buf = Vec::with_capacity(8192);
+    let Ok(mut file) = fs::File::open(path) else { return false };
+    if (&mut file).take(8192).read_to_end(&mut buf).is_err() {
+        return false;
+    }
+    if buf.contains(&0) {
+        return false;
+    }
+    if known {
+        return true;
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let replaced = text.chars().filter(|&c| c == char::REPLACEMENT_CHARACTER).count();
+    replaced * 100 <= text.chars().count().max(1)
+}
 
 /// Up to `max_lines` lines of a text file, or `None` for binary files.
 /// Reads at most 64 KB. Unknown extensions are sniffed: no NUL bytes and

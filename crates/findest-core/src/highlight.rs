@@ -62,7 +62,17 @@ pub struct Preview {
 }
 
 pub fn has_own_preview(path: &Path) -> bool {
-    has_extension(path, OWN_PREVIEW_EXTENSIONS)
+    if has_extension(path, OWN_PREVIEW_EXTENSIONS) {
+        return true;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        crate::info::is_text_file(path)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        false
+    }
 }
 
 fn has_extension(path: &Path, extensions: &[&str]) -> bool {
@@ -193,14 +203,26 @@ fn json_spans(line: &str, dark: bool) -> Vec<Span> {
 
 fn syntax_for(path: &Path, text: &str) -> &'static SyntaxReference {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let by_ext = |ext: &str| SYNTAXES.find_syntax_by_extension(ext);
     // Grammars missing from syntect's defaults borrow a close one.
     let fallback = match ext.to_ascii_lowercase().as_str() {
-        "toml" | "cfg" | "conf" | "env" | "properties" | "tf" | "hcl" => by_ext("ini").or_else(|| by_ext("sh")),
+        "toml" | "cfg" | "conf" | "env" | "properties" | "tf" | "hcl" | "lock" | "editorconfig" => {
+            by_ext("ini").or_else(|| by_ext("sh"))
+        }
         "gradle" => by_ext("groovy").or_else(|| by_ext("java")),
-        "proto" => by_ext("c"),
-        "ndjson" | "jsonl" => by_ext("json"),
-        _ => None,
+        "proto" | "swift" => by_ext("c"),
+        "ndjson" | "jsonl" | "jsonc" => by_ext("json"),
+        "ts" | "tsx" | "jsx" | "mjs" | "cjs" => by_ext("js"),
+        "kt" | "kts" => by_ext("java"),
+        "vue" | "svelte" => by_ext("html"),
+        "scss" | "less" => by_ext("css"),
+        "zsh" | "fish" | "gitignore" | "dockerignore" => by_ext("sh"),
+        _ => match name.to_ascii_lowercase().as_str() {
+            "dockerfile" | "containerfile" | "justfile" => by_ext("sh"),
+            "makefile" => by_ext("make").or_else(|| by_ext("sh")),
+            _ => None,
+        },
     };
     by_ext(ext)
         .or_else(|| by_ext(&ext.to_ascii_lowercase()))

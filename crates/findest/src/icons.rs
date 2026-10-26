@@ -123,10 +123,130 @@ impl IconKey {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = pixels;
-            None
+            let size = pixels.round().max(16.0) as u32;
+            match self {
+                IconKey::Folder => render_linux_folder_png(size),
+                IconKey::Path(path) if path.is_dir() || path.extension().is_none() => render_linux_folder_png(size),
+                IconKey::Path(path) => {
+                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    render_linux_file_png(size, ext)
+                }
+                IconKey::Extension(ext) => render_linux_file_png(size, ext),
+                IconKey::File => render_linux_file_png(size, ""),
+                IconKey::Symbol { .. } | IconKey::Large(_) | IconKey::Tinted(..) | IconKey::Thumbnail { .. } => {
+                    unreachable!("handled above")
+                }
+            }
         }
     }
+}
+
+/// Renders a shaded macOS/Adwaita-style blue folder icon at `size × size` so
+/// folders look crisp at any DPI and [`IconKey::Tinted`] can recolor them for
+/// folder color tags.
+#[cfg(not(target_os = "macos"))]
+fn render_linux_folder_png(size: u32) -> Option<Vec<u8>> {
+    let mut img = image::RgbaImage::new(size, size);
+    let s = size as f32;
+    let left = s * 0.08;
+    let right = s * 0.92;
+    let tab_top = s * 0.16;
+    let body_top = s * 0.26;
+    let bottom = s * 0.86;
+    let tab_right = s * 0.44;
+    let radius = (s * 0.06).max(2.0);
+
+    let in_rounded_rect = |x: f32, y: f32, x0: f32, y0: f32, x1: f32, y1: f32, r: f32| -> f32 {
+        let qx = (x - (x0 + x1) * 0.5).abs() - ((x1 - x0) * 0.5 - r);
+        let qy = (y - (y0 + y1) * 0.5).abs() - ((y1 - y0) * 0.5 - r);
+        let dist = (qx.max(0.0).hypot(qy.max(0.0)) + qx.min(qy).min(0.0)) - r;
+        (0.5 - dist).clamp(0.0, 1.0)
+    };
+
+    for (py, px_row) in img.enumerate_rows_mut() {
+        let y = py as f32 + 0.5;
+        for (px, _, pixel) in px_row {
+            let x = px as f32 + 0.5;
+            let body_a = in_rounded_rect(x, y, left, body_top, right, bottom, radius);
+            let tab_a = in_rounded_rect(x, y, left, tab_top, tab_right, body_top + radius * 1.5, radius * 0.8);
+            let a = body_a.max(tab_a);
+            if a <= 0.0 {
+                continue;
+            }
+            let (r, g, b) = if body_a >= tab_a && y >= body_top {
+                let t = ((y - body_top) / (bottom - body_top)).clamp(0.0, 1.0);
+                // Top highlight ridge
+                if (y - body_top) < (s * 0.025).max(1.5) {
+                    (135u8, 212u8, 248u8)
+                } else {
+                    // Shaded around [89, 189, 235] (luma ~0.64) so tint_pixel maps it accurately.
+                    let shade = 1.06 - 0.14 * t;
+                    (
+                        (89.0 * shade).clamp(0.0, 255.0) as u8,
+                        (189.0 * shade).clamp(0.0, 255.0) as u8,
+                        (235.0 * shade).clamp(0.0, 255.0) as u8,
+                    )
+                }
+            } else {
+                // Darker back tab
+                (68u8, 158u8, 208u8)
+            };
+            *pixel = image::Rgba([r, g, b, (a * 255.0).round() as u8]);
+        }
+    }
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut out, image::ImageFormat::Png).ok()?;
+    Some(out.into_inner())
+}
+
+/// Renders a clean document page icon with a folded corner and extension accent.
+#[cfg(not(target_os = "macos"))]
+fn render_linux_file_png(size: u32, ext: &str) -> Option<Vec<u8>> {
+    let mut img = image::RgbaImage::new(size, size);
+    let s = size as f32;
+    let left = s * 0.18;
+    let right = s * 0.82;
+    let top = s * 0.10;
+    let bottom = s * 0.90;
+    let fold = s * 0.22;
+    let accent: [u8; 3] = match ext.to_ascii_lowercase().as_str() {
+        "pdf" => [225, 65, 55],
+        "rs" | "toml" | "json" | "yaml" | "yml" => [230, 140, 45],
+        "py" | "js" | "ts" | "tsx" | "go" | "c" | "cpp" | "h" | "sh" => [65, 145, 225],
+        "zip" | "gz" | "tgz" | "xz" | "7z" | "rar" | "tar" => [190, 145, 85],
+        "mp3" | "wav" | "flac" | "mp4" | "mkv" | "mov" => [165, 95, 215],
+        _ => [140, 150, 165],
+    };
+
+    for (py, px_row) in img.enumerate_rows_mut() {
+        let y = py as f32 + 0.5;
+        for (px, _, pixel) in px_row {
+            let x = px as f32 + 0.5;
+            if x < left || x > right || y < top || y > bottom {
+                continue;
+            }
+            // Top-right corner cut
+            if (x - (right - fold)) + (top + fold - y) > fold {
+                continue;
+            }
+            let in_fold = x >= (right - fold) && y <= (top + fold);
+            let border = x - left < 1.5 || right - x < 1.5 || y - top < 1.5 || bottom - y < 1.5;
+            let stripe = y >= bottom - s * 0.18 && y <= bottom - s * 0.07 && x >= left + s * 0.08 && x <= right - s * 0.08;
+            let [r, g, b] = if in_fold {
+                [200, 206, 214]
+            } else if border {
+                [185, 192, 202]
+            } else if stripe {
+                accent
+            } else {
+                [242, 245, 249]
+            };
+            *pixel = image::Rgba([r, g, b, 255]);
+        }
+    }
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut out, image::ImageFormat::Png).ok()?;
+    Some(out.into_inner())
 }
 
 /// Recolors an icon (a PNG) with `rgb`, keeping its shading.
@@ -231,7 +351,6 @@ pub fn load_icon(key: &IconKey) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "macos")]
     fn is_png(bytes: &[u8]) -> bool {
         bytes.starts_with(b"\x89PNG")
     }
@@ -250,7 +369,6 @@ mod tests {
         assert!(light[1] > tinted[1] && light[2] > tinted[2], "highlights get lighter");
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn tinted_folder_icons_render() {
         let folder = IconKey::Folder.load().unwrap();
@@ -320,8 +438,10 @@ mod tests {
 
     #[cfg(not(target_os = "macos"))]
     #[test]
-    fn uses_text_fallbacks_without_native_icons() {
-        assert!(load_icon(&IconKey::Folder).is_none());
+    fn renders_linux_folder_and_file_icons() {
+        assert!(load_icon(&IconKey::Folder).is_some_and(|b| is_png(&b)));
+        assert!(load_icon(&IconKey::File).is_some_and(|b| is_png(&b)));
+        assert!(load_icon(&IconKey::Extension("rs".into())).is_some_and(|b| is_png(&b)));
         assert!(load_icon(&IconKey::Symbol { name: "folder", rgb: 0 }).is_none());
     }
 

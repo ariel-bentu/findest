@@ -36,9 +36,36 @@ pub fn reveal_in_finder(path: &Path) -> Result<()> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        // xdg-open has no "select this file" mode, so open the containing folder.
-        let target = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
-        spawn_detached(&[opener().to_string(), target.display().to_string()])
+        let owned = path.to_path_buf();
+        let uri = crate::paths::file_url(&owned);
+        let fallback_dir = if owned.is_dir() { owned.clone() } else { owned.parent().unwrap_or(&owned).to_path_buf() };
+        std::thread::spawn(move || {
+            let ok = Command::new("dbus-send")
+                .args([
+                    "--session",
+                    "--print-reply",
+                    "--dest=org.freedesktop.FileManager1",
+                    "--type=method_call",
+                    "/org/freedesktop/FileManager1",
+                    "org.freedesktop.FileManager1.ShowItems",
+                    &format!("array:string:{uri}"),
+                    "string:",
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            if !ok {
+                let _ = Command::new(opener())
+                    .arg(fallback_dir)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        });
+        Ok(())
     }
 }
 

@@ -108,8 +108,17 @@ pub fn read_color(path: &Path) -> Option<TagColor> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = path;
-        None
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+        let mut buf = [0u8; 4];
+        // SAFETY: valid C strings and buffer of the given size.
+        let n = unsafe {
+            libc::getxattr(path.as_ptr(), c"user.findest.color".as_ptr(), buf.as_mut_ptr().cast(), buf.len())
+        };
+        if n < 1 {
+            return None;
+        }
+        TagColor::from_label(buf[0])
     }
 }
 

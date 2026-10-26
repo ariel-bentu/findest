@@ -249,15 +249,99 @@ pub use mac::*;
 
 #[cfg(not(target_os = "macos"))]
 mod imp {
+    use std::cell::RefCell;
     use std::path::PathBuf;
+    use std::process::{Command, Stdio};
 
-    pub fn is_open_for(_window: &gpui::Window) -> bool {
-        false
+    thread_local! {
+        static OPEN_PATH: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
     }
 
-    pub fn toggle(_window: &gpui::Window, _paths: Vec<PathBuf>, _cx: &gpui::App) {}
+    pub fn is_open_for(_window: &gpui::Window) -> bool {
+        OPEN_PATH.with(|p| p.borrow().is_some())
+    }
 
-    pub fn follow(_paths: Vec<PathBuf>, _cx: &gpui::App) {}
+    pub fn toggle(_window: &gpui::Window, paths: Vec<PathBuf>, cx: &gpui::App) {
+        let current = OPEN_PATH.with(|p| p.borrow().clone());
+        let next = paths.into_iter().next();
+        if current.is_some() && (next.is_none() || current == next) {
+            OPEN_PATH.with(|p| *p.borrow_mut() = None);
+            cx.background_executor().spawn(async move { close_sushi() }).detach();
+            return;
+        }
+        if let Some(path) = next {
+            OPEN_PATH.with(|p| *p.borrow_mut() = Some(path.clone()));
+            cx.background_executor().spawn(async move { show_sushi(&path) }).detach();
+        }
+    }
+
+    pub fn follow(paths: Vec<PathBuf>, cx: &gpui::App) {
+        if !OPEN_PATH.with(|p| p.borrow().is_some()) {
+            return;
+        }
+        let next = paths.into_iter().next();
+        if OPEN_PATH.with(|p| *p.borrow() == next) {
+            return;
+        }
+        OPEN_PATH.with(|p| *p.borrow_mut() = next.clone());
+        cx.background_executor()
+            .spawn(async move {
+                match next {
+                    Some(path) => show_sushi(&path),
+                    None => close_sushi(),
+                }
+            })
+            .detach();
+    }
+
+    fn show_sushi(path: & std::path::Path) {
+        let uri = findest_core::paths::file_url(path);
+        // GNOME Sushi exposes org.gnome.NautilusPreviewer on the session bus.
+        let status = Command::new("gdbus")
+            .args([
+                "call",
+                "--session",
+                "--dest",
+                "org.gnome.NautilusPreviewer",
+                "--object-path",
+                "/org/gnome/NautilusPreviewer",
+                "--method",
+                "org.gnome.NautilusPreviewer.ShowFile",
+                &uri,
+                "0",
+                "true",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if !status.is_ok_and(|s| s.success()) {
+            let _ = Command::new("sushi")
+                .arg(path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+        }
+    }
+
+    fn close_sushi() {
+        let _ = Command::new("gdbus")
+            .args([
+                "call",
+                "--session",
+                "--dest",
+                "org.gnome.NautilusPreviewer",
+                "--object-path",
+                "/org/gnome/NautilusPreviewer",
+                "--method",
+                "org.gnome.NautilusPreviewer.Close",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
