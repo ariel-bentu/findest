@@ -1190,7 +1190,7 @@ impl Browser {
         };
         let locs = &self.config.locations;
         if locs.macintosh_hd {
-            push_location("loc-root".into(), "internaldrive", root_volume_name().into(), PathBuf::from("/"));
+            push_location("loc-root".into(), "internaldrive", locations::root_label().into(), PathBuf::from("/"));
         }
         if locs.volumes {
             for (ix, v) in self.volumes.iter().enumerate() {
@@ -2892,10 +2892,6 @@ fn icon_for(entry: &Entry) -> &'static str {
 
 fn search_placeholder() -> &'static str {
     if cfg!(target_os = "macos") { "Search  ⌘F" } else { "Search  Ctrl+F" }
-}
-
-fn root_volume_name() -> &'static str {
-    if cfg!(target_os = "macos") { "Macintosh HD" } else { "Filesystem" }
 }
 
 pub(crate) fn monospace_font() -> &'static str {

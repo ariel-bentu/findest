@@ -400,7 +400,8 @@ pub fn friendly_name(home: &Path, path: &Path) -> String {
     }
 }
 
-fn root_label() -> &'static str {
+/// What the sidebar and breadcrumbs call `/`.
+pub fn root_label() -> &'static str {
     #[cfg(target_os = "macos")]
     {
         "Macintosh HD"

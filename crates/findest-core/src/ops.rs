@@ -554,6 +554,7 @@ fn copy_recursive(src: &Path, dst: &Path, chunked: bool, resume: bool, progress:
             copy_recursive(&item.path(), &dst.join(item.file_name()), chunked, resume, progress)?;
         }
         fs::set_permissions(dst, meta.permissions())?;
+        #[cfg(not(target_os = "macos"))]
         copy_metadata(src, dst, &meta);
     } else {
         copy_file(src, dst, &meta, chunked, resume, progress)?;
@@ -578,14 +579,11 @@ fn copy_file(src: &Path, dst: &Path, meta: &fs::Metadata, chunked: bool, resume:
         Err(e) => return Err(e).with_context(|| format!("reading {}", src.display())),
     };
     if !chunked {
-        #[cfg(target_os = "linux")]
-        if try_ficlone(&input, dst, meta) {
-            copy_metadata(src, dst, meta);
-            return progress.file_done(len);
-        }
-        // std uses clonefile/fcopyfile on macOS, so this is cheap on APFS.
+        // std uses clonefile/fcopyfile on macOS (cheap on APFS, and it copies
+        // the metadata), and copy_file_range on Linux (a reflink on btrfs and XFS).
         drop(input);
         fs::copy(src, dst).with_context(|| format!("copying {}", src.display()))?;
+        #[cfg(not(target_os = "macos"))]
         copy_metadata(src, dst, meta);
         return progress.file_done(len);
     }
@@ -614,20 +612,37 @@ fn copy_file(src: &Path, dst: &Path, meta: &fs::Metadata, chunked: bool, resume:
     progress.file_done(0)
 }
 
-#[cfg(target_os = "linux")]
-fn try_ficlone(src_file: &fs::File, dst: &Path, meta: &fs::Metadata) -> bool {
-    use std::os::fd::AsRawFd;
-    let Ok(dst_file) = fs::File::create(dst) else {
-        return false;
+/// Copies the `user.*` extended attributes (findest's colors, other tools'
+/// tags and comments). Others (ACLs, SELinux labels) belong to the new file.
+#[cfg(not(target_os = "macos"))]
+fn copy_user_xattrs(src: &Path, dst: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let (Ok(from), Ok(to)) = (std::ffi::CString::new(src.as_os_str().as_bytes()), std::ffi::CString::new(dst.as_os_str().as_bytes())) else {
+        return;
     };
-    let rc = unsafe { libc::ioctl(dst_file.as_raw_fd(), libc::FICLONE as _, src_file.as_raw_fd()) };
-    if rc == 0 {
-        let _ = dst_file.set_permissions(meta.permissions());
-        true
-    } else {
-        drop(dst_file);
-        let _ = fs::remove_file(dst);
-        false
+    // SAFETY: valid C strings, and buffers of the sizes passed.
+    unsafe {
+        let size = libc::listxattr(from.as_ptr(), std::ptr::null_mut(), 0);
+        if size <= 0 {
+            return;
+        }
+        let mut names = vec![0u8; size as usize];
+        let size = libc::listxattr(from.as_ptr(), names.as_mut_ptr().cast(), names.len());
+        if size <= 0 {
+            return;
+        }
+        for name in names[..size as usize].split(|&b| b == 0).filter(|n| n.starts_with(b"user.")) {
+            let Ok(name) = std::ffi::CString::new(name) else { continue };
+            let len = libc::getxattr(from.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0);
+            if len < 0 {
+                continue;
+            }
+            let mut value = vec![0u8; len as usize];
+            let len = libc::getxattr(from.as_ptr(), name.as_ptr(), value.as_mut_ptr().cast(), value.len());
+            if len >= 0 {
+                libc::setxattr(to.as_ptr(), name.as_ptr(), value.as_ptr().cast(), len as usize, 0);
+            }
+        }
     }
 }
 
@@ -643,33 +658,7 @@ fn copy_metadata(src: &Path, dst: &Path, meta: &fs::Metadata) {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        use std::os::unix::ffi::OsStrExt;
-        const COLOR_XATTR: &[u8] = b"user.findest.color\0";
-        if let (Ok(from), Ok(to)) = (
-            std::ffi::CString::new(src.as_os_str().as_bytes()),
-            std::ffi::CString::new(dst.as_os_str().as_bytes()),
-        ) {
-            let mut buf = [0u8; 32];
-            let n = unsafe {
-                libc::getxattr(
-                    from.as_ptr(),
-                    COLOR_XATTR.as_ptr().cast(),
-                    buf.as_mut_ptr().cast(),
-                    buf.len(),
-                )
-            };
-            if n > 0 && (n as usize) <= buf.len() {
-                unsafe {
-                    libc::setxattr(
-                        to.as_ptr(),
-                        COLOR_XATTR.as_ptr().cast(),
-                        buf.as_ptr().cast(),
-                        n as usize,
-                        0,
-                    );
-                }
-            }
-        }
+        copy_user_xattrs(src, dst);
         let _ = fs::set_permissions(dst, meta.permissions());
     }
     if let (Ok(file), Ok(modified)) = (fs::OpenOptions::new().write(true).open(dst), meta.modified()) {
@@ -979,6 +968,35 @@ mod tests {
         assert_eq!(fs::read_dir(&files).unwrap().count(), 0);
         #[cfg(not(target_os = "macos"))]
         assert_eq!(fs::read_dir(tmp.path().join("Trash/info")).unwrap().count(), 0);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn copies_user_extended_attributes() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dst) = (tmp.path().join("a"), tmp.path().join("b"));
+        fs::write(&src, "x").unwrap();
+        fs::write(&dst, "x").unwrap();
+        let path = std::ffi::CString::new(src.as_os_str().as_bytes()).unwrap();
+        for (name, value) in [(c"user.findest.color", &[3u8][..]), (c"user.other.comment", b"hello")] {
+            // SAFETY: valid C strings and a buffer of the given length.
+            let rc = unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
+            if rc != 0 {
+                eprintln!("skipped: this file system has no user extended attributes");
+                return;
+            }
+        }
+        copy_metadata(&src, &dst, &fs::metadata(&src).unwrap());
+        let read = |name: &std::ffi::CStr| {
+            let to = std::ffi::CString::new(dst.as_os_str().as_bytes()).unwrap();
+            let mut buf = [0u8; 16];
+            // SAFETY: valid C strings and buffer.
+            let n = unsafe { libc::getxattr(to.as_ptr(), name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+            buf[..n.max(0) as usize].to_vec()
+        };
+        assert_eq!(read(c"user.findest.color"), [3]);
+        assert_eq!(read(c"user.other.comment"), b"hello");
     }
 
     #[test]

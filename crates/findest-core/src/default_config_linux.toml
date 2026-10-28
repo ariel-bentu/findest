@@ -110,7 +110,7 @@ content_max_mb = 20
 # "none" to disable it. Openers are bound with "open_with:<name>".
 # "secondary" is Ctrl on Linux (Command on macOS).
 # Built-in defaults include: secondary-e = open_with:VS Code,
-# secondary-alt-t = open_with:Terminal, enter = rename, secondary-o = open.
+# secondary-shift-e = open_with:Terminal, f2 = rename, secondary-o = open.
 [keybindings]
 # "enter" = "open"
 # "f2" = "rename"

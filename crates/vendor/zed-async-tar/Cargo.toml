@@ -49,30 +49,6 @@ default = ["xattr"]
 name = "zed_async_tar"
 path = "src/lib.rs"
 
-[[example]]
-name = "extract_file"
-path = "examples/extract_file.rs"
-
-[[example]]
-name = "list"
-path = "examples/list.rs"
-
-[[example]]
-name = "raw_list"
-path = "examples/raw_list.rs"
-
-[[example]]
-name = "write"
-path = "examples/write.rs"
-
-[[test]]
-name = "all"
-path = "tests/all.rs"
-
-[[test]]
-name = "entry"
-path = "tests/entry.rs"
-
 [dependencies.async-std]
 version = "1.12.0"
 features = ["unstable"]

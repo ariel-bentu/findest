@@ -318,7 +318,9 @@ mod tests {
         #[cfg(not(target_os = "macos"))]
         {
             assert_eq!(shortcut_label(&map, "new_folder").unwrap(), "Ctrl+Shift+N");
-            assert_eq!(shortcut_label(&map, "trash").unwrap(), "Ctrl+Backspace");
+            // The shortest binding is shown: Delete also trashes on Linux.
+            assert_eq!(shortcut_label(&map, "trash").unwrap(), "Delete");
+            assert_eq!(shortcut_label(&map, "rename").unwrap(), "F2");
             assert_eq!(shortcut_label(&map, "open").unwrap(), "Ctrl+O");
             assert_eq!(shortcut_label(&map, "zoom_out").unwrap(), "Ctrl+-");
         }
