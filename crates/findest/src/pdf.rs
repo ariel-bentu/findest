@@ -104,8 +104,32 @@ mod imp {
     use super::*;
     use std::process::{Command, Stdio};
 
+    type Sizes = Arc<Vec<(f32, f32)>>;
+
+    /// The sizes last read, and for which file: drawing a page needs its size,
+    /// and each page is drawn separately as it scrolls into view.
+    static SIZES: Mutex<Option<(std::path::PathBuf, Option<std::time::SystemTime>, Sizes)>> = Mutex::new(None);
+
     /// Each page's size in points (width, height), read via `pdfinfo`.
     pub fn page_sizes(path: &Path) -> Result<Vec<(f32, f32)>, String> {
+        sizes_cached(path).map(|sizes| sizes.to_vec())
+    }
+
+    /// Like `read_sizes`, but `pdfinfo` runs again only when the file changes.
+    pub(super) fn sizes_cached(path: &Path) -> Result<Sizes, String> {
+        let modified = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        if let Some((cached, when, sizes)) = SIZES.lock().unwrap().as_ref()
+            && cached == path
+            && *when == modified
+        {
+            return Ok(sizes.clone());
+        }
+        let sizes = Arc::new(read_sizes(path)?);
+        *SIZES.lock().unwrap() = Some((path.to_path_buf(), modified, sizes.clone()));
+        Ok(sizes)
+    }
+
+    fn read_sizes(path: &Path) -> Result<Vec<(f32, f32)>, String> {
         if !path.is_file() {
             return Err("not a readable PDF".into());
         }
@@ -165,7 +189,7 @@ mod imp {
 
     /// Page `index` (from 0) drawn `width` pixels wide on white via `pdftoppm`, as gpui's BGRA image.
     pub fn render_page(path: &Path, index: usize, width: u32) -> Option<RenderImage> {
-        let sizes = page_sizes(path).ok()?;
+        let sizes = sizes_cached(path).ok()?;
         let &(pw, ph) = sizes.get(index)?;
         let (pw, ph) = (pw as f64, ph as f64);
         let scale = (width as f64 / pw).min(MAX_PIXELS / pw.max(ph));
@@ -235,6 +259,15 @@ mod tests {
         assert_eq!((size.width.0, size.height.0), (396, 306));
         assert!(image.as_bytes(0).unwrap().iter().all(|&b| b == 255), "a blank page on white");
         assert!(render_page(&path, 1, 100).is_none());
+        #[cfg(not(target_os = "macos"))]
+        {
+            // Drawing pages doesn't read the sizes again until the file changes.
+            let first = imp::sizes_cached(&path).unwrap();
+            assert!(Arc::ptr_eq(&first, &imp::sizes_cached(&path).unwrap()));
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60)).unwrap();
+            assert!(!Arc::ptr_eq(&first, &imp::sizes_cached(&path).unwrap()));
+        }
         assert!(page_sizes(&tmp.path().join("missing.pdf")).is_err());
     }
 }

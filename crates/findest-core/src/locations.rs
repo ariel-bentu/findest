@@ -58,6 +58,26 @@ pub fn cloud_places(home: &Path) -> Vec<Place> {
     places
 }
 
+/// How long `cloud_root` reuses the folders it found: it runs for every
+/// breadcrumb on every frame, and listing the home folder isn't free.
+#[cfg(not(target_os = "macos"))]
+const CLOUD_CACHE_SECS: u64 = 10;
+
+#[cfg(not(target_os = "macos"))]
+static CLOUD_CACHE: std::sync::Mutex<Vec<(PathBuf, std::time::Instant, Vec<Place>)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(not(target_os = "macos"))]
+fn linux_cloud_places_cached(home: &Path) -> Vec<Place> {
+    let mut cache = CLOUD_CACHE.lock().unwrap();
+    cache.retain(|(_, at, _)| at.elapsed().as_secs() < CLOUD_CACHE_SECS);
+    if let Some((_, _, places)) = cache.iter().find(|(h, _, _)| h == home) {
+        return places.clone();
+    }
+    let places = linux_cloud_places(home);
+    cache.push((home.to_path_buf(), std::time::Instant::now(), places.clone()));
+    places
+}
+
 #[cfg(not(target_os = "macos"))]
 fn linux_cloud_places(home: &Path) -> Vec<Place> {
     let mut places = Vec::new();
@@ -278,27 +298,52 @@ pub fn volumes() -> Vec<Place> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let mut roots = vec![PathBuf::from("/media"), PathBuf::from("/mnt")];
-        // systemd mounts removable media here.
-        if let Some(user) = dirs::home_dir().and_then(|h| h.file_name().map(|n| n.to_owned())) {
-            roots.push(PathBuf::from("/run/media").join(user));
-        }
-        let mut volumes = Vec::new();
-        for root in roots {
-            let Ok(read) = fs::read_dir(root) else { continue };
-            for path in read.filter_map(|e| e.ok()).map(|e| e.path()) {
-                if path.is_dir()
-                    && !path.is_symlink()
-                    && !path.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.'))
-                {
-                    volumes.push(Place { label: crate::paths::display_name(&path), path });
-                }
-            }
-        }
+        let mounts = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+        let mut volumes: Vec<Place> = user_mount_points(&mounts)
+            .into_iter()
+            .filter(|p| p.is_dir())
+            .map(|path| Place { label: crate::paths::display_name(&path), path })
+            .collect();
         volumes.sort_by(|a, b| a.label.cmp(&b.label));
         volumes.dedup_by(|a, b| a.path == b.path);
         volumes
     }
+}
+
+/// Mount points of user-visible drives in `/proc/self/mountinfo`: what's
+/// actually mounted under `/media` (`/media/$USER/LABEL` on Debian and
+/// Ubuntu), `/run/media` (systemd) and `/mnt`, not every folder there.
+#[cfg(not(target_os = "macos"))]
+pub fn user_mount_points(mountinfo: &str) -> Vec<PathBuf> {
+    mountinfo
+        .lines()
+        .filter_map(|line| line.split(' ').nth(4))
+        .map(unescape_mountinfo)
+        .filter(|m| ["/media/", "/run/media/", "/mnt/"].iter().any(|root| m.starts_with(root)))
+        .filter(|m| !m.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')))
+        .collect()
+}
+
+/// mountinfo writes space, tab, newline and backslash as `\040`-style octal escapes.
+#[cfg(not(target_os = "macos"))]
+fn unescape_mountinfo(field: &str) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\'
+            && let Some(code) = field.get(i + 1..i + 4)
+            && let Ok(b) = u8::from_str_radix(code, 8)
+        {
+            out.push(b);
+            i += 4;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    PathBuf::from(std::ffi::OsString::from_vec(out))
 }
 
 /// The root of the cloud drive containing `path`, with its label.
@@ -322,7 +367,7 @@ pub fn cloud_root(home: &Path, path: &Path) -> Option<Place> {
                 return Some(Place { path: gvfs_dir.join(first), label });
             }
         }
-        if let Some(place) = linux_cloud_places(home)
+        if let Some(place) = linux_cloud_places_cached(home)
             .into_iter()
             .filter(|p| path.starts_with(&p.path))
             .max_by_key(|p| p.path.as_os_str().len())
@@ -355,7 +400,8 @@ pub fn friendly_name(home: &Path, path: &Path) -> String {
     }
 }
 
-fn root_label() -> &'static str {
+/// What the sidebar and breadcrumbs call `/`.
+pub fn root_label() -> &'static str {
     #[cfg(target_os = "macos")]
     {
         "Macintosh HD"
@@ -450,6 +496,39 @@ mod tests {
             gvfs_label("davs:host=cloud.example.com,user=bob,prefix=%2Fremote.php%2Fdav").as_deref(),
             Some("Nextcloud – bob@cloud.example.com")
         );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn breadcrumbs_do_not_list_the_home_folder_every_time() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        fs::create_dir_all(home.join("Dropbox/docs")).unwrap();
+        let inside = home.join("Dropbox/docs");
+        let first = cloud_root(home, &inside).unwrap();
+        assert_eq!(first.label, "Dropbox");
+        // Removed on disk, but still known for a few seconds.
+        fs::remove_dir_all(home.join("Dropbox")).unwrap();
+        assert_eq!(cloud_root(home, &inside).unwrap().path, first.path);
+        // The sidebar's own listing is never cached.
+        assert!(cloud_places(home).is_empty());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn finds_mounted_drives() {
+        let info = "\
+24 1 259:2 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p2 rw
+31 24 8:17 / /media/lior/USB\\040STICK rw,nosuid shared:5 - vfat /dev/sdb1 rw
+32 24 8:33 / /run/media/lior/Backup rw shared:6 - ext4 /dev/sdc1 rw
+33 24 8:49 / /mnt/data rw shared:7 - xfs /dev/sdd1 rw
+34 24 0:40 / /home/lior/.cache rw - tmpfs tmpfs rw
+35 24 0:41 / /mnt/.hidden rw - tmpfs tmpfs rw
+36 24 0:42 / /medianet rw - tmpfs tmpfs rw
+";
+        let found: Vec<String> = user_mount_points(info).iter().map(|p| p.display().to_string()).collect();
+        assert_eq!(found, vec!["/media/lior/USB STICK", "/run/media/lior/Backup", "/mnt/data"]);
+        assert!(user_mount_points("").is_empty());
     }
 
     #[cfg(not(target_os = "macos"))]

@@ -138,3 +138,24 @@ pub fn start_file_drag(
 pub fn option_key_down() -> bool {
     false
 }
+
+/// Whether a drop with these modifiers held should copy rather than move:
+/// ⌥ on macOS, Ctrl elsewhere (the file-manager convention).
+pub fn copy_modifier(modifiers: &gpui::Modifiers) -> bool {
+    if cfg!(target_os = "macos") { modifiers.alt } else { modifiers.control }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn ctrl_copies_on_linux() {
+        let none = gpui::Modifiers::default();
+        assert!(!copy_modifier(&none));
+        assert!(copy_modifier(&gpui::Modifiers { control: true, ..none }));
+        assert!(!copy_modifier(&gpui::Modifiers { alt: true, ..none }));
+        assert!(!copy_modifier(&gpui::Modifiers { shift: true, ..none }));
+    }
+}

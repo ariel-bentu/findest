@@ -11,10 +11,10 @@ A fast, keyboard-friendly file browser for macOS and Linux, written in Rust on [
 - **Type to jump:** start typing a name to select it; repeat a letter to cycle through matches.
 - **Copy, cut and paste** with progress, speed and time left. Copies can be paused, cancelled, and retried where they stopped. Name clashes ask first (Replace, Keep Both, Skip). Paste goes into the selected folder, or next to the selected file.
 - **Undo (⌘Z / Ctrl+Z)** for the last paste, drop, duplicate, compress or uncompress.
-- **Drag and drop** between Findest windows, Finder/file managers and other apps (on macOS), with auto-scroll near the list's edges.
+- **Drag and drop** between Findest windows, Finder and other apps (on macOS), or onto folders inside a window (on Linux; hold Ctrl to copy), with auto-scroll near the list's edges.
 - **Compress and uncompress** zip files; opening a .zip unpacks it next to it, in Findest.
 - **Folder colors:** right-click folders to pick a color. On macOS they're Finder's color tags, so Finder and Spotlight see them too; on Linux they're stored in `user.findest.color` extended attributes.
-- **Sidebar:** Recents, Favorites, cloud drives (iCloud Drive on macOS; Dropbox, OneDrive, Google Drive, Nextcloud, Proton Drive, pCloud, MEGA, Insync, Syncthing, ownCloud, Box, Keybase and GVFS cloud mounts on Linux), system disk (Macintosh HD / Filesystem), external volumes and the Trash.
+- **Sidebar:** Recents, Favorites, cloud drives (iCloud Drive on macOS; Dropbox, OneDrive, Google Drive, Nextcloud, ownCloud, MEGA, pCloud, Box, Insync and GVFS cloud mounts on Linux), system disk (Macintosh HD / Filesystem), external volumes and the Trash.
 - **Toolbar and path bar:** back/forward with history, the current folder's name (click for the folders above), a Go to bar that accepts pasted paths and completes them with Tab, a ⋯ menu of folder actions, and a clickable path bar at the bottom.
 - **Multiple windows (⌘N / Ctrl+N)**, each restored at launch with its folder, expanded folders, view and column widths.
 - **New folders and files start unnamed:** type a name, or press Esc to remove the item.
@@ -39,6 +39,8 @@ sudo dnf install gcc libxkbcommon-devel libxkbcommon-x11 vulkan-loader fontconfi
 # Arch Linux
 sudo pacman -S base-devel libxkbcommon libxkbcommon-x11 vulkan-icd-loader fontconfig
 ```
+
+Findest runs these tools when needed, so install them for the matching features: `poppler-utils` (PDF preview), `zip` and `unzip` (compress / uncompress), `xdg-utils` (open files, default file manager), `dbus` / `glib2` (`dbus-send`, `gdbus`: reveal in file manager, preview) and `gnome-sushi` (preview of other file types, optional).
 
 Build and install from a clone:
 
@@ -122,7 +124,7 @@ Changes apply as soon as you save the file. Open it with **⌘,** (macOS) or **C
 
 ## Default shortcuts
 
-> **Linux modifier keys:** On Linux, shortcuts use standard PC keys: **Ctrl** replaces **⌘**, **Alt** replaces **⌥**, **Enter** replaces **↩**, and **Backspace** replaces **⌫** (e.g. `Ctrl+F` for Find, `Ctrl+C` / `Ctrl+V` for Copy / Paste, `Ctrl+Shift+N` for New Folder, `Ctrl+Shift+T` for Add to Favorites, `Ctrl+Backspace` for Trash).
+> **Linux modifier keys:** On Linux, shortcuts use standard PC keys: **Ctrl** replaces **⌘**, **Alt** replaces **⌥**, **Enter** replaces **↩**, and **Backspace** replaces **⌫** (e.g. `Ctrl+F` for Find, `Ctrl+C` / `Ctrl+V` for Copy / Paste, `Ctrl+Shift+N` for New Folder, `Ctrl+Shift+T` for Add to Favorites, `Ctrl+Backspace` or `Delete` for Trash). File-manager keys also work: `F2` renames, `Ctrl+H` shows hidden files, `Alt+←` / `Alt+→` go back / forward, and `Ctrl+Shift+E` opens a terminal here (`Ctrl+Alt+T` is left to the desktop).
 
 | Keys | Command | Keys | Command |
 |---|---|---|---|
@@ -149,7 +151,7 @@ In tiles, the arrow keys move through the grid in both directions. In Quick Look
 
 ## Search (⌘F / Ctrl+F)
 
-Findest keeps an in-memory index of file names, a design inspired by FSearch and Everything: flat name-sorted arrays searched on all cores. It indexes about 1.2M files in ~7 s, and most queries finish in a few milliseconds. The index is saved to disk, so search works right away at launch. On macOS, file-change history (FSEvents) catches it up on whatever changed while Findest wasn't running without a rescan, and applies file changes as they happen. On Linux, current directories are watched live via inotify (`notify`), and a full rescan runs once a day at background priority (or on demand), so indexing stays out of the way of everything else. While a scan runs the status bar shows its progress; click it to pause indexing (for an hour, or until you resume) or turn it off for good (`indexing = false` under `[search]`). You choose what's indexed in `[search]` in the config.
+Findest keeps an in-memory index of file names, a design inspired by FSearch and Everything: flat name-sorted arrays searched on all cores. It indexes about 1.2M files in ~7 s, and most queries finish in a few milliseconds. The index is saved to disk, so search works right away at launch. On macOS, file-change history (FSEvents) catches it up on whatever changed while Findest wasn't running without a rescan, and applies file changes as they happen. On Linux there is no change history to replay, so the index is rescanned at launch and then once a day (or on demand), at idle I/O and CPU priority, so indexing stays out of the way of everything else; the folders you're looking at are watched live via inotify (`notify`). While a scan runs the status bar shows its progress; click it to pause indexing (for an hour, or until you resume) or turn it off for good (`indexing = false` under `[search]`). You choose what's indexed in `[search]` in the config.
 
 | Query | Matches |
 |---|---|

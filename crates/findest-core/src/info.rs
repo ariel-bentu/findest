@@ -80,14 +80,14 @@ pub const TEXT_EXTENSIONS: &[&str] = &[
     "proto", "graphql", "lock", "gitignore", "dockerignore", "editorconfig", "plist", "srt", "tex", "svg",
 ];
 
-/// Whether `path` is a readable text file (by extension or by sniffing the first 8 KB).
-pub fn is_text_file(path: &Path) -> bool {
-    use std::io::Read;
+/// Whether the name alone says `path` is text: a known extension, a dotfile
+/// or a well-known file such as `Makefile`. Never reads the file.
+pub fn is_known_text_name(path: &Path) -> bool {
     let ext = path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase);
     if ext.as_deref() == Some("pdf") {
         return false;
     }
-    let known = ext.as_deref().is_some_and(|e| TEXT_EXTENSIONS.contains(&e))
+    ext.as_deref().is_some_and(|e| TEXT_EXTENSIONS.contains(&e))
         || path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
             (n.starts_with('.') && !n[1..].contains('.'))
                 || matches!(
@@ -107,7 +107,16 @@ pub fn is_text_file(path: &Path) -> bool {
                         | "authors"
                         | "codeowners"
                 )
-        });
+        })
+}
+
+/// Whether `path` is a readable text file (by extension or by sniffing the first 8 KB).
+pub fn is_text_file(path: &Path) -> bool {
+    use std::io::Read;
+    if path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("pdf")) {
+        return false;
+    }
+    let known = is_known_text_name(path);
     let Ok(meta) = fs::metadata(path) else {
         return known;
     };
@@ -174,6 +183,32 @@ pub fn group_digits(n: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn text_names_are_known_without_reading() {
+        use super::*;
+        // None of these exist: the answer comes from the name alone.
+        for name in ["/x/a.rs", "/x/Makefile", "/x/.bashrc", "/x/README", "/x/a.SVG"] {
+            assert!(is_known_text_name(Path::new(name)), "{name}");
+        }
+        for name in ["/x/a.pdf", "/x/a.bin", "/x/noext", "/x/.a.b"] {
+            assert!(!is_known_text_name(Path::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn unknown_names_are_sniffed() {
+        use super::*;
+        let tmp = tempfile::tempdir().unwrap();
+        let text = tmp.path().join("notes.zzz");
+        std::fs::write(&text, "just some words\n").unwrap();
+        let binary = tmp.path().join("blob.zzz");
+        std::fs::write(&binary, [0u8, 1, 2, 3]).unwrap();
+        assert!(!is_known_text_name(&text));
+        assert!(is_text_file(&text));
+        assert!(!is_text_file(&binary));
+        assert!(!is_text_file(&tmp.path().join("missing.zzz")));
+    }
+
     use super::*;
 
     #[test]

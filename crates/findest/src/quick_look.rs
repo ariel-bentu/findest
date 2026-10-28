@@ -261,17 +261,38 @@ mod imp {
         OPEN_PATH.with(|p| p.borrow().is_some())
     }
 
+    /// What pressing Space does, given the file Sushi is believed to show.
+    #[derive(Debug, PartialEq)]
+    pub(super) enum Step {
+        /// Ask Sushi to show the file. It closes itself if it is already
+        /// showing it, so a preview closed by hand doesn't need two presses.
+        Show(PathBuf),
+        Close,
+        Nothing,
+    }
+
+    pub(super) fn step(current: Option<&PathBuf>, next: Option<PathBuf>) -> Step {
+        match (current, next) {
+            (Some(_), None) => Step::Close,
+            (_, Some(path)) => Step::Show(path),
+            (None, None) => Step::Nothing,
+        }
+    }
+
     pub fn toggle(_window: &gpui::Window, paths: Vec<PathBuf>, cx: &gpui::App) {
         let current = OPEN_PATH.with(|p| p.borrow().clone());
-        let next = paths.into_iter().next();
-        if current.is_some() && (next.is_none() || current == next) {
-            OPEN_PATH.with(|p| *p.borrow_mut() = None);
-            cx.background_executor().spawn(async move { close_sushi() }).detach();
-            return;
-        }
-        if let Some(path) = next {
-            OPEN_PATH.with(|p| *p.borrow_mut() = Some(path.clone()));
-            cx.background_executor().spawn(async move { show_sushi(&path) }).detach();
+        match step(current.as_ref(), paths.into_iter().next()) {
+            Step::Nothing => {}
+            Step::Close => {
+                OPEN_PATH.with(|p| *p.borrow_mut() = None);
+                cx.background_executor().spawn(async move { close_sushi() }).detach();
+            }
+            Step::Show(path) => {
+                // The same file again closes it (Sushi toggles); anything else opens.
+                let reopen = current.as_ref() == Some(&path);
+                OPEN_PATH.with(|p| *p.borrow_mut() = (!reopen).then(|| path.clone()));
+                cx.background_executor().spawn(async move { show_sushi(&path) }).detach();
+            }
         }
     }
 
@@ -294,23 +315,31 @@ mod imp {
             .detach();
     }
 
+    /// `ShowFile(uri, parent window id, close if already shown)`. Wayland has
+    /// no window id to give, so the preview isn't attached to the window.
+    pub(super) fn show_args(uri: &str) -> Vec<String> {
+        [
+            "call",
+            "--session",
+            "--dest",
+            "org.gnome.NautilusPreviewer",
+            "--object-path",
+            "/org/gnome/NautilusPreviewer",
+            "--method",
+            "org.gnome.NautilusPreviewer.ShowFile",
+            uri,
+            "0",
+            "true",
+        ]
+        .map(String::from)
+        .to_vec()
+    }
+
     fn show_sushi(path: & std::path::Path) {
         let uri = findest_core::paths::file_url(path);
         // GNOME Sushi exposes org.gnome.NautilusPreviewer on the session bus.
         let status = Command::new("gdbus")
-            .args([
-                "call",
-                "--session",
-                "--dest",
-                "org.gnome.NautilusPreviewer",
-                "--object-path",
-                "/org/gnome/NautilusPreviewer",
-                "--method",
-                "org.gnome.NautilusPreviewer.ShowFile",
-                &uri,
-                "0",
-                "true",
-            ])
+            .args(show_args(&uri))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -347,3 +376,25 @@ mod imp {
 #[cfg(not(target_os = "macos"))]
 pub use imp::*;
 
+#[cfg(all(test, not(target_os = "macos")))]
+mod tests {
+    use super::imp::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn space_toggles_the_preview() {
+        let a = PathBuf::from("/a");
+        let b = PathBuf::from("/b");
+        assert_eq!(step(None, Some(a.clone())), Step::Show(a.clone()));
+        assert_eq!(step(Some(&a), Some(a.clone())), Step::Show(a.clone()), "Sushi closes it, or reopens if it was closed by hand");
+        assert_eq!(step(Some(&a), Some(b.clone())), Step::Show(b));
+        assert_eq!(step(Some(&a), None), Step::Close);
+        assert_eq!(step(None, None), Step::Nothing);
+    }
+
+    #[test]
+    fn asks_sushi_to_toggle() {
+        let args = show_args("file:///a%20b");
+        assert_eq!(&args[args.len() - 3..], ["file:///a%20b", "0", "true"]);
+    }
+}

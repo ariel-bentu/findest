@@ -342,6 +342,9 @@ pub struct Browser {
     nav_long_pressed: bool,
     /// Where the mouse went down on a selected row; moving far enough starts a drag.
     pub(crate) drag_origin: Option<Point<Pixels>>,
+    /// Items being dragged inside the app, where the platform has no native
+    /// drag source (Linux). Dropped by releasing over a folder.
+    pub(crate) app_drag: Option<Vec<PathBuf>>,
     load_task: Option<Task<()>>,
     pending_select: Option<PendingSelect>,
     /// Set when a just-created item should be named on the next frame.
@@ -513,6 +516,7 @@ impl Browser {
             nav_press: None,
             nav_long_pressed: false,
             drag_origin: None,
+            app_drag: None,
             load_task: None,
             pending_select: None,
             pending_name_new: false,
@@ -1814,18 +1818,21 @@ impl Browser {
     }
 
     fn empty_trash(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let items: Vec<PathBuf> = match std::fs::read_dir(self.trash_dir()) {
-            Ok(read) => read.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| !p.ends_with(".DS_Store")).collect(),
-            Err(e) => return self.set_error(format!("Can't read the Trash: {e} (Findest needs Full Disk Access)"), cx),
+        let dir = self.trash_dir();
+        let count = match ops::trash_item_count(&dir) {
+            Ok(n) => n,
+            Err(e) if cfg!(target_os = "macos") => {
+                return self.set_error(format!("Can't read the Trash: {e} (Findest needs Full Disk Access)"), cx);
+            }
+            Err(e) => return self.set_error(format!("Can't read the Trash: {e}"), cx),
         };
-        if items.is_empty() {
+        if count == 0 {
             return self.set_info("The Trash is empty", cx);
         }
-        let message = format!("Permanently erase {} in the Trash?", count_label(items.len()));
+        let message = format!("Permanently erase {} in the Trash?", count_label(count));
         self.confirm_then(true, &message, Some("This can't be undone."), "Empty Trash", window, cx, move |this, cx| {
-            let n = items.len();
-            this.run_op(cx, move || ops::delete_permanently(&items), move |this, (), cx| {
-                this.set_info(format!("Erased {}", count_label(n)), cx);
+            this.run_op(cx, move || ops::empty_trash(&dir), move |this, (), cx| {
+                this.set_info(format!("Erased {}", count_label(count)), cx);
                 this.reload(cx);
             });
         });
@@ -2564,6 +2571,10 @@ impl Browser {
                 }
             })
             .detach();
+        } else if cfg!(not(target_os = "macos")) {
+            self.set_info(format!("Dragging {}: release over a folder (hold Ctrl to copy)", describe(&paths)), cx);
+            self.app_drag = Some(paths);
+            cx.notify();
         }
     }
 

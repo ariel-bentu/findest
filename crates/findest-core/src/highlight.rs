@@ -65,9 +65,11 @@ pub fn has_own_preview(path: &Path) -> bool {
     if has_extension(path, OWN_PREVIEW_EXTENSIONS) {
         return true;
     }
+    // Known text names only: this runs while drawing, so it never reads the
+    // file. Unknown names are sniffed by `info::is_text_file` when previewed.
     #[cfg(not(target_os = "macos"))]
     {
-        crate::info::is_text_file(path)
+        crate::info::is_known_text_name(path)
     }
     #[cfg(target_os = "macos")]
     {
@@ -275,6 +277,18 @@ fn group_thousands(n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn deciding_on_a_preview_does_not_read_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let text = tmp.path().join("notes.zzz");
+        std::fs::write(&text, "plain words\n").unwrap();
+        // Unknown names aren't sniffed here: it runs on every frame.
+        assert!(!has_own_preview(&text));
+        assert!(crate::info::is_text_file(&text));
+        assert!(has_own_preview(&tmp.path().join("Makefile")));
+    }
 
     #[test]
     fn colors_yaml() {

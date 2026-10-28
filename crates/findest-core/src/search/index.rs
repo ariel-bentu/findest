@@ -40,6 +40,24 @@ pub const FLAG_HIDDEN_TREE: u8 = 16;
 const UF_HIDDEN: u32 = 0x8000;
 pub(crate) const PACKAGE_EXTENSIONS: &[&str] = &["app", "bundle", "framework", "plugin", "kext", "xcarchive", "photoslibrary"];
 
+/// Runs the calling thread at background priority, so a scan stays out of
+/// the way of everything else.
+fn lower_priority() {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_BACKGROUND, 0);
+    }
+    #[cfg(target_os = "linux")]
+    // SAFETY: plain syscalls on the calling thread (`who` 0), no pointers.
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, 19);
+        // I/O class "idle" (3): only gets the disk when nothing else wants it.
+        const IOPRIO_WHO_PROCESS: libc::c_long = 1;
+        const IDLE: libc::c_long = 3 << 13;
+        libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0 as libc::c_long, IDLE);
+    }
+}
+
 /// Whether the platform marks this entry as hidden independently of its name.
 fn has_hidden_flag(meta: &fs::Metadata) -> bool {
     #[cfg(target_os = "macos")]
@@ -741,12 +759,7 @@ pub fn in_background<R: Send>(f: impl FnOnce() -> R + Send) -> R {
         rayon::ThreadPoolBuilder::new()
             .num_threads(4)
             .thread_name(|i| format!("findest-index-{i}"))
-            .start_handler(|_| {
-                #[cfg(target_os = "macos")]
-                unsafe {
-                    libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_BACKGROUND, 0);
-                }
-            })
+            .start_handler(|_| lower_priority())
             .build()
             .ok()
     });
@@ -824,6 +837,21 @@ impl Flat {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scan_threads_run_at_background_priority() {
+        let (nice, ioprio) = std::thread::spawn(|| {
+            super::lower_priority();
+            // SAFETY: reads this thread's own priorities.
+            unsafe { (libc::getpriority(libc::PRIO_PROCESS, 0), libc::syscall(libc::SYS_ioprio_get, 1 as libc::c_long, 0 as libc::c_long)) }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(nice, 19);
+        // May be refused in a sandbox; when it works it's the idle class.
+        assert!(ioprio < 0 || ioprio >> 13 == 3, "ioprio {ioprio:#x}");
+    }
+
     use super::*;
 
     /// A small tree used by the search tests too.

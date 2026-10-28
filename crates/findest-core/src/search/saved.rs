@@ -49,10 +49,22 @@ impl ScanMark {
     /// The event id to replay from, if the saved index covers the same
     /// roots and its history is still there.
     pub fn replay_from(config: &SearchConfig) -> Option<u64> {
+        if !fsevents::REPLAY_SUPPORTED {
+            return None;
+        }
         let saved: ScanMark = serde_json::from_slice(&std::fs::read(Self::path()).ok()?).ok()?;
-        let current = ScanMark::now(config);
-        (saved.roots == current.roots && saved.exclude == current.exclude && saved.histories == current.histories)
-            .then_some(saved.event_id)
+        saved.replay_id(&ScanMark::now(config))
+    }
+
+    /// The event id to replay from, if `self` was saved for the same roots
+    /// and history as `current`. Without a history to replay (no FSEvents),
+    /// there's never one: only a rescan catches an old index up.
+    fn replay_id(&self, current: &ScanMark) -> Option<u64> {
+        (fsevents::REPLAY_SUPPORTED
+            && self.roots == current.roots
+            && self.exclude == current.exclude
+            && self.histories == current.histories)
+            .then_some(self.event_id)
     }
 
     /// Saves `index` with this mark. The mark goes first and comes back
@@ -98,5 +110,30 @@ pub fn changes_since(config: &SearchConfig, since: u64) -> Option<Vec<PathBuf>> 
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replays_only_where_the_platform_keeps_history() {
+        let config = SearchConfig::default();
+        let saved = ScanMark::at(&config, 42);
+        let same = ScanMark::at(&config, 99);
+        // Linux has no change history: a saved mark must never claim one, or
+        // the app would skip the rescan and miss everything changed since.
+        assert_eq!(saved.replay_id(&same), fsevents::REPLAY_SUPPORTED.then_some(42));
+        let mut other = SearchConfig::default();
+        other.roots.push("/elsewhere".into());
+        assert_eq!(saved.replay_id(&ScanMark::at(&other, 99)), None);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn no_replay_without_fsevents() {
+        assert!(!fsevents::REPLAY_SUPPORTED);
+        assert!(EventStream::start(&[], Some(1), 0.0, |_, _| {}).is_none());
     }
 }

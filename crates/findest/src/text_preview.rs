@@ -237,7 +237,7 @@ impl Browser {
             return true;
         }
         match self.preview_target() {
-            Some(path) if handles(&path) => {
+            Some(path) if handles_sniffed(&path) => {
                 self.open_text_preview(path, cx);
                 true
             }
@@ -579,7 +579,7 @@ impl Browser {
             return;
         }
         match target {
-            Some(path) if handles(&path) => self.open_text_preview(path, cx),
+            Some(path) if handles_sniffed(&path) => self.open_text_preview(path, cx),
             Some(path) if !path.is_dir() => {
                 self.text_preview = None;
                 crate::quick_look::toggle(window, vec![path], cx);
@@ -1015,6 +1015,10 @@ fn word_at(line: &str, byte: usize) -> (usize, usize) {
     (start, end)
 }
 
+/// Image formats the `image` crate is built to decode (see Cargo.toml).
+#[cfg(not(target_os = "macos"))]
+const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tiff", "tif"];
+
 /// Whether `path` is an image handled by Findest's built-in viewer (on platforms
 /// without a native Quick Look panel).
 pub fn is_image(path: &Path) -> bool {
@@ -1025,14 +1029,16 @@ pub fn is_image(path: &Path) -> bool {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        const IMAGE_EXTENSIONS: &[&str] = &[
-            "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tiff", "tif", "pnm", "pbm", "pgm", "ppm", "tga",
-            "dds", "qoi", "farbfeld", "exr", "hdr",
-        ];
         path.extension()
             .and_then(|e| e.to_str())
             .is_some_and(|e| IMAGE_EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(e)))
     }
+}
+
+/// Like [`handles`], also for text files with unknown names. Reads the file's
+/// start, so only for what the user asked for, not on every frame.
+pub fn handles_sniffed(path: &Path) -> bool {
+    handles(path) || (cfg!(not(target_os = "macos")) && !path.is_dir() && findest_core::info::is_text_file(path))
 }
 
 /// True if `path` gets Findest's preview instead of Quick Look.
@@ -1043,6 +1049,17 @@ pub fn handles(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn every_listed_image_type_can_be_decoded() {
+        for ext in IMAGE_EXTENSIONS {
+            let format = image::ImageFormat::from_extension(ext).unwrap_or_else(|| panic!("{ext} isn't an image format"));
+            assert!(format.reading_enabled(), "{ext} is listed but the image crate can't read it");
+        }
+        assert!(is_image(Path::new("/a/B.JPG")));
+        assert!(!is_image(Path::new("/a/b.tga")));
+    }
     use findest_core::highlight::Line;
 
     fn line(text: &str, spans: Vec<Span>) -> Line {

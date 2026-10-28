@@ -73,7 +73,26 @@ pub const DEFAULT_KEYBINDINGS: &[(&str, &str)] = &[
     ("secondary-n", "new_window"),
     ("secondary-w", "close_window"),
     ("secondary-e", "open_with:VS Code"),
+    #[cfg(target_os = "macos")]
     ("secondary-alt-t", "open_with:Terminal"),
+    // Ctrl+Alt+T is the desktop's own "open a terminal" shortcut on Linux.
+    #[cfg(not(target_os = "macos"))]
+    ("secondary-shift-e", "open_with:Terminal"),
+    // What Linux file managers use.
+    #[cfg(not(target_os = "macos"))]
+    ("f2", "rename"),
+    #[cfg(not(target_os = "macos"))]
+    ("delete", "trash"),
+    #[cfg(not(target_os = "macos"))]
+    ("shift-delete", "trash_now"),
+    #[cfg(not(target_os = "macos"))]
+    ("secondary-h", "toggle_hidden"),
+    #[cfg(not(target_os = "macos"))]
+    ("alt-left", "go_back"),
+    #[cfg(not(target_os = "macos"))]
+    ("alt-right", "go_forward"),
+    #[cfg(not(target_os = "macos"))]
+    ("alt-home", "go_home"),
 ];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -118,6 +137,12 @@ fn default_favorites() -> Vec<Favorite> {
     vec![fav("~"), fav("~/Desktop"), fav("~/Documents"), fav("~/Downloads")]
 }
 
+/// Opens a terminal in the folder `$1`: `$TERMINAL` if set, else the first
+/// of the common terminals that is installed. (`x-terminal-emulator` exists
+/// only on Debian-based systems, and terminals take a command, not a folder.)
+#[cfg(not(target_os = "macos"))]
+pub const TERMINAL_SCRIPT: &str = r#"cd "$1" || exit 1; for t in "$TERMINAL" x-terminal-emulator gnome-terminal konsole xfce4-terminal alacritty kitty xterm; do if [ -n "$t" ] && command -v "$t" >/dev/null 2>&1; then exec "$t"; fi; done; exit 1"#;
+
 #[cfg(target_os = "macos")]
 fn default_openers() -> Vec<Opener> {
     let opener = |name: &str, app: &str, arg: &str, target| Opener {
@@ -142,7 +167,7 @@ fn default_openers() -> Vec<Opener> {
         },
         Opener {
             name: "Terminal".into(),
-            command: vec!["x-terminal-emulator".into(), "{dir}".into()],
+            command: vec!["sh".into(), "-c".into(), TERMINAL_SCRIPT.into(), "sh".into(), "{dir}".into()],
             target: OpenerTarget::Any,
         },
         Opener {
@@ -573,6 +598,57 @@ for = \"any\"
         assert!(!keys.contains_key("secondary-d"));
         assert_eq!(keys.get("secondary-j").unwrap(), "open_with:VS Code");
         assert_eq!(keys.get("secondary-up").unwrap(), "go_up");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn terminal_opener_starts_in_the_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let from_file: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
+        let terminal = |c: &Config| c.openers.iter().find(|o| o.name == "Terminal").unwrap().command.clone();
+        assert_eq!(terminal(&from_file), terminal(&Config::default()), "the config file and the built-in default agree");
+
+        // A stand-in terminal that records where it was started.
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = tmp.path().join("fake-term");
+        let out = tmp.path().join("cwd.txt");
+        fs::write(&fake, format!("#!/bin/sh\npwd > '{}'\n", out.display())).unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        let work = tmp.path().join("work dir");
+        fs::create_dir(&work).unwrap();
+
+        let argv = crate::launch::expand_command(&terminal(&from_file), &work);
+        let status = std::process::Command::new(&argv[0]).args(&argv[1..]).env("TERMINAL", &fake).status().unwrap();
+        assert!(status.success());
+        assert_eq!(fs::read_to_string(&out).unwrap().trim(), work.to_str().unwrap());
+
+        // With no terminal available it fails instead of hanging.
+        let none = std::process::Command::new(&argv[0]).args(&argv[1..]).env("TERMINAL", "").env("PATH", "/nonexistent").status();
+        assert!(none.map(|s| !s.success()).unwrap_or(true));
+    }
+
+    #[test]
+    fn default_keys_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for (key, _) in DEFAULT_KEYBINDINGS {
+            // Bound to both go_to_folder and find_previous since before the Linux port.
+            if *key != "secondary-shift-g" {
+                assert!(seen.insert(*key), "{key} is bound twice");
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn linux_has_file_manager_keys() {
+        let keys = Config::default().keybindings();
+        assert_eq!(keys["f2"], "rename");
+        assert_eq!(keys["delete"], "trash");
+        assert_eq!(keys["alt-left"], "go_back");
+        assert_eq!(keys["secondary-h"], "toggle_hidden");
+        // Ctrl+Alt+T belongs to the desktop.
+        assert!(!keys.contains_key("secondary-alt-t"));
+        assert_eq!(keys["secondary-shift-e"], "open_with:Terminal");
     }
 
     #[test]

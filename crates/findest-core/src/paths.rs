@@ -103,6 +103,12 @@ pub fn path_from_file_url(url: &str) -> Option<PathBuf> {
     Some(path)
 }
 
+/// A command-line argument as a path: `file://` URLs (what desktop entries
+/// with `%U` pass) are decoded, anything else is taken as it is.
+pub fn path_from_arg(arg: &std::ffi::OsStr) -> PathBuf {
+    arg.to_str().and_then(path_from_file_url).unwrap_or_else(|| PathBuf::from(arg))
+}
+
 /// Terminal-style Tab completion of a typed path: the new text, and the
 /// matching names when there's nothing more to complete (`Some(empty)`: no match).
 #[derive(Debug, PartialEq)]
@@ -166,6 +172,16 @@ fn common_prefix<'a>(mut names: impl Iterator<Item = &'a str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arguments_may_be_file_urls() {
+        use std::ffi::OsStr;
+        assert_eq!(path_from_arg(OsStr::new("file:///home/me/My%20Docs/")), PathBuf::from("/home/me/My Docs"));
+        assert_eq!(path_from_arg(OsStr::new("/plain/path")), PathBuf::from("/plain/path"));
+        assert_eq!(path_from_arg(OsStr::new("relative")), PathBuf::from("relative"));
+        let p = Path::new("/tmp/a b/ü");
+        assert_eq!(path_from_arg(file_url(p).as_ref()), p);
+    }
 
     #[test]
     fn completes_paths_like_a_terminal() {

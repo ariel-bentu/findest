@@ -198,8 +198,68 @@ pub fn delete_permanently(paths: &[PathBuf]) -> Result<()> {
             fs::remove_file(path)
         }
         .with_context(|| format!("deleting {}", path.display()))?;
+        remove_trashinfo(path);
     }
     Ok(())
+}
+
+/// Deleting an item from a freedesktop Trash (`Trash/files/NAME`) also removes
+/// its `Trash/info/NAME.trashinfo` record, so nothing is left to "restore".
+fn remove_trashinfo(path: &Path) {
+    let Some(files) = path.parent().filter(|f| f.file_name().is_some_and(|n| n == "files")) else { return };
+    let Some(trash) = files.parent().filter(|t| t.join("info").is_dir()) else { return };
+    let Some(name) = path.file_name() else { return };
+    let mut record = name.to_os_string();
+    record.push(".trashinfo");
+    let _ = fs::remove_file(trash.join("info").join(record));
+}
+
+fn trash_entries(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    Ok(fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| !p.ends_with(".DS_Store"))
+        .collect())
+}
+
+/// The number of items in the Trash whose files are in `dir`. On Linux this
+/// also counts items trashed from other drives (`$topdir/.Trash-$uid`).
+pub fn trash_item_count(dir: &Path) -> std::io::Result<usize> {
+    let here = trash_entries(dir)?.len();
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Items in the home Trash are in both counts, so take the larger.
+        if let Ok(all) = trash::os_limited::list() {
+            return Ok(all.len().max(here));
+        }
+    }
+    Ok(here)
+}
+
+/// Permanently erases everything in the Trash folder `dir`, and on Linux the
+/// `info` records beside it that no longer have a file.
+pub fn empty_trash_folder(dir: &Path) -> Result<()> {
+    delete_permanently(&trash_entries(dir)?)?;
+    #[cfg(not(target_os = "macos"))]
+    if let Some(info) = dir.parent().map(|t| t.join("info")).filter(|i| i.is_dir())
+        && let Ok(read) = fs::read_dir(info)
+    {
+        for record in read.filter_map(|e| e.ok()) {
+            let _ = fs::remove_file(record.path());
+        }
+    }
+    Ok(())
+}
+
+/// Empties the user's Trash: the folder `dir` and, on Linux, the Trash folders
+/// of other drives. This erases the real system Trash: tests use
+/// [`empty_trash_folder`] on a temporary folder instead.
+pub fn empty_trash(dir: &Path) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    if let Ok(all) = trash::os_limited::list() {
+        trash::os_limited::purge_all(all).context("emptying the Trash")?;
+    }
+    empty_trash_folder(dir)
 }
 
 /// Copies `path` next to itself as "name copy.ext", "name copy 2.ext", ...
@@ -494,6 +554,7 @@ fn copy_recursive(src: &Path, dst: &Path, chunked: bool, resume: bool, progress:
             copy_recursive(&item.path(), &dst.join(item.file_name()), chunked, resume, progress)?;
         }
         fs::set_permissions(dst, meta.permissions())?;
+        #[cfg(not(target_os = "macos"))]
         copy_metadata(src, dst, &meta);
     } else {
         copy_file(src, dst, &meta, chunked, resume, progress)?;
@@ -518,14 +579,11 @@ fn copy_file(src: &Path, dst: &Path, meta: &fs::Metadata, chunked: bool, resume:
         Err(e) => return Err(e).with_context(|| format!("reading {}", src.display())),
     };
     if !chunked {
-        #[cfg(target_os = "linux")]
-        if try_ficlone(&input, dst, meta) {
-            copy_metadata(src, dst, meta);
-            return progress.file_done(len);
-        }
-        // std uses clonefile/fcopyfile on macOS, so this is cheap on APFS.
+        // std uses clonefile/fcopyfile on macOS (cheap on APFS, and it copies
+        // the metadata), and copy_file_range on Linux (a reflink on btrfs and XFS).
         drop(input);
         fs::copy(src, dst).with_context(|| format!("copying {}", src.display()))?;
+        #[cfg(not(target_os = "macos"))]
         copy_metadata(src, dst, meta);
         return progress.file_done(len);
     }
@@ -554,20 +612,37 @@ fn copy_file(src: &Path, dst: &Path, meta: &fs::Metadata, chunked: bool, resume:
     progress.file_done(0)
 }
 
-#[cfg(target_os = "linux")]
-fn try_ficlone(src_file: &fs::File, dst: &Path, meta: &fs::Metadata) -> bool {
-    use std::os::fd::AsRawFd;
-    let Ok(dst_file) = fs::File::create(dst) else {
-        return false;
+/// Copies the `user.*` extended attributes (findest's colors, other tools'
+/// tags and comments). Others (ACLs, SELinux labels) belong to the new file.
+#[cfg(not(target_os = "macos"))]
+fn copy_user_xattrs(src: &Path, dst: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let (Ok(from), Ok(to)) = (std::ffi::CString::new(src.as_os_str().as_bytes()), std::ffi::CString::new(dst.as_os_str().as_bytes())) else {
+        return;
     };
-    let rc = unsafe { libc::ioctl(dst_file.as_raw_fd(), libc::FICLONE as _, src_file.as_raw_fd()) };
-    if rc == 0 {
-        let _ = dst_file.set_permissions(meta.permissions());
-        true
-    } else {
-        drop(dst_file);
-        let _ = fs::remove_file(dst);
-        false
+    // SAFETY: valid C strings, and buffers of the sizes passed.
+    unsafe {
+        let size = libc::listxattr(from.as_ptr(), std::ptr::null_mut(), 0);
+        if size <= 0 {
+            return;
+        }
+        let mut names = vec![0u8; size as usize];
+        let size = libc::listxattr(from.as_ptr(), names.as_mut_ptr().cast(), names.len());
+        if size <= 0 {
+            return;
+        }
+        for name in names[..size as usize].split(|&b| b == 0).filter(|n| n.starts_with(b"user.")) {
+            let Ok(name) = std::ffi::CString::new(name) else { continue };
+            let len = libc::getxattr(from.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0);
+            if len < 0 {
+                continue;
+            }
+            let mut value = vec![0u8; len as usize];
+            let len = libc::getxattr(from.as_ptr(), name.as_ptr(), value.as_mut_ptr().cast(), value.len());
+            if len >= 0 {
+                libc::setxattr(to.as_ptr(), name.as_ptr(), value.as_ptr().cast(), len as usize, 0);
+            }
+        }
     }
 }
 
@@ -583,33 +658,7 @@ fn copy_metadata(src: &Path, dst: &Path, meta: &fs::Metadata) {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        use std::os::unix::ffi::OsStrExt;
-        const COLOR_XATTR: &[u8] = b"user.findest.color\0";
-        if let (Ok(from), Ok(to)) = (
-            std::ffi::CString::new(src.as_os_str().as_bytes()),
-            std::ffi::CString::new(dst.as_os_str().as_bytes()),
-        ) {
-            let mut buf = [0u8; 32];
-            let n = unsafe {
-                libc::getxattr(
-                    from.as_ptr(),
-                    COLOR_XATTR.as_ptr().cast(),
-                    buf.as_mut_ptr().cast(),
-                    buf.len(),
-                )
-            };
-            if n > 0 && (n as usize) <= buf.len() {
-                unsafe {
-                    libc::setxattr(
-                        to.as_ptr(),
-                        COLOR_XATTR.as_ptr().cast(),
-                        buf.as_ptr().cast(),
-                        n as usize,
-                        0,
-                    );
-                }
-            }
-        }
+        copy_user_xattrs(src, dst);
         let _ = fs::set_permissions(dst, meta.permissions());
     }
     if let (Ok(file), Ok(modified)) = (fs::OpenOptions::new().write(true).open(dst), meta.modified()) {
@@ -881,6 +930,73 @@ mod tests {
         fs::write(&f, "").unwrap();
         assert!(same_volume(&f, tmp.path()));
         assert!(!same_volume(&tmp.path().join("missing"), tmp.path()));
+    }
+
+    #[test]
+    fn deleting_from_the_trash_removes_its_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trash = tmp.path().join("Trash");
+        fs::create_dir_all(trash.join("files/old")).unwrap();
+        fs::create_dir_all(trash.join("info")).unwrap();
+        fs::write(trash.join("files/old/a.txt"), "a").unwrap();
+        fs::write(trash.join("files/b.txt"), "b").unwrap();
+        fs::write(trash.join("info/old.trashinfo"), "[Trash Info]").unwrap();
+        fs::write(trash.join("info/b.txt.trashinfo"), "[Trash Info]").unwrap();
+        fs::write(trash.join("info/c.txt.trashinfo"), "[Trash Info]").unwrap();
+
+        delete_permanently(&[trash.join("files/b.txt")]).unwrap();
+        assert!(!trash.join("info/b.txt.trashinfo").exists());
+        assert!(trash.join("info/old.trashinfo").exists(), "other records stay");
+
+        delete_permanently(&[trash.join("files/old")]).unwrap();
+        assert!(!trash.join("info/old.trashinfo").exists());
+        assert!(trash.join("info/c.txt.trashinfo").exists());
+    }
+
+    #[test]
+    fn empties_a_trash_folder_with_its_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files = tmp.path().join("Trash/files");
+        fs::create_dir_all(&files).unwrap();
+        fs::create_dir_all(tmp.path().join("Trash/info")).unwrap();
+        fs::write(files.join("a.txt"), "a").unwrap();
+        fs::create_dir(files.join("dir")).unwrap();
+        fs::write(tmp.path().join("Trash/info/a.txt.trashinfo"), "").unwrap();
+        fs::write(tmp.path().join("Trash/info/orphan.trashinfo"), "").unwrap();
+        assert!(trash_item_count(&files).unwrap() >= 2);
+        empty_trash_folder(&files).unwrap();
+        assert_eq!(fs::read_dir(&files).unwrap().count(), 0);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(fs::read_dir(tmp.path().join("Trash/info")).unwrap().count(), 0);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn copies_user_extended_attributes() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dst) = (tmp.path().join("a"), tmp.path().join("b"));
+        fs::write(&src, "x").unwrap();
+        fs::write(&dst, "x").unwrap();
+        let path = std::ffi::CString::new(src.as_os_str().as_bytes()).unwrap();
+        for (name, value) in [(c"user.findest.color", &[3u8][..]), (c"user.other.comment", b"hello")] {
+            // SAFETY: valid C strings and a buffer of the given length.
+            let rc = unsafe { libc::setxattr(path.as_ptr(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
+            if rc != 0 {
+                eprintln!("skipped: this file system has no user extended attributes");
+                return;
+            }
+        }
+        copy_metadata(&src, &dst, &fs::metadata(&src).unwrap());
+        let read = |name: &std::ffi::CStr| {
+            let to = std::ffi::CString::new(dst.as_os_str().as_bytes()).unwrap();
+            let mut buf = [0u8; 16];
+            // SAFETY: valid C strings and buffer.
+            let n = unsafe { libc::getxattr(to.as_ptr(), name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+            buf[..n.max(0) as usize].to_vec()
+        };
+        assert_eq!(read(c"user.findest.color"), [3]);
+        assert_eq!(read(c"user.other.comment"), b"hello");
     }
 
     #[test]
