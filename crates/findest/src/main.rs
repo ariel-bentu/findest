@@ -216,7 +216,7 @@ fn main() {
         return;
     }
     // `findest <path>` when running in place (debug builds / FINDEST_NO_BUNDLE).
-    let start = std::env::args_os().skip(1).map(PathBuf::from).find(|p| !p.to_string_lossy().starts_with('-'));
+    let start = std::env::args_os().skip(1).find(|a| !a.to_string_lossy().starts_with('-')).map(|a| findest_core::paths::path_from_arg(&a));
     let start = start.and_then(|p| std::path::absolute(p).ok());
 
     // Folders opened via `findest <path>`, Finder's "Open With" or dropping on the Dock icon.

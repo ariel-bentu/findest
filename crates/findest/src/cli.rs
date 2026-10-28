@@ -6,7 +6,6 @@
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
-use std::path::Path;
 use std::time::UNIX_EPOCH;
 
 use findest_core::config::{Config, SearchConfig};
@@ -96,12 +95,13 @@ pub fn handle_args() -> Option<i32> {
         }
         // Folders to open: refuse ones that don't exist, rather than
         // starting the app from the terminal.
-        _ => std::env::args_os().skip(1).find(|a| !a.to_string_lossy().starts_with('-') && !Path::new(a).exists()).map(
-            |missing| {
-                eprintln!("findest: {} doesn't exist\n\n{HELP}", Path::new(&missing).display());
+        _ => std::env::args_os()
+            .skip(1)
+            .find(|a| !a.to_string_lossy().starts_with('-') && !findest_core::paths::path_from_arg(a).exists())
+            .map(|missing| {
+                eprintln!("findest: {} doesn't exist\n\n{HELP}", findest_core::paths::path_from_arg(&missing).display());
                 2
-            },
-        ),
+            }),
     }
 }
 

@@ -118,6 +118,12 @@ fn default_favorites() -> Vec<Favorite> {
     vec![fav("~"), fav("~/Desktop"), fav("~/Documents"), fav("~/Downloads")]
 }
 
+/// Opens a terminal in the folder `$1`: `$TERMINAL` if set, else the first
+/// of the common terminals that is installed. (`x-terminal-emulator` exists
+/// only on Debian-based systems, and terminals take a command, not a folder.)
+#[cfg(not(target_os = "macos"))]
+pub const TERMINAL_SCRIPT: &str = r#"cd "$1" || exit 1; for t in "$TERMINAL" x-terminal-emulator gnome-terminal konsole xfce4-terminal alacritty kitty xterm; do if [ -n "$t" ] && command -v "$t" >/dev/null 2>&1; then exec "$t"; fi; done; exit 1"#;
+
 #[cfg(target_os = "macos")]
 fn default_openers() -> Vec<Opener> {
     let opener = |name: &str, app: &str, arg: &str, target| Opener {
@@ -142,7 +148,7 @@ fn default_openers() -> Vec<Opener> {
         },
         Opener {
             name: "Terminal".into(),
-            command: vec!["x-terminal-emulator".into(), "{dir}".into()],
+            command: vec!["sh".into(), "-c".into(), TERMINAL_SCRIPT.into(), "sh".into(), "{dir}".into()],
             target: OpenerTarget::Any,
         },
         Opener {
@@ -573,6 +579,33 @@ for = \"any\"
         assert!(!keys.contains_key("secondary-d"));
         assert_eq!(keys.get("secondary-j").unwrap(), "open_with:VS Code");
         assert_eq!(keys.get("secondary-up").unwrap(), "go_up");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn terminal_opener_starts_in_the_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let from_file: Config = toml::from_str(DEFAULT_CONFIG).unwrap();
+        let terminal = |c: &Config| c.openers.iter().find(|o| o.name == "Terminal").unwrap().command.clone();
+        assert_eq!(terminal(&from_file), terminal(&Config::default()), "the config file and the built-in default agree");
+
+        // A stand-in terminal that records where it was started.
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = tmp.path().join("fake-term");
+        let out = tmp.path().join("cwd.txt");
+        fs::write(&fake, format!("#!/bin/sh\npwd > '{}'\n", out.display())).unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+        let work = tmp.path().join("work dir");
+        fs::create_dir(&work).unwrap();
+
+        let argv = crate::launch::expand_command(&terminal(&from_file), &work);
+        let status = std::process::Command::new(&argv[0]).args(&argv[1..]).env("TERMINAL", &fake).status().unwrap();
+        assert!(status.success());
+        assert_eq!(fs::read_to_string(&out).unwrap().trim(), work.to_str().unwrap());
+
+        // With no terminal available it fails instead of hanging.
+        let none = std::process::Command::new(&argv[0]).args(&argv[1..]).env("TERMINAL", "").env("PATH", "/nonexistent").status();
+        assert!(none.map(|s| !s.success()).unwrap_or(true));
     }
 
     #[test]

@@ -144,6 +144,12 @@ impl Render for Browser {
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::on_run))
             .on_key_down(cx.listener(Self::on_key_down))
+            // A drag released anywhere but over a folder is cancelled.
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                if this.app_drag.take().is_some() {
+                    cx.notify();
+                }
+            }))
             .relative()
             .size_full()
             .flex()
@@ -1886,7 +1892,7 @@ impl Browser {
                 // A plain click on one item of a multi-selection (that didn't
                 // turn into a drag) narrows the selection to it, like Finder.
                 let m = event.modifiers;
-                if this.drag_origin.take().is_some() && !m.platform && !m.shift && this.selected.len() > 1 {
+                if this.drag_origin.take().is_some() && !m.secondary() && !m.shift && this.selected.len() > 1 {
                     this.select_only(ix, cx);
                 }
             }),
@@ -1903,7 +1909,7 @@ impl Browser {
                 this.commit_edit(window, cx);
                 window.focus(&this.focus);
                 let m = event.modifiers;
-                if m.platform {
+                if m.secondary() {
                     this.toggle_selected(ix, cx);
                 } else if m.shift {
                     this.select_range_to(ix, cx);
@@ -2724,17 +2730,32 @@ impl Browser {
     /// Accepts drops (from Findest or other apps) into `dest`, highlighting on hover.
     fn drop_target<E: InteractiveElement + StatefulInteractiveElement + Styled>(&self, el: E, dest: PathBuf, cx: &mut Context<Self>) -> E {
         let highlight = self.theme.accent.opacity(0.25);
-        self.drop_handlers(el, dest, cx).drag_over::<ExternalPaths>(move |s, _, _, _| s.bg(highlight))
+        let hovering = self.app_drag.is_some();
+        let el = self.drop_handlers(el, dest, cx).drag_over::<ExternalPaths>(move |s, _, _, _| s.bg(highlight));
+        if hovering { el.hover(move |s| s.bg(highlight)) } else { el }
     }
 
     /// All drops, including drags started in Findest itself, arrive as native
     /// file drags (see `native_drag`).
     fn drop_handlers<E: InteractiveElement>(&self, el: E, dest: PathBuf, cx: &mut Context<Self>) -> E {
+        let app_dest = dest.clone();
         el.on_drop(cx.listener(move |this, files: &ExternalPaths, window, cx| {
             cx.stop_propagation();
             let copy = crate::native_drag::option_key_down();
             this.drop_paths(files.paths().to_vec(), dest.clone(), copy, window, cx);
         }))
+        // Drags started inside the app where there's no native drag source.
+        .on_mouse_up(
+            MouseButton::Left,
+            cx.listener(move |this, event: &gpui::MouseUpEvent, window, cx| {
+                if let Some(paths) = this.app_drag.take() {
+                    cx.stop_propagation();
+                    let copy = crate::native_drag::copy_modifier(&event.modifiers);
+                    this.drop_paths(paths, app_dest.clone(), copy, window, cx);
+                    cx.notify();
+                }
+            }),
+        )
     }
 }
 

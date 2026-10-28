@@ -23,15 +23,62 @@ actions!(
 
 const CONTEXT: &str = "TextInput";
 
+/// Keys for moving and deleting by word and line, which differ by platform:
+/// macOS uses ⌥ for words and ⌘ for lines, elsewhere Ctrl moves by word and
+/// Home/End (always bound) go to the line's ends.
+struct EditKeys {
+    word_left: &'static str,
+    word_right: &'static str,
+    /// Extra bindings for moving to the line's start / end.
+    line_start: Option<&'static str>,
+    line_end: Option<&'static str>,
+    delete_word: &'static str,
+    delete_to_start: &'static str,
+}
+
+fn edit_keys() -> EditKeys {
+    if cfg!(target_os = "macos") {
+        EditKeys {
+            word_left: "alt-left",
+            word_right: "alt-right",
+            line_start: Some("secondary-left"),
+            line_end: Some("secondary-right"),
+            delete_word: "alt-backspace",
+            delete_to_start: "secondary-backspace",
+        }
+    } else {
+        EditKeys {
+            word_left: "secondary-left",
+            word_right: "secondary-right",
+            line_start: None,
+            line_end: None,
+            delete_word: "secondary-backspace",
+            delete_to_start: "secondary-shift-backspace",
+        }
+    }
+}
+
 pub fn bind_keys(cx: &mut App) {
     let c = Some(CONTEXT);
+    let keys = edit_keys();
+    cx.bind_keys([
+        KeyBinding::new(keys.word_left, WordLeft, c),
+        KeyBinding::new(keys.word_right, WordRight, c),
+        KeyBinding::new(keys.delete_word, DeleteWordLeft, c),
+        KeyBinding::new(keys.delete_to_start, DeleteToStart, c),
+    ]);
+    if let (Some(start), Some(end)) = (keys.line_start, keys.line_end) {
+        cx.bind_keys([KeyBinding::new(start, Home, c), KeyBinding::new(end, End, c)]);
+    }
+    if !cfg!(target_os = "macos") {
+        // Alt+←/→ also move by word, as in most Linux text fields.
+        cx.bind_keys([KeyBinding::new("alt-left", WordLeft, c), KeyBinding::new("alt-right", WordRight, c)]);
+    }
     cx.bind_keys([
         KeyBinding::new("backspace", Backspace, c),
         KeyBinding::new("delete", Delete, c),
         KeyBinding::new("left", Left, c),
         KeyBinding::new("right", Right, c),
-        KeyBinding::new("alt-left", WordLeft, c),
-        KeyBinding::new("alt-right", WordRight, c),
         KeyBinding::new("shift-left", SelectLeft, c),
         KeyBinding::new("shift-right", SelectRight, c),
         KeyBinding::new("secondary-a", SelectAll, c),
@@ -40,14 +87,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-x", Cut, c),
         KeyBinding::new("home", Home, c),
         KeyBinding::new("end", End, c),
-        KeyBinding::new("secondary-left", Home, c),
-        KeyBinding::new("secondary-right", End, c),
         KeyBinding::new("up", MoveUp, c),
         KeyBinding::new("down", MoveDown, c),
         KeyBinding::new("shift-home", SelectHome, c),
         KeyBinding::new("shift-end", SelectEnd, c),
-        KeyBinding::new("secondary-backspace", DeleteToStart, c),
-        KeyBinding::new("alt-backspace", DeleteWordLeft, c),
         KeyBinding::new("enter", Confirm, c),
         KeyBinding::new("escape", Cancel, c),
         KeyBinding::new("tab", Tab, c),
@@ -676,5 +719,34 @@ impl Render for TextInput {
 impl Focusable for TextInput {
     fn focus_handle(&self, _: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edit_keys_do_not_clash() {
+        let k = edit_keys();
+        let mut all = vec![k.word_left, k.word_right, k.delete_word, k.delete_to_start, "home", "end", "backspace"];
+        all.extend(k.line_start);
+        all.extend(k.line_end);
+        let unique: std::collections::HashSet<_> = all.iter().collect();
+        assert_eq!(unique.len(), all.len(), "{all:?}");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn ctrl_moves_and_deletes_by_word_on_linux() {
+        let k = edit_keys();
+        assert_eq!((k.word_left, k.word_right), ("secondary-left", "secondary-right"));
+        assert_eq!(k.delete_word, "secondary-backspace");
+        assert_eq!(k.delete_to_start, "secondary-shift-backspace");
+        assert!(k.line_start.is_none() && k.line_end.is_none(), "Home/End already go to the line's ends");
+        // The keys must parse as keystrokes.
+        for key in [k.word_left, k.word_right, k.delete_word, k.delete_to_start] {
+            gpui::Keystroke::parse(key).unwrap();
+        }
     }
 }

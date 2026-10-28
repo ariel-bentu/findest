@@ -198,8 +198,68 @@ pub fn delete_permanently(paths: &[PathBuf]) -> Result<()> {
             fs::remove_file(path)
         }
         .with_context(|| format!("deleting {}", path.display()))?;
+        remove_trashinfo(path);
     }
     Ok(())
+}
+
+/// Deleting an item from a freedesktop Trash (`Trash/files/NAME`) also removes
+/// its `Trash/info/NAME.trashinfo` record, so nothing is left to "restore".
+fn remove_trashinfo(path: &Path) {
+    let Some(files) = path.parent().filter(|f| f.file_name().is_some_and(|n| n == "files")) else { return };
+    let Some(trash) = files.parent().filter(|t| t.join("info").is_dir()) else { return };
+    let Some(name) = path.file_name() else { return };
+    let mut record = name.to_os_string();
+    record.push(".trashinfo");
+    let _ = fs::remove_file(trash.join("info").join(record));
+}
+
+fn trash_entries(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    Ok(fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| !p.ends_with(".DS_Store"))
+        .collect())
+}
+
+/// The number of items in the Trash whose files are in `dir`. On Linux this
+/// also counts items trashed from other drives (`$topdir/.Trash-$uid`).
+pub fn trash_item_count(dir: &Path) -> std::io::Result<usize> {
+    let here = trash_entries(dir)?.len();
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Items in the home Trash are in both counts, so take the larger.
+        if let Ok(all) = trash::os_limited::list() {
+            return Ok(all.len().max(here));
+        }
+    }
+    Ok(here)
+}
+
+/// Permanently erases everything in the Trash folder `dir`, and on Linux the
+/// `info` records beside it that no longer have a file.
+pub fn empty_trash_folder(dir: &Path) -> Result<()> {
+    delete_permanently(&trash_entries(dir)?)?;
+    #[cfg(not(target_os = "macos"))]
+    if let Some(info) = dir.parent().map(|t| t.join("info")).filter(|i| i.is_dir())
+        && let Ok(read) = fs::read_dir(info)
+    {
+        for record in read.filter_map(|e| e.ok()) {
+            let _ = fs::remove_file(record.path());
+        }
+    }
+    Ok(())
+}
+
+/// Empties the user's Trash: the folder `dir` and, on Linux, the Trash folders
+/// of other drives. This erases the real system Trash: tests use
+/// [`empty_trash_folder`] on a temporary folder instead.
+pub fn empty_trash(dir: &Path) -> Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    if let Ok(all) = trash::os_limited::list() {
+        trash::os_limited::purge_all(all).context("emptying the Trash")?;
+    }
+    empty_trash_folder(dir)
 }
 
 /// Copies `path` next to itself as "name copy.ext", "name copy 2.ext", ...
@@ -881,6 +941,44 @@ mod tests {
         fs::write(&f, "").unwrap();
         assert!(same_volume(&f, tmp.path()));
         assert!(!same_volume(&tmp.path().join("missing"), tmp.path()));
+    }
+
+    #[test]
+    fn deleting_from_the_trash_removes_its_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trash = tmp.path().join("Trash");
+        fs::create_dir_all(trash.join("files/old")).unwrap();
+        fs::create_dir_all(trash.join("info")).unwrap();
+        fs::write(trash.join("files/old/a.txt"), "a").unwrap();
+        fs::write(trash.join("files/b.txt"), "b").unwrap();
+        fs::write(trash.join("info/old.trashinfo"), "[Trash Info]").unwrap();
+        fs::write(trash.join("info/b.txt.trashinfo"), "[Trash Info]").unwrap();
+        fs::write(trash.join("info/c.txt.trashinfo"), "[Trash Info]").unwrap();
+
+        delete_permanently(&[trash.join("files/b.txt")]).unwrap();
+        assert!(!trash.join("info/b.txt.trashinfo").exists());
+        assert!(trash.join("info/old.trashinfo").exists(), "other records stay");
+
+        delete_permanently(&[trash.join("files/old")]).unwrap();
+        assert!(!trash.join("info/old.trashinfo").exists());
+        assert!(trash.join("info/c.txt.trashinfo").exists());
+    }
+
+    #[test]
+    fn empties_a_trash_folder_with_its_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files = tmp.path().join("Trash/files");
+        fs::create_dir_all(&files).unwrap();
+        fs::create_dir_all(tmp.path().join("Trash/info")).unwrap();
+        fs::write(files.join("a.txt"), "a").unwrap();
+        fs::create_dir(files.join("dir")).unwrap();
+        fs::write(tmp.path().join("Trash/info/a.txt.trashinfo"), "").unwrap();
+        fs::write(tmp.path().join("Trash/info/orphan.trashinfo"), "").unwrap();
+        assert!(trash_item_count(&files).unwrap() >= 2);
+        empty_trash_folder(&files).unwrap();
+        assert_eq!(fs::read_dir(&files).unwrap().count(), 0);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(fs::read_dir(tmp.path().join("Trash/info")).unwrap().count(), 0);
     }
 
     #[test]

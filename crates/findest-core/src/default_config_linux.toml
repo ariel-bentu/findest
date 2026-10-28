@@ -73,7 +73,8 @@ for = "any"
 
 [[openers]]
 name = "Terminal"
-command = ["x-terminal-emulator", "{dir}"]
+# Starts in the folder, in $TERMINAL or the first terminal installed.
+command = ["sh", "-c", 'cd "$1" || exit 1; for t in "$TERMINAL" x-terminal-emulator gnome-terminal konsole xfce4-terminal alacritty kitty xterm; do if [ -n "$t" ] && command -v "$t" >/dev/null 2>&1; then exec "$t"; fi; done; exit 1', "sh", "{dir}"]
 for = "any"
 
 [[openers]]

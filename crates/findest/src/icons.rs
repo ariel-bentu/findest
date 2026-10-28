@@ -126,7 +126,7 @@ impl IconKey {
             let size = pixels.round().max(16.0) as u32;
             match self {
                 IconKey::Folder => render_linux_folder_png(size),
-                IconKey::Path(path) if path.is_dir() || path.extension().is_none() => render_linux_folder_png(size),
+                IconKey::Path(path) if path.is_dir() => render_linux_folder_png(size),
                 IconKey::Path(path) => {
                     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                     render_linux_file_png(size, ext)
@@ -443,6 +443,19 @@ mod tests {
         assert!(load_icon(&IconKey::File).is_some_and(|b| is_png(&b)));
         assert!(load_icon(&IconKey::Extension("rs".into())).is_some_and(|b| is_png(&b)));
         assert!(load_icon(&IconKey::Symbol { name: "folder", rgb: 0 }).is_none());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn files_without_an_extension_are_not_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("Makefile");
+        std::fs::write(&file, "all:\n").unwrap();
+        let dir = tmp.path().join("src");
+        std::fs::create_dir(&dir).unwrap();
+        let icon = |p: PathBuf| load_icon(&IconKey::Path(p)).unwrap();
+        assert_eq!(icon(file), load_icon(&IconKey::File).unwrap());
+        assert_eq!(icon(dir), load_icon(&IconKey::Folder).unwrap());
     }
 
     #[test]

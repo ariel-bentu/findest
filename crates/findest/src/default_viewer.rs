@@ -229,7 +229,7 @@ mod imp {
              Type=Application\n\
              Name=Findest\n\
              Comment=Fast, keyboard-first file manager\n\
-             Exec=\"{exec}\" %U\n\
+             Exec=\"{exec}\" %F\n\
              Icon=system-file-manager\n\
              Terminal=false\n\
              StartupWMClass=dev.findest.Findest\n\
@@ -295,7 +295,7 @@ mod tests {
     fn generates_valid_desktop_entry() {
         let entry = imp::desktop_entry(Path::new("/usr/local/bin/findest"));
         assert!(entry.contains("[Desktop Entry]"));
-        assert!(entry.contains("Exec=\"/usr/local/bin/findest\" %U"));
+        assert!(entry.contains("Exec=\"/usr/local/bin/findest\" %F"));
         assert!(entry.contains("MimeType=inode/directory;"));
         assert!(entry.contains("StartupWMClass=dev.findest.Findest"));
     }

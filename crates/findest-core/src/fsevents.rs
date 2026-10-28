@@ -1,4 +1,11 @@
-//! that, so this talks to CoreServices directly.
+//! A minimal FSEvents stream that can replay history. Given an event id
+//! saved earlier, macOS first delivers every change made since then (even
+//! while findest wasn't running), then live changes. `notify` doesn't expose
+//! that, so this talks to CoreServices directly. Other platforms have no
+//! such history: [`EventStream::start`] returns `None` there.
+
+/// Whether changes made while findest wasn't running can be replayed.
+pub const REPLAY_SUPPORTED: bool = cfg!(target_os = "macos");
 
 #[cfg(target_os = "macos")]
 mod mac {
