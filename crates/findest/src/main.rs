@@ -226,6 +226,7 @@ fn main() {
         let _ = url_tx.unbounded_send(urls);
     });
     app.run(move |cx: &mut App| {
+        native_drag::install_drop_feedback();
         cx.on_action(|_: &Quit, cx| {
             cx.set_global(Quitting(true));
             findest_core::sources::global().shutdown();

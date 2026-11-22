@@ -1716,6 +1716,7 @@ name = "findest"
 version = "0.12.0"
 dependencies = [
  "anyhow",
+ "block2",
  "chrono",
  "findest-core",
  "futures",

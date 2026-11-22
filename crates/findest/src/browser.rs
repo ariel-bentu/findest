@@ -93,6 +93,13 @@ impl BrowserInit {
     }
 }
 
+/// Whether dropping `paths` into `dest` copies them rather than moving:
+/// across volumes, when ⌥ is held (`force_copy`), or for items from a source
+/// (cache copies: never move them out).
+pub(crate) fn drop_copies(paths: &[PathBuf], dest: &Path, force_copy: bool) -> bool {
+    force_copy || paths.first().is_some_and(|p| !ops::same_volume(p, dest)) || paths.iter().any(|p| sources::global().contains(p))
+}
+
 /// Every open browser window, in opening order (used to save the session).
 #[derive(Default)]
 pub struct OpenBrowsers(pub Vec<WeakEntity<Browser>>);
@@ -102,6 +109,15 @@ impl Global for OpenBrowsers {}
 #[derive(Default)]
 pub struct Quitting(pub bool);
 impl Global for Quitting {}
+
+/// Items copied (or cut) with ⌘C / ⌘X, shared by all windows so Paste works
+/// in any of them. Each browser mirrors it in `file_clipboard`/`clipboard_cut`.
+#[derive(Default)]
+struct FileClipboard {
+    paths: Vec<PathBuf>,
+    cut: bool,
+}
+impl Global for FileClipboard {}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Location {
@@ -342,6 +358,10 @@ pub struct Browser {
     nav_long_pressed: bool,
     /// Where the mouse went down on a selected row; moving far enough starts a drag.
     pub(crate) drag_origin: Option<Point<Pixels>>,
+    /// While files are dragged over this window: whether dropping them where
+    /// the pointer is would copy (`None` when it isn't over a drop target).
+    /// Set while painting the hovered target, read by the drag cursor.
+    pub(crate) drop_copies: std::rc::Rc<std::cell::Cell<Option<bool>>>,
     load_task: Option<Task<()>>,
     pending_select: Option<PendingSelect>,
     /// Set when a just-created item should be named on the next frame.
@@ -350,7 +370,7 @@ pub struct Browser {
     cursor: Option<PathBuf>,
     anchor: Option<PathBuf>,
     pub(crate) edit: Option<Edit>,
-    /// Items copied (or cut) with ⌘C / ⌘X, waiting for Paste.
+    /// Items copied (or cut) with ⌘C / ⌘X, waiting for Paste (this window's copy of `FileClipboard`).
     pub(crate) file_clipboard: Vec<PathBuf>,
     /// The clipboard was filled by Cut: Paste moves instead of copying.
     pub(crate) clipboard_cut: bool,
@@ -461,6 +481,12 @@ impl Browser {
         browsers.push(me);
         let mut subscriptions = subscriptions;
         subscriptions.push(cx.observe_global::<crate::search_service::IndexService>(|this, cx| this.on_index_updated(cx)));
+        subscriptions.push(cx.observe_global::<FileClipboard>(|this, cx| {
+            let clipboard = cx.global::<FileClipboard>();
+            this.file_clipboard = clipboard.paths.clone();
+            this.clipboard_cut = clipboard.cut;
+            cx.notify();
+        }));
         subscriptions.push(cx.on_release(|_, cx| {
             // Closing one of several windows drops it from the saved session.
             // Closing the last one (or quitting) keeps what was saved.
@@ -513,6 +539,7 @@ impl Browser {
             nav_press: None,
             nav_long_pressed: false,
             drag_origin: None,
+            drop_copies: Default::default(),
             load_task: None,
             pending_select: None,
             pending_name_new: false,
@@ -520,8 +547,8 @@ impl Browser {
             cursor: None,
             anchor: None,
             edit: None,
-            file_clipboard: Vec::new(),
-            clipboard_cut: false,
+            file_clipboard: cx.try_global::<FileClipboard>().map(|c| c.paths.clone()).unwrap_or_default(),
+            clipboard_cut: cx.try_global::<FileClipboard>().is_some_and(|c| c.cut),
             transfers: Vec::new(),
             undo: Vec::new(),
             transfer_ticker: None,
@@ -1004,6 +1031,11 @@ impl Browser {
             return;
         }
         let command = action.command.parse::<Command>();
+        // Space types into the search field instead of opening Quick Look.
+        if matches!(command, Ok(Command::QuickLook)) && self.search_focused(window, cx) {
+            cx.propagate();
+            return;
+        }
         // The preview's find field keeps everything but ⌘G / ⌘⇧G and ⌘F.
         if self.preview_find_focused(window, cx)
             && !matches!(command, Ok(Command::FindNext | Command::FindPrevious | Command::Find))
@@ -1207,15 +1239,9 @@ impl Browser {
                     return;
                 }
                 // Nothing happens to the items until Paste; the status bar shows what's pending.
-                self.file_clipboard = paths;
-                self.clipboard_cut = command == Cut;
-                cx.notify();
+                cx.set_global(FileClipboard { paths, cut: command == Cut });
             }
-            ClearClipboard => {
-                self.file_clipboard.clear();
-                self.clipboard_cut = false;
-                cx.notify();
-            }
+            ClearClipboard => cx.set_global(FileClipboard::default()),
             Paste | MoveHere => {
                 let Some(dir) = self.paste_destination() else {
                     return self.set_error("Open a folder to paste into", cx);
@@ -1228,8 +1254,7 @@ impl Browser {
                 self.transfer_into(sources, dir.clone(), moving, window, cx, move |this, created, cx| {
                     if moving {
                         // Moved items aren't where they were any more.
-                        this.file_clipboard.clear();
-                        this.clipboard_cut = false;
+                        cx.set_global(FileClipboard::default());
                     }
                     let n = count_label(created.len());
                     let here = this.current_dir().as_deref() == Some(dir.as_path());
@@ -1555,6 +1580,32 @@ impl Browser {
     fn record_copy(&mut self, created: &[PathBuf]) {
         let items = created.iter().map(|p| (p.clone(), std::fs::symlink_metadata(p).and_then(|m| m.modified()).ok())).collect();
         self.push_undo(UndoOp::Copy(items));
+    }
+
+    /// Records for Undo an item another app (Finder) had us copy or move;
+    /// `merge` adds it to the previous step (the same drop).
+    fn record_delivered(&mut self, done: crate::native_drag::Delivered, merge: bool, cx: &mut Context<Self>) {
+        use crate::native_drag::Delivered;
+        match (done, merge.then(|| self.undo.pop()).flatten()) {
+            (Delivered::Moved(moved), Some(UndoOp::Move(mut pairs))) => {
+                pairs.extend(moved.into_iter().filter(|(from, to)| from != to));
+                self.push_undo(UndoOp::Move(pairs));
+            }
+            (Delivered::Copied(created), Some(UndoOp::Copy(mut items))) => {
+                items.extend(created.iter().map(|p| (p.clone(), std::fs::symlink_metadata(p).and_then(|m| m.modified()).ok())));
+                self.push_undo(UndoOp::Copy(items));
+            }
+            (done, previous) => {
+                if let Some(previous) = previous {
+                    self.push_undo(previous);
+                }
+                match done {
+                    Delivered::Moved(moved) => self.record_move(moved),
+                    Delivered::Copied(created) => self.record_copy(&created),
+                }
+            }
+        }
+        self.reload(cx);
     }
 
     /// `moved` is `(from, to)` per item, as `ops::move_into` returns it.
@@ -2528,7 +2579,11 @@ impl Browser {
     /// pixels with the button held since pressing on a selected row.
     pub fn maybe_start_drag(&mut self, event: &gpui::MouseMoveEvent, window: &mut Window, cx: &mut Context<Self>) {
         let Some(origin) = self.drag_origin else { return };
-        if event.pressed_button != Some(gpui::MouseButton::Left) || self.edit.is_some() {
+        // A drag already under way (from any window or app) also arrives as
+        // button-held mouse moves; a press left armed here (released off the
+        // row, or before the window was active) must not start a second drag
+        // that replaces it.
+        if event.pressed_button != Some(gpui::MouseButton::Left) || self.edit.is_some() || cx.has_active_drag() {
             self.drag_origin = None;
             return;
         }
@@ -2552,7 +2607,20 @@ impl Browser {
         let from_source = paths.iter().any(|p| sources::global().contains(p));
         let handle = self.scroll.0.borrow().base_handle.clone();
         let start_offset = handle.offset();
-        if let Some(ended) = crate::native_drag::start_file_drag(window, &paths, from_source) {
+        if let Some(crate::native_drag::DragSession { ended, mut delivered }) =
+            crate::native_drag::start_file_drag(window, &paths, from_source)
+        {
+            // Items Finder had us copy or move: one Undo step for the whole drop.
+            cx.spawn(async move |this, cx| {
+                let mut first = true;
+                while let Some(done) = delivered.next().await {
+                    let merge = !std::mem::replace(&mut first, false);
+                    if this.update(cx, |b, cx| b.record_delivered(done, merge, cx)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
             // Cancelled (Esc) or dropped nowhere: scroll back to where the dragged items are.
             cx.spawn(async move |this, cx| {
                 if ended.await == Ok(false) {
@@ -2827,8 +2895,7 @@ impl Browser {
                 this.reload(cx);
             });
         }
-        // Items from a source are cache copies: never move them out.
-        let copy = force_copy || !ops::same_volume(&paths[0], &dest) || paths.iter().any(|p| sources::global().contains(p));
+        let copy = drop_copies(&paths, &dest, force_copy);
         let n = paths.len();
         let dest_name = locations::friendly_name(&self.home, &dest);
         self.transfer_into(paths, dest, !copy, window, cx, move |this, created, cx| {

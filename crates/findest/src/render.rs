@@ -43,6 +43,7 @@ const TREE_INDENT: f32 = 16.0;
 impl Render for Browser {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::pdf::drop_retired(window, cx);
+        self.drop_copies.set(None);
         self.load_sidebar_icons(cx);
         self.sync_info(cx);
         let selection = self.selection();
@@ -195,6 +196,7 @@ impl Render for Browser {
             })
             .child(root)
             .children(self.render_resize_handles(window, cx))
+            .when(cx.has_active_drag(), |d| d.child(self.render_drop_cursor()))
     }
 }
 
@@ -1550,7 +1552,7 @@ impl Browser {
                     .flex_1()
                     .min_h_0()
                     .relative()
-                    .when_some(self.current_dir(), |d, dir| self.drop_handlers(d, dir, cx))
+                    .when_some(self.current_dir(), |d, dir| self.drop_handlers(d, dir, None, cx))
                     .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, window, cx| {
                         this.maybe_start_drag(event, window, cx);
                         if cx.has_active_drag() {
@@ -2723,18 +2725,47 @@ impl Browser {
 impl Browser {
     /// Accepts drops (from Findest or other apps) into `dest`, highlighting on hover.
     fn drop_target<E: InteractiveElement + StatefulInteractiveElement + Styled>(&self, el: E, dest: PathBuf, cx: &mut Context<Self>) -> E {
-        let highlight = self.theme.accent.opacity(0.25);
-        self.drop_handlers(el, dest, cx).drag_over::<ExternalPaths>(move |s, _, _, _| s.bg(highlight))
+        self.drop_handlers(el, dest, Some(self.theme.accent.opacity(0.25)), cx)
     }
 
     /// All drops, including drags started in Findest itself, arrive as native
-    /// file drags (see `native_drag`).
-    fn drop_handlers<E: InteractiveElement>(&self, el: E, dest: PathBuf, cx: &mut Context<Self>) -> E {
+    /// file drags (see `native_drag`). Hovering notes whether the drop would
+    /// copy, for the drag cursor.
+    fn drop_handlers<E: InteractiveElement>(&self, el: E, dest: PathBuf, highlight: Option<Hsla>, cx: &mut Context<Self>) -> E {
+        let copies = self.drop_copies.clone();
+        let hovered = dest.clone();
         el.on_drop(cx.listener(move |this, files: &ExternalPaths, window, cx| {
             cx.stop_propagation();
             let copy = crate::native_drag::option_key_down();
             this.drop_paths(files.paths().to_vec(), dest.clone(), copy, window, cx);
         }))
+        .drag_over::<ExternalPaths>(move |s, files, _, _| {
+            copies.set(Some(crate::browser::drop_copies(files.paths(), &hovered, crate::native_drag::option_key_down())));
+            match highlight {
+                Some(color) => s.bg(color),
+                None => s,
+            }
+        })
+    }
+
+    /// Shows the + cursor while a drop here would copy. gpui resets the cursor
+    /// on every frame of a drag, which would hide the badge AppKit shows, so
+    /// the window sets it itself. Painted last, after the hovered target has
+    /// set `drop_copies`, which it also hands to AppKit (see `native_drag`).
+    fn render_drop_cursor(&self) -> impl IntoElement {
+        let copies = self.drop_copies.clone();
+        canvas(
+            |_, _, _| (),
+            move |_, (), window, _| {
+                let copy = copies.get();
+                crate::native_drag::set_drop_copies(window, copy);
+                if copy == Some(true) {
+                    window.set_window_cursor_style(gpui::CursorStyle::DragCopy);
+                }
+            },
+        )
+        .absolute()
+        .size_0()
     }
 }
 
