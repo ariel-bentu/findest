@@ -15,8 +15,8 @@ tile_size = 96
 show_hidden = false
 folders_first = true
 # name | size | modified | kind
-sort_by = "name"
-sort_ascending = true
+sort_by = "modified"
+sort_ascending = false
 # Ask before moving items to the Trash.
 confirm_trash = false
 # How many recently opened files to remember.
