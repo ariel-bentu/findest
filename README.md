@@ -15,7 +15,7 @@ A fast, keyboard-friendly file browser for macOS and Linux, written in Rust on [
 - **Compress and uncompress** zip files; opening a .zip unpacks it next to it, in Findest.
 - **Folder colors:** right-click folders to pick a color. On macOS they're Finder's color tags, so Finder and Spotlight see them too; on Linux they're stored in `user.findest.color` extended attributes.
 - **Sidebar:** Recents, Favorites, cloud drives (iCloud Drive on macOS; Dropbox, OneDrive, Google Drive, Nextcloud, Proton Drive, pCloud, MEGA, Insync, Syncthing, ownCloud, Box, Keybase and GVFS cloud mounts on Linux), system disk (Macintosh HD / Filesystem), external volumes and the Trash.
-- **Toolbar and path bar:** back/forward with history, the current folder's name (click for the folders above), a Go to bar that accepts pasted paths and completes them with Tab, a ⋯ menu of folder actions, and a clickable path bar at the bottom.
+- **Toolbar and path bar:** back/forward with history, the current folder's name (click for the folders above), a Go to bar that accepts pasted paths and completes them with Tab (inside a source, also the source's own paths, like `/sap/my-org`), a ⋯ menu of folder actions, and a clickable path bar at the bottom.
 - **Multiple windows (⌘N / Ctrl+N)**, each restored at launch with its folder, expanded folders, view and column widths.
 - **New folders and files start unnamed:** type a name, or press Esc to remove the item.
 - **Open in…:** VS Code, Terminal or any app you configure, from the menu or a shortcut.

@@ -19,7 +19,7 @@ command = ["~/findest/static-source", "--some-flag"]   # the adapter, plus its o
 root = "/"          # the folder the sidebar opens (default "/")
 ```
 
-The source appears under **Sources** in the sidebar as soon as you save. Mistakes in this section, such as a duplicate `id` or an empty `command`, are shown in the status bar.
+The source appears under **Sources** in the sidebar as soon as you save. To open another of its folders, type or paste the folder's path (`/docs/old`) in Go to (⇧⌘G) while you're in the source. Mistakes in this section, such as a duplicate `id` or an empty `command`, are shown in the status bar.
 
 ## The protocol
 

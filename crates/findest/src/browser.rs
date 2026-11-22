@@ -14,7 +14,7 @@ use findest_core::locations::{self, Place};
 use findest_core::paths::{contract_tilde, display_name, home_dir};
 use findest_core::recents::Recents;
 use findest_core::session::{ColumnWidths, Session, WindowSession};
-use findest_core::sources::{self, SourceAction, SourceError};
+use findest_core::sources::{self, Source, SourceAction, SourceError};
 use findest_core::{launch, ops};
 use futures::StreamExt;
 use gpui::{
@@ -849,6 +849,11 @@ impl Browser {
             Location::Dir(dir) => Some(dir.clone()),
             Location::Recents => None,
         }
+    }
+
+    /// The source the current folder is in, if any.
+    pub fn current_source(&self) -> Option<Source> {
+        self.current_dir().and_then(|dir| sources::global().source_at(&dir))
     }
 
     pub fn location_label(&self) -> String {
@@ -2004,15 +2009,25 @@ impl Browser {
         // A path on the clipboard is probably where the user wants to go:
         // prefill it, selected, so Enter jumps there and typing replaces it.
         let clipboard = cx.read_from_clipboard().and_then(|item| item.text()).filter(|t| t.trim().lines().count() == 1);
+        let source = self.current_source();
         if let Some(text) = clipboard
             && let Some(path) = findest_core::paths::parse_user_path(&text)
-            && path.exists()
         {
-            let text = contract_tilde(&path);
-            let len = text.len();
-            return self.start_edit(EditKind::GoToFolder, text, 0..len, "Path, e.g. ~/Projects", window, cx);
+            let text = match go_to_target(&text, source.as_ref()) {
+                GoToTarget::Folder | GoToTarget::File => Some(contract_tilde(&path)),
+                GoToTarget::InSource(_) => Some(path.display().to_string()),
+                GoToTarget::Empty | GoToTarget::Missing => None,
+            };
+            if let Some(text) = text {
+                let len = text.len();
+                return self.start_edit(EditKind::GoToFolder, text, 0..len, "Path, e.g. ~/Projects", window, cx);
+            }
         }
         let text = match &self.location {
+            // Inside a source: its own path (`/sap/my-org/`), which Go to accepts there.
+            Location::Dir(dir) if let Some(folder) = sources::global().source_path(dir) => {
+                if folder.ends_with('/') { folder } else { format!("{folder}/") }
+            }
             Location::Dir(dir) => {
                 let mut s = contract_tilde(dir);
                 if !s.ends_with('/') {
@@ -2086,7 +2101,7 @@ impl Browser {
         // Enter on a path that doesn't exist keeps the Go to bar open; it's already
         // showing the warning, so the user can fix the path.
         if let Some(Edit { kind: EditKind::GoToFolder, input, .. }) = &self.edit
-            && go_to_target(input.read(cx).text()) == GoToTarget::Missing
+            && go_to_target(input.read(cx).text(), self.current_source().as_ref()) == GoToTarget::Missing
         {
             return;
         }
@@ -2111,11 +2126,14 @@ impl Browser {
                     Err(e) => self.set_error(format!("{e:#}"), cx),
                 }
             }
-            EditKind::GoToFolder => {
-                if let Some(path) = findest_core::paths::parse_user_path(&text) {
-                    self.navigate_to_path(path, cx);
+            EditKind::GoToFolder => match go_to_target(&text, self.current_source().as_ref()) {
+                GoToTarget::InSource(dir) => self.navigate(Location::Dir(dir), true, cx),
+                _ => {
+                    if let Some(path) = findest_core::paths::parse_user_path(&text) {
+                        self.navigate_to_path(path, cx);
+                    }
                 }
-            }
+            },
         }
         cx.notify();
     }
@@ -3363,15 +3381,24 @@ pub enum GoToTarget {
     Folder,
     File,
     Missing,
+    /// A folder in the current source, at its cache path.
+    InSource(PathBuf),
 }
 
-/// What the text in the Go to bar points at.
-pub fn go_to_target(text: &str) -> GoToTarget {
+/// What the text in the Go to bar points at. Inside a source, `/` and absolute
+/// paths that aren't on this Mac are folders in that source (`/sap/my-org`).
+pub fn go_to_target(text: &str, source: Option<&Source>) -> GoToTarget {
+    let in_source = |path: &Path| {
+        let typed = text.trim().trim_start_matches(['\'', '"']);
+        let folder = path.to_str().filter(|_| typed.starts_with('/'))?;
+        Some(GoToTarget::InSource(sources::global().folder_path(source?, folder)))
+    };
     match findest_core::paths::parse_user_path(text) {
         None => GoToTarget::Empty,
+        Some(path) if path == Path::new("/") && let Some(target) = in_source(&path) => target,
         Some(path) if path.is_dir() => GoToTarget::Folder,
         Some(path) if path.exists() => GoToTarget::File,
-        Some(_) => GoToTarget::Missing,
+        Some(path) => in_source(&path).unwrap_or(GoToTarget::Missing),
     }
 }
 
@@ -3527,10 +3554,18 @@ mod tests {
         let tmp = std::env::temp_dir();
         let file = tmp.join(format!("findest-goto-{}", std::process::id()));
         std::fs::write(&file, "").unwrap();
-        assert_eq!(go_to_target(" "), GoToTarget::Empty);
-        assert_eq!(go_to_target(&format!("'{}'", tmp.display())), GoToTarget::Folder);
-        assert_eq!(go_to_target(&file.display().to_string()), GoToTarget::File);
-        assert_eq!(go_to_target("/definitely/not/here"), GoToTarget::Missing);
+        assert_eq!(go_to_target(" ", None), GoToTarget::Empty);
+        assert_eq!(go_to_target(&format!("'{}'", tmp.display()), None), GoToTarget::Folder);
+        assert_eq!(go_to_target(&file.display().to_string(), None), GoToTarget::File);
+        assert_eq!(go_to_target("/definitely/not/here", None), GoToTarget::Missing);
+        // Inside a source, paths not on this Mac (and "/") are the source's own folders.
+        let source = Source { id: "s".into(), name: "S".into(), command: vec!["x".into()], root: "/".into(), protocol_version: 1 };
+        let mount = sources::global().mount_path(&source);
+        assert_eq!(go_to_target("/definitely/not/here", Some(&source)), GoToTarget::InSource(mount.join("definitely/not/here")));
+        assert_eq!(go_to_target(" '/a/b/' ", Some(&source)), GoToTarget::InSource(mount.join("a/b")));
+        assert_eq!(go_to_target("/", Some(&source)), GoToTarget::InSource(mount.clone()));
+        assert_eq!(go_to_target(&tmp.display().to_string(), Some(&source)), GoToTarget::Folder);
+        assert_eq!(go_to_target("~/definitely-not-here", Some(&source)), GoToTarget::Missing);
         std::fs::remove_file(file).unwrap();
     }
 }

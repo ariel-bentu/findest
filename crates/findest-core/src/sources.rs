@@ -349,11 +349,17 @@ impl Sources {
         format!("/{}", parts.join("/"))
     }
 
+    /// The cache path of a folder given as its ref (`/a/b`): the inverse of `folder_ref`.
+    pub fn folder_path(&self, source: &Source, folder: &str) -> PathBuf {
+        let mut path = self.mount_path(source);
+        path.extend(folder.split('/').filter(|p| !p.is_empty() && *p != "." && *p != ".."));
+        path
+    }
+
     /// A v2 adapter's notice: `folder` (a ref; the root if none) changed.
     pub(crate) fn notice(&self, id: &str, folder: Option<&str>, message: Option<&str>) {
         let Some(source) = self.sources().into_iter().find(|s| s.id == id) else { return };
-        let mut path = self.mount_path(&source);
-        path.extend(folder.unwrap_or("/").split('/').filter(|p| !p.is_empty() && *p != ".."));
+        let path = self.folder_path(&source, folder.unwrap_or("/"));
         self.invalidate(&path);
         let message = message.filter(|m| !m.is_empty()).map(|m| format!("{}: {m}", source.name));
         {
@@ -650,7 +656,7 @@ impl Sources {
     }
 
     /// The item's path inside its source (`/a/b/name`), for `path:` queries.
-    pub(crate) fn source_path(&self, path: &Path) -> Option<String> {
+    pub fn source_path(&self, path: &Path) -> Option<String> {
         let source = self.source_at(path)?;
         Some(self.folder_ref(&source, path))
     }

@@ -1094,7 +1094,12 @@ impl Browser {
         let theme = &self.theme;
         // Checked every frame while the bar is open: one stat() call, so typing gets live feedback.
         let text = edit.input.read(cx).text();
-        let (mut hint, hint_color, border) = match go_to_target(text) {
+        let source = self.current_source();
+        let (mut hint, hint_color, border) = match go_to_target(text, source.as_ref()) {
+            GoToTarget::InSource(_) => {
+                let name = source.map(|s| s.name).unwrap_or_default();
+                (format!("↩ go to this folder in {name} · ⎋ cancel"), theme.text_muted, theme.accent)
+            }
             GoToTarget::Missing => ("⚠ This path doesn't exist".to_string(), theme.danger, theme.danger),
             GoToTarget::File => ("↩ shows the file in its folder · ⎋ cancel".into(), theme.text_muted, theme.accent),
             GoToTarget::Folder | GoToTarget::Empty => ("↩ go · ⇥ complete · ⎋ cancel".into(), theme.text_muted, theme.accent),
