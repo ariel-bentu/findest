@@ -17,3 +17,4 @@ pub mod search;
 pub mod session;
 pub mod sources;
 pub(crate) mod sources_v2;
+pub mod update;

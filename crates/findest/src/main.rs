@@ -14,6 +14,7 @@ mod system;
 mod text_input;
 mod text_preview;
 mod theme;
+mod update_check;
 mod watcher;
 
 use std::path::PathBuf;
@@ -42,6 +43,7 @@ fn menus() -> Vec<Menu> {
             name: "Findest".into(),
             items: vec![
                 item("Settings…", "open_config"),
+                item("Check for Updates…", "check_for_updates"),
                 MenuItem::separator(),
                 item("Pause Search Indexing", "pause_indexing"),
                 item("Resume Search Indexing", "resume_indexing"),
@@ -236,6 +238,7 @@ fn main() {
         text_input::bind_keys(cx);
         cx.set_menus(menus());
         search_service::init(cx);
+        update_check::init(cx);
 
         for init in initial_windows(start) {
             open_browser_window(init, cx);

@@ -23,6 +23,8 @@ confirm_trash = false
 max_recents = 50
 # Show the Recents item at the top of the sidebar.
 show_recents = true
+# Check GitHub once a day for a newer version (shown in the status bar).
+check_for_updates = true
 
 [appearance]
 # dark | light | system

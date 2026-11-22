@@ -103,6 +103,8 @@ pub enum Command {
     /// Opens the selection's folder with it selected (from search results, Recents, a subfolder).
     RevealInFindest,
     OpenConfig,
+    /// Ask GitHub now whether a newer Findest is out.
+    CheckForUpdates,
     NewWindow,
     CloseWindow,
     /// Reset sidebar and info panel widths to their defaults.
@@ -178,6 +180,7 @@ impl FromStr for Command {
             "reveal_in_finder" => RevealInFinder,
             "reveal_in_findest" => RevealInFindest,
             "open_config" => OpenConfig,
+            "check_for_updates" => CheckForUpdates,
             "new_window" => NewWindow,
             "close_window" => CloseWindow,
             "reset_layout" => ResetLayout,

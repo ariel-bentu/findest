@@ -2364,11 +2364,42 @@ impl Browser {
                 (None, None) => None,
             })
             .children(self.render_type_ahead())
+            .children(self.render_update_available(cx))
             .children(self.render_index_activity(cx))
             .children(self.render_transfers(cx))
             .children(self.render_clipboard(cx))
             .children(capacity.map(|c| div().flex_none().whitespace_nowrap().child(c)))
             .when(self.view == ViewMode::Tiles, |d| d.child(self.render_tile_slider(cx)))
+    }
+
+    /// "Findest 0.14.0 available" once a newer version is out; click for its
+    /// release notes.
+    fn render_update_available(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let version = cx.try_global::<crate::update_check::UpdateCheck>()?.available.clone()?;
+        let theme = &self.theme;
+        let hint = format!("Click for what's new. {}", crate::update_check::how_to_update());
+        Some(
+            div()
+                .id("update-available")
+                .flex_none()
+                .whitespace_nowrap()
+                .px_1()
+                .rounded_sm()
+                .cursor_pointer()
+                .text_color(theme.accent)
+                .hover(|s| s.bg(theme.hover))
+                .tooltip(tooltip(hint))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        if let Err(e) = findest_core::launch::open_url(findest_core::update::RELEASES_URL) {
+                            this.set_error(format!("{e:#}"), cx);
+                        }
+                    }),
+                )
+                .child(format!("Findest {version} available")),
+        )
     }
 
     /// What the search index is doing: "Indexing… 340,000 items", paused,

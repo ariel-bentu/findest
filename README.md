@@ -20,6 +20,7 @@ A fast, keyboard-friendly file browser for macOS and Linux, written in Rust on [
 - **New folders and files start unnamed:** type a name, or press Esc to remove the item.
 - **Open in…:** VS Code, Terminal or any app you configure, from the menu or a shortcut.
 - **Default file viewer:** "Show in Finder" / "Show in File Manager" in other apps can open Findest instead (see [Install](#install)).
+- **Update notice:** once a day Findest asks GitHub for the latest release and, when there's a newer one, says so in the status bar (click for what's new). Findest ▸ Check for Updates… checks right away; `check_for_updates = false` turns it off.
 - **Sources:** browse things that aren't on disk (cloud resources, buckets, wikis) as folders, through a small program you plug in, e.g. a Kubernetes cluster. See [Sources](docs/sources.md).
 - **Configurable:** theme, colors, fonts, favorites and every shortcut, in a commented TOML file that applies as soon as you save it.
 
@@ -112,7 +113,7 @@ GPUI is built with `runtime_shaders`, so you don't need Xcode's separately downl
 On first launch Findest writes a commented config to `~/.config/findest/config.toml` (override it with `$FINDEST_CONFIG`).
 Changes apply as soon as you save the file. Open it with **⌘,** (macOS) or **Ctrl+,** (Linux).
 
-- `[general]`: start folder, session restore, info panel, default view and tile size, hidden files, sort order and folders first (also View ▸ Folders First On/Off or the right-click menu), Trash confirmation, recents size
+- `[general]`: start folder, session restore, info panel, default view and tile size, hidden files, sort order and folders first (also View ▸ Folders First On/Off or the right-click menu), Trash confirmation, recents size, and the daily check for a new version (`check_for_updates`)
 - `[appearance]`: `dark` / `light` / `system` theme, font, row height, per-color overrides
 - `[[favorites]]`: sidebar folders (you can also add them from the app with ⌃⌘T / Ctrl+Shift+T)
 - `[[openers]]`: "Open in …" targets, e.g. VS Code and Terminal, with `{path}` / `{dir}` placeholders

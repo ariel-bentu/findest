@@ -235,6 +235,8 @@ pub struct General {
     pub confirm_trash: bool,
     pub max_recents: usize,
     pub show_recents: bool,
+    /// Check GitHub once a day for a newer version and say so in the status bar.
+    pub check_for_updates: bool,
 }
 
 impl Default for General {
@@ -252,6 +254,7 @@ impl Default for General {
             confirm_trash: false,
             max_recents: 50,
             show_recents: true,
+            check_for_updates: true,
         }
     }
 }

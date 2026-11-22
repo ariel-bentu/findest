@@ -481,6 +481,7 @@ impl Browser {
         browsers.push(me);
         let mut subscriptions = subscriptions;
         subscriptions.push(cx.observe_global::<crate::search_service::IndexService>(|this, cx| this.on_index_updated(cx)));
+        subscriptions.push(cx.observe_global::<crate::update_check::UpdateCheck>(|_, cx| cx.notify()));
         subscriptions.push(cx.observe_global::<FileClipboard>(|this, cx| {
             let clipboard = cx.global::<FileClipboard>();
             this.file_clipboard = clipboard.paths.clone();
@@ -1335,6 +1336,23 @@ impl Browser {
                 for path in self.selection_or_current() {
                     self.report(crate::default_viewer::reveal_in_finder(&path), cx);
                 }
+            }
+            CheckForUpdates => {
+                self.set_info("Checking for updates…", cx);
+                let latest = cx.background_executor().spawn(async { findest_core::update::latest_version() });
+                cx.spawn(async move |this, cx| {
+                    let latest = latest.await;
+                    this.update(cx, |this, cx| match latest {
+                        Ok(v) if findest_core::update::is_newer(&v, findest_core::update::CURRENT) => {
+                            this.set_info(format!("Findest {v} is available. {}", crate::update_check::how_to_update()), cx);
+                            cx.set_global(crate::update_check::UpdateCheck { available: Some(v) });
+                        }
+                        Ok(_) => this.set_info(format!("Findest {} is the latest version", findest_core::update::CURRENT), cx),
+                        Err(e) => this.set_error(format!("Couldn't check for updates: {e:#}"), cx),
+                    })
+                    .ok();
+                })
+                .detach();
             }
             OpenConfig => {
                 let path = self.config_path.clone();
@@ -2290,6 +2308,7 @@ impl Browser {
         let entries = match menu_name {
             "Findest" => vec![
                 self.item("Settings…", OpenConfig, "open_config"),
+                self.item("Check for Updates…", CheckForUpdates, "check_for_updates"),
                 MenuEntry::Separator,
                 self.item("Pause Search Indexing", PauseIndexing, "pause_indexing"),
                 self.item("Resume Search Indexing", ResumeIndexing, "resume_indexing"),
