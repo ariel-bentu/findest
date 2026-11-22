@@ -4,7 +4,7 @@
 use std::ops::Range;
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
+    App, Bounds, ClipboardItem, Context, CursorStyle, DispatchPhase, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, Hsla, KeyBinding,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
     ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
@@ -17,9 +17,13 @@ actions!(
     [
         Backspace, Delete, Left, Right, WordLeft, WordRight, SelectLeft, SelectRight, SelectAll,
         Home, End, SelectHome, SelectEnd, Paste, Cut, Copy, Confirm, Cancel, DeleteToStart,
-        DeleteWordLeft, MoveUp, MoveDown, Tab,
+        DeleteWordLeft, MoveUp, MoveDown, Tab, SelectWordLeft, SelectWordRight, DeleteWordRight,
+        DeleteToEnd, MoveToStart, MoveToEnd, SelectToStart, SelectToEnd, Undo, Redo,
     ]
 );
+
+/// Edits kept for ⌘Z.
+const UNDO_LIMIT: usize = 100;
 
 const CONTEXT: &str = "TextInput";
 
@@ -51,6 +55,39 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("enter", Confirm, c),
         KeyBinding::new("escape", Cancel, c),
         KeyBinding::new("tab", Tab, c),
+        // The rest of the standard Mac text-field keys. Bound here so they win
+        // over the browser's own shortcuts (⌘↑, ⇧↑, ⌘Z…) while typing.
+        KeyBinding::new("secondary-shift-left", SelectHome, c),
+        KeyBinding::new("secondary-shift-right", SelectEnd, c),
+        KeyBinding::new("alt-shift-left", SelectWordLeft, c),
+        KeyBinding::new("alt-shift-right", SelectWordRight, c),
+        KeyBinding::new("secondary-up", MoveToStart, c),
+        KeyBinding::new("secondary-down", MoveToEnd, c),
+        KeyBinding::new("alt-up", MoveToStart, c),
+        KeyBinding::new("alt-down", MoveToEnd, c),
+        KeyBinding::new("shift-up", SelectToStart, c),
+        KeyBinding::new("shift-down", SelectToEnd, c),
+        KeyBinding::new("secondary-shift-up", SelectToStart, c),
+        KeyBinding::new("secondary-shift-down", SelectToEnd, c),
+        KeyBinding::new("alt-shift-up", SelectToStart, c),
+        KeyBinding::new("alt-shift-down", SelectToEnd, c),
+        KeyBinding::new("alt-delete", DeleteWordRight, c),
+        KeyBinding::new("secondary-delete", DeleteToEnd, c),
+        KeyBinding::new("secondary-z", Undo, c),
+        KeyBinding::new("secondary-shift-z", Redo, c),
+    ]);
+    // Cocoa's Emacs-style keys; on Linux Ctrl is the command key.
+    #[cfg(target_os = "macos")]
+    cx.bind_keys([
+        KeyBinding::new("ctrl-a", Home, c),
+        KeyBinding::new("ctrl-e", End, c),
+        KeyBinding::new("ctrl-b", Left, c),
+        KeyBinding::new("ctrl-f", Right, c),
+        KeyBinding::new("ctrl-d", Delete, c),
+        KeyBinding::new("ctrl-h", Backspace, c),
+        KeyBinding::new("ctrl-k", DeleteToEnd, c),
+        KeyBinding::new("ctrl-p", MoveUp, c),
+        KeyBinding::new("ctrl-n", MoveDown, c),
     ]);
 }
 
@@ -76,8 +113,13 @@ pub struct TextInput {
     pub cursor_color: Hsla,
     pub selection_color: Hsla,
     pub placeholder_color: Hsla,
-    /// Report ↑/↓ as events instead of moving to the start/end of the text.
+    /// Report ↑/↓ as events instead of moving to the start/end of the text,
+    /// and leave ⌘↑/⇧↑ and the like to the list the input drives.
     pub emit_vertical: bool,
+    undo: Vec<(SharedString, Range<usize>)>,
+    redo: Vec<(SharedString, Range<usize>)>,
+    /// Where the last typed character ended: typing on from there joins its undo step.
+    typing_at: Option<usize>,
 }
 
 impl EventEmitter<TextInputEvent> for TextInput {}
@@ -98,6 +140,9 @@ impl TextInput {
             selection_color: gpui::rgba(0x3311ff30).into(),
             placeholder_color: gpui::hsla(0., 0., 0.5, 0.6),
             emit_vertical: false,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            typing_at: None,
         }
     }
 
@@ -107,7 +152,12 @@ impl TextInput {
 
     /// Replaces the content and selects `selection` (byte offsets).
     pub fn set_text(&mut self, text: impl Into<SharedString>, selection: Range<usize>, cx: &mut Context<Self>) {
-        self.content = text.into();
+        let text = text.into();
+        // E.g. Tab completion: undoable, unlike filling in a new input.
+        if !self.content.is_empty() && text != self.content {
+            self.save_undo();
+        }
+        self.content = text;
         let end = selection.end.min(self.content.len());
         self.selected_range = selection.start.min(end)..end;
         self.selection_reversed = false;
@@ -149,6 +199,31 @@ impl TextInput {
 
     fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
         self.select_to(self.next_boundary(self.cursor_offset()), cx);
+    }
+
+    fn select_word_left(&mut self, _: &SelectWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.previous_word(self.cursor_offset()), cx);
+    }
+
+    fn select_word_right(&mut self, _: &SelectWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.next_word(self.cursor_offset()), cx);
+    }
+
+    // ⌘↑/⌥↑ and their ⇧ versions: the list's when the input drives one.
+    fn move_to_start(&mut self, _: &MoveToStart, _: &mut Window, cx: &mut Context<Self>) {
+        if self.emit_vertical { cx.propagate() } else { self.move_to(0, cx) }
+    }
+
+    fn move_to_end(&mut self, _: &MoveToEnd, _: &mut Window, cx: &mut Context<Self>) {
+        if self.emit_vertical { cx.propagate() } else { self.move_to(self.content.len(), cx) }
+    }
+
+    fn select_to_start(&mut self, _: &SelectToStart, _: &mut Window, cx: &mut Context<Self>) {
+        if self.emit_vertical { cx.propagate() } else { self.select_to(0, cx) }
+    }
+
+    fn select_to_end(&mut self, _: &SelectToEnd, _: &mut Window, cx: &mut Context<Self>) {
+        if self.emit_vertical { cx.propagate() } else { self.select_to(self.content.len(), cx) }
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
@@ -198,6 +273,53 @@ impl TextInput {
             self.select_to(self.previous_word(self.cursor_offset()), cx)
         }
         self.replace_text_in_range(None, "", window, cx)
+    }
+
+    fn delete_word_right(&mut self, _: &DeleteWordRight, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            self.select_to(self.next_word(self.cursor_offset()), cx)
+        }
+        self.replace_text_in_range(None, "", window, cx)
+    }
+
+    fn delete_to_end(&mut self, _: &DeleteToEnd, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty() {
+            self.select_to(self.content.len(), cx)
+        }
+        self.replace_text_in_range(None, "", window, cx)
+    }
+
+    fn save_undo(&mut self) {
+        self.undo.push((self.content.clone(), self.selected_range.clone()));
+        if self.undo.len() > UNDO_LIMIT {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+        self.typing_at = None;
+    }
+
+    fn restore(&mut self, (content, selection): (SharedString, Range<usize>), cx: &mut Context<Self>) {
+        self.content = content;
+        self.selected_range = selection;
+        self.selection_reversed = false;
+        self.marked_range = None;
+        self.typing_at = None;
+        cx.notify();
+    }
+
+    // With nothing to undo, ⌘Z does nothing: it never reaches the file undo.
+    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = self.undo.pop() {
+            self.redo.push((self.content.clone(), self.selected_range.clone()));
+            self.restore(state, cx);
+        }
+    }
+
+    fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(state) = self.redo.pop() {
+            self.undo.push((self.content.clone(), self.selected_range.clone()));
+            self.restore(state, cx);
+        }
     }
 
     fn move_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
@@ -256,13 +378,8 @@ impl TextInput {
         self.is_selecting = false;
     }
 
-    fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.is_selecting {
-            self.select_to(self.index_for_mouse_position(event.position), cx);
-        }
-    }
-
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        self.typing_at = None;
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             self.replace_text_in_range(None, &text.replace('\n', " "), window, cx);
         }
@@ -427,8 +544,16 @@ impl EntityInputHandler for TextInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
+        // Typing on where the last character went joins its undo step; a
+        // composition (marked text) saved one when it started.
+        let typing = range.is_empty() && !new_text.is_empty();
+        if self.marked_range.is_none() && !(typing && self.typing_at == Some(range.start)) {
+            self.save_undo();
+        }
         self.content = (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..]).into();
         self.selected_range = range.start + new_text.len()..range.start + new_text.len();
+        self.selection_reversed = false;
+        self.typing_at = typing.then_some(self.selected_range.end);
         self.marked_range.take();
         cx.notify();
     }
@@ -447,6 +572,9 @@ impl EntityInputHandler for TextInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
+        if self.marked_range.is_none() {
+            self.save_undo();
+        }
         self.content = (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..]).into();
         self.marked_range =
             if new_text.is_empty() { None } else { Some(range.start..range.start + new_text.len()) };
@@ -630,6 +758,20 @@ impl Element for TextElement {
             input.last_layout = Some(line);
             input.last_bounds = Some(bounds);
         });
+
+        // A drag-selection follows the mouse anywhere in the window: a div's
+        // on_mouse_move only fires over it, so dragging past the left end of
+        // the text used to stop short of its first character.
+        let input = self.input.clone();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
+            if phase == DispatchPhase::Bubble {
+                input.update(cx, |input, cx| {
+                    if input.is_selecting {
+                        input.select_to(input.index_for_mouse_position(event.position), cx);
+                    }
+                });
+            }
+        });
     }
 }
 
@@ -665,10 +807,19 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::move_down))
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::tab))
+            .on_action(cx.listener(Self::select_word_left))
+            .on_action(cx.listener(Self::select_word_right))
+            .on_action(cx.listener(Self::move_to_start))
+            .on_action(cx.listener(Self::move_to_end))
+            .on_action(cx.listener(Self::select_to_start))
+            .on_action(cx.listener(Self::select_to_end))
+            .on_action(cx.listener(Self::delete_word_right))
+            .on_action(cx.listener(Self::delete_to_end))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_move(cx.listener(Self::on_mouse_move))
             .child(TextElement { input: cx.entity() })
     }
 }
